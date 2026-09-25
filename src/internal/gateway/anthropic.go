@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"poolgate/internal/channel"
+	"poolgate/internal/toolshim"
 )
 
 // handleAnthropicMessages 处理 POST /v1/messages。
@@ -35,11 +36,19 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	}
 
 	// 工具调用：Anthropic tools → OpenAI tools（input_schema → function.parameters）。
+	// 能力同样分三档：原生透传 / 网关代做模拟（toolshim）/ 明确拒绝。
 	tools := anthropicToolsToOpenAI(body["tools"])
-	if len(tools) > 0 && !ch.Spec().Tools {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error",
-			"渠道 "+string(kind)+" 暂不支持工具调用（tools）：已明确拒绝而不是静默忽略")
-		return
+	useShim := false
+	if len(tools) > 0 {
+		switch {
+		case ch.Spec().Tools:
+		case ch.Spec().ToolsShim:
+			useShim = true
+		default:
+			writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error",
+				"渠道 "+string(kind)+" 暂不支持工具调用（tools）：已明确拒绝而不是静默忽略")
+			return
+		}
 	}
 
 	// system（string 或 block 数组）→ 首条 system 消息。
@@ -148,6 +157,9 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 
 	creq := channel.ChatRequest{Model: modelName, Messages: msgs, MaxTokens: maxTokens, Stream: asBool(body["stream"]),
 		Tools: tools, ToolChoice: anthropicToolChoiceToOpenAI(body["tool_choice"])}
+	if useShim {
+		creq = toolshim.BuildRequest(creq)
+	}
 
 	// 路由。
 	res, err := s.router.Route(r.Context(), ch, kind, r.Header.Get("X-Poolgate-Session"), creq)
@@ -155,15 +167,19 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", err.Error())
 		return
 	}
-	defer res.Stream.Close()
+	st := res.Stream
+	if useShim {
+		st = toolshim.Wrap(st)
+	}
+	defer st.Close()
 
 	if creq.Stream {
-		s.streamAnthropic(w, res.Stream, model)
+		s.streamAnthropic(w, st, model)
 		return
 	}
 
 	// 非流式：聚合。
-	agg := aggregate(res.Stream, model)
+	agg := aggregate(st, model)
 	writeJSON(w, http.StatusOK, buildAnthropicMessage(agg, model))
 }
 

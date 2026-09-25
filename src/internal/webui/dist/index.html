@@ -694,7 +694,7 @@
                 <td>
                   <span class="pill" :class="p.status==='paused'?'pause':'good'">
                     <span class="i">{{ p.status==='paused'?'‖':'✓' }}</span><span class="swatch"></span>{{ p.status==='paused'?'已暂停':'正常' }}</span>
-                  <div class="hint">{{ p.supports_tools ? '工具调用 ✓ 可做 coding agent 后端' : '不支持工具调用：带 tools 的请求会被明确拒绝' }}</div>
+                  <div class="hint">{{ toolModeText(p) }}</div>
                 </td>
                 <td>
                   <div class="hint mono">{{ p.api_key_masked }}</div>
@@ -802,10 +802,16 @@
               <div class="field"><label>模型清单（可选，逗号分隔；上游没有 /v1/models 时手填）</label>
                 <input class="mono" v-model.trim="provWiz.modelsText" placeholder="sonar, sonar-pro" spellcheck="false"></div>
               <div class="field"><label>工具调用能力</label>
-                <select v-model="provWiz.cfg.supports_tools">
-                  <option :value="true">上游支持 tools（可做 coding agent 后端）</option>
-                  <option :value="false">不支持 —— 带 tools 的请求会被明确拒绝，不会静默丢弃</option>
+                <select v-model="provWiz.cfg.tools_mode" @change="syncToolMode">
+                  <option value="native">上游原生支持 tools（官方 API 基本都是这档）</option>
+                  <option value="shim">上游只会聊天 —— 由网关代做模拟（提示词约定 + 解析回结构化 tool_calls）</option>
+                  <option value="none">不用工具（纯聊天来源；带 tools 的请求会被明确拒绝）</option>
                 </select>
+                <p class="hint" style="margin:0" v-if="provWiz.cfg.tools_mode==='shim'">
+                  适用于扫码登录的网页聊天模型：它们没有工具协议，网关会把工具定义翻成提示词、
+                  再把模型输出的 &lt;tool_call&gt; 标记解析回标准的 tool_calls。可靠性比原生低一档（靠模型守格式），
+                  所以测试那一步会实打实验一次。
+                </p>
               </div>
               <div style="display:flex;gap:8px;justify-content:flex-end">
                 <button class="btn" @click="provWiz.step=1" v-if="!provWiz.editing">返回</button>
@@ -1810,11 +1816,17 @@ createApp({
     const provWiz=reactive({
       open:false,step:1,type:'key',editing:false,testing:false,test:null,
       preset:'',modelsText:'',
-      cfg:{name:'',display_name:'',base_url:'',api_key:'',supports_tools:true,notes:'',models:[]}
+      cfg:{name:'',display_name:'',base_url:'',api_key:'',supports_tools:true,tools_mode:'native',notes:'',models:[]}
     });
     // 只取登录授权式：API Key 式来源在下面单独一行渲染（后端用 source 字段标出来，
     // 否则同一个来源会被列出两次 —— 实测过，页面上确实重了一行）。
     const providerChannelRows=computed(()=>channels.value.filter(c=>(c.source||'login')!=='api_key'));
+    // supports_tools 是后端字段（兼容旧配置），tools_mode 是面板的三档选择器；
+    // 两者必须同步，否则保存时一个字段说 native、另一个说 false，行为取决于读哪边。
+    const syncToolMode=()=>{provWiz.cfg.supports_tools=provWiz.cfg.tools_mode==='native';};
+    const toolModeText=p=>p.tools_mode==='shim'
+      ? '工具调用：网关代做模拟（上游只会聊天）'
+      : (p.tools_mode==='none' ? '不使用工具：带 tools 的请求会被明确拒绝' : '工具调用 ✓ 原生支持，可做 coding agent 后端');
     const presetInfo=computed(()=>presets.value.find(x=>x.name===provWiz.preset)||null);
     const loadProviders=async()=>{
       try{
@@ -2223,7 +2235,7 @@ createApp({
       detectedBase,clientBase,keyShown,keyPlain,keyPath,copyClientBase,useDetectedBase,copyKey,revealKey,hideKey,rotateKey,
       listenEffective,listenPinned,failedModelCount,hiddenByHealthCount,
       reasonText,
-      providers,presets,provWiz,presetInfo,providerChannelRows,openProviderWizard,editProvider,applyPreset,
+      providers,presets,provWiz,presetInfo,providerChannelRows,openProviderWizard,editProvider,applyPreset,syncToolMode,toolModeText,
       runProviderTest,saveProvider,askRemoveProvider,testSavedProvider,
       authFlowOpen,
       doSetup,doLogin,logout};

@@ -32,12 +32,17 @@ type ProviderConfig struct {
 	// Models 是手填的模型清单：上游没有 /v1/models 时（如 Perplexity）用它兜底。
 	// 留空则完全依赖上游目录；两者都拿不到时**报错而不是给空列表**。
 	Models []string `json:"models,omitempty"`
-	// SupportsTools 声明该上游是否支持工具调用。声明 false 时网关对带 tools 的请求
-	// 会**明确拒绝**（F3.7），不会静默丢弃 —— 后者会让模型把工具调用写成文本。
-	SupportsTools bool   `json:"supports_tools"`
-	Notes         string `json:"notes,omitempty"`  // 免费额度 / 实名要求等提示（面板展示）
-	Preset        string `json:"preset,omitempty"` // 来自哪个预设模板
-	AddedAt       string `json:"added_at,omitempty"`
+	// SupportsTools 声明该上游是否支持**原生**工具调用。声明 false 时按 ToolsMode 处理。
+	SupportsTools bool `json:"supports_tools"`
+	// ToolsMode 是工具调用的处理方式（三档）：
+	//   "native" —— 上游原生支持，tools 原样透传；
+	//   "shim"   —— 上游只会聊天，由**网关代做模拟**（提示词约定 + 解析回结构化 tool_calls）；
+	//   "none"   —— 不带 tools 的纯聊天；
+	// 留空时按 SupportsTools 推（true→native / false→none），兼容旧配置。
+	ToolsMode string `json:"tools_mode,omitempty"`
+	Notes     string `json:"notes,omitempty"`  // 免费额度 / 实名要求等提示（面板展示）
+	Preset    string `json:"preset,omitempty"` // 来自哪个预设模板
+	AddedAt   string `json:"added_at,omitempty"`
 }
 
 // builtinKinds 是六个内置登录式渠道的名字 —— key 式来源不能占用，否则会覆盖注册表里的实现。
@@ -107,6 +112,17 @@ func (s *ProviderStore) Put(cfg ProviderConfig) error {
 		return err
 	}
 	cfg.Name = strings.ToLower(strings.TrimSpace(cfg.Name))
+	switch strings.ToLower(strings.TrimSpace(cfg.ToolsMode)) {
+	case "native", "shim", "none":
+		cfg.ToolsMode = strings.ToLower(strings.TrimSpace(cfg.ToolsMode))
+	default:
+		// 留空或写错：按 SupportsTools 推，保持旧配置的行为不变。
+		if cfg.SupportsTools {
+			cfg.ToolsMode = "native"
+		} else {
+			cfg.ToolsMode = "none"
+		}
+	}
 	cfg.BaseURL = strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
 	cfg.APIKey = strings.TrimSpace(cfg.APIKey)
 	if cfg.DisplayName == "" {

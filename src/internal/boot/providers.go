@@ -22,7 +22,8 @@ import (
 func ProviderAdapter(cfg store.ProviderConfig) *openaiup.Adapter {
 	return openaiup.New(openaiup.Config{
 		Name: cfg.Name, DisplayName: cfg.DisplayName, BaseURL: cfg.BaseURL,
-		APIKey: cfg.APIKey, Models: cfg.Models, SupportsTools: cfg.SupportsTools, Notes: cfg.Notes,
+		APIKey: cfg.APIKey, Models: cfg.Models, SupportsTools: cfg.SupportsTools,
+		ToolsMode: cfg.ToolsMode, Notes: cfg.Notes,
 	})
 }
 

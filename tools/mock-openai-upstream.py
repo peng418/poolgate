@@ -19,6 +19,8 @@ import json
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+OpenTag = "<tool_call>"
+CloseTag = "</tool_call>"
 SEEN_FILE = "/tmp/mock_upstream_saw.json"
 
 
@@ -60,6 +62,7 @@ class Handler(BaseHTTPRequestHandler):
                 "n_tools": len(body.get("tools") or []),
                 "roles": [m.get("role") for m in msgs],
                 "has_tool_call_id": any(m.get("tool_call_id") for m in msgs),
+                "system_has_tool_prompt": OpenTag in " ".join((m.get("content") or "") for m in msgs if m.get("role") == "system"),
             }, f)
 
         self.send_response(200)
@@ -71,7 +74,17 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(s.encode())
             self.wfile.flush()
 
-        if "tools" in body:
+        # 「只会聊天的上游」模式：请求里没有 tools，但系统提示词里带着工具说明
+        # （说明网关启用了工具调用模拟）→ 像聊天模型那样把工具调用**写成文本**。
+        sys_text = " ".join((m.get("content") or "") for m in msgs if m.get("role") == "system")
+        chat_only = ("tools" not in body) and (OpenTag in sys_text)
+        if chat_only:
+            w('data: {"id":"c1","choices":[{"index":0,"delta":{"role":"assistant","content":"好的，我查一下。"}}]}\n\n')
+            w('data: {"id":"c1","choices":[{"index":0,"delta":{"content":"'
+              + OpenTag + '{\\"name\\":\\"get_weather\\",\\"arguments\\":{\\"city\\":\\"北京\\"}}' + CloseTag
+              + '"}}]}\n\n')
+            w('data: {"id":"c1","choices":[{"index":0,"finish_reason":"stop"}]}\n\n')
+        elif "tools" in body:
             w('data: {"id":"c1","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}\n\n')
             w('data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":['
               '{"index":0,"id":"call_mock","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}\n\n')

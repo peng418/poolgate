@@ -724,3 +724,70 @@ func TestAnthropicToolsRoundTrip(t *testing.T) {
 		t.Fatalf("响应里应含 tool_use 块（含 id/name/input），实际 %s", w.Body.String())
 	}
 }
+
+// 只支持「网关代做模拟」的渠道：客户端发 tools，网关把工具定义翻成提示词给上游，
+// 再把上游文本里的标记解析回结构化 tool_calls —— 对客户端来说合同没变。
+func TestToolsShimChannel(t *testing.T) {
+	var got channel.ChatRequest
+	ch := &fakeChannel{
+		kind: channel.QwenWork,
+		spec: channel.Spec{Kind: channel.QwenWork, Status: channel.Active, ToolsShim: true},
+		chat: func(ctx context.Context, c *channel.Credential, req channel.ChatRequest) (channel.Stream, error) {
+			got = req
+			return &sliceStream{chunks: []channel.ChatCompletionChunk{
+				chunk("好的，"),
+				chunk(`<tool_call>{"name":"get_weather","arguments":{"city":"北京"}}</tool_call>`),
+			}}, nil
+		},
+	}
+	srv, _ := newTestGateway(t, ch, true)
+	w := postJSON(t, srv, "/v1/chat/completions", map[string]any{
+		"model":    "qwenwork/pro",
+		"messages": []map[string]any{{"role": "user", "content": "北京天气"}},
+		"tools": []map[string]any{{
+			"type": "function",
+			"function": map[string]any{"name": "get_weather", "description": "查天气",
+				"parameters": map[string]any{"type": "object", "properties": map[string]any{}}},
+		}},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("应 200，实际 %d body=%s", w.Code, w.Body.String())
+	}
+	// 请求侧：tools 被清掉，工具说明进了系统提示词
+	if len(got.Tools) != 0 {
+		t.Fatalf("模拟模式下不该把 tools 原样传给上游：%+v", got.Tools)
+	}
+	if len(got.Messages) == 0 || got.Messages[0].Role != "system" ||
+		!strings.Contains(got.Messages[0].Content, "get_weather") {
+		t.Fatalf("工具说明没进系统提示词：%+v", got.Messages)
+	}
+	// 响应侧：文本里的标记变成了结构化 tool_calls，且正文没有被吞
+	var out struct {
+		Choices []struct {
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
+				Content   string `json:"content"`
+				ToolCalls []struct {
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("响应不是合法 JSON：%v", err)
+	}
+	msg := out.Choices[0].Message
+	if len(msg.ToolCalls) != 1 || msg.ToolCalls[0].Function.Name != "get_weather" ||
+		msg.ToolCalls[0].Function.Arguments != `{"city":"北京"}` {
+		t.Fatalf("标记没解析成工具调用：%+v", msg)
+	}
+	if msg.Content != "好的，" {
+		t.Fatalf("正文应保留标记以外的内容，got %q", msg.Content)
+	}
+	if out.Choices[0].FinishReason != "tool_calls" {
+		t.Fatalf("finish_reason 应为 tool_calls，got %q", out.Choices[0].FinishReason)
+	}
+}

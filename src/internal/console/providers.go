@@ -40,11 +40,23 @@ type providerOut struct {
 	Models        []string `json:"models,omitempty"`
 	ModelCount    int      `json:"model_count"`
 	SupportsTools bool     `json:"supports_tools"`
+	ToolsMode     string   `json:"tools_mode"` // native | shim | none（面板用三档选择）
 	Notes         string   `json:"notes,omitempty"`
 	Preset        string   `json:"preset,omitempty"`
 	AddedAt       string   `json:"added_at,omitempty"`
 	Status        string   `json:"status"`        // active | paused（来自注册表，渠道开关可改）
 	AccountCount  int      `json:"account_count"` // 合成账号数（正常是 1）
+}
+
+// modeOf 归一化工具调用档位（空值按旧配置推：支持→native，不支持→none）。
+func modeOf(c store.ProviderConfig) string {
+	if c.ToolsMode != "" {
+		return c.ToolsMode
+	}
+	if c.SupportsTools {
+		return "native"
+	}
+	return "none"
 }
 
 // maskKey 把 key 变成可辨识但不可用的形式：前 6 后 4，中间省略。
@@ -80,7 +92,8 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request) {
 			out = append(out, providerOut{
 				Name: c.Name, DisplayName: c.DisplayName, BaseURL: c.BaseURL,
 				APIKeyMasked: maskKey(c.APIKey), Models: c.Models, ModelCount: len(c.Models),
-				SupportsTools: c.SupportsTools, Notes: c.Notes, Preset: c.Preset, AddedAt: c.AddedAt,
+				SupportsTools: c.SupportsTools, ToolsMode: modeOf(c), Notes: c.Notes,
+				Preset: c.Preset, AddedAt: c.AddedAt,
 				Status: status, AccountCount: n,
 			})
 		}

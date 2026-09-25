@@ -20,6 +20,7 @@ import (
 	"poolgate/internal/registry"
 	"poolgate/internal/router"
 	"poolgate/internal/store"
+	"poolgate/internal/toolshim"
 )
 
 // Server 是网关服务。
@@ -262,15 +263,26 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			WithChannel(string(kind)))
 		return
 	}
-	// 工具调用：渠道实现不了就**明确拒绝**（F3.7）。
+	// 工具调用能力分三档（F3.7）：
+	//   ① 原生支持（spec.Tools）→ tools 原样透传给上游；
+	//   ② 只支持「网关代做模拟」（spec.ToolsShim）→ 把工具定义翻成提示词，
+	//      再把模型输出的标记解析回结构化 tool_calls（见 internal/toolshim）；
+	//   ③ 都不支持 → **明确拒绝**。
 	// 静默丢掉 tools 是最坏的一种处理：上游收不到工具定义，会把「我要调用工具」
 	// 写成普通文本（各家的标记还不一样），客户端拿不到 tool_calls，
 	// 表现成「模型不回复 / 回一堆看不懂的乱码」—— coding agent 直接不可用。
-	if len(req.Tools) > 0 && !spec.Tools {
-		writeErr(w, http.StatusBadRequest, errs.New(errs.ModelUnavailable,
-			"渠道 "+string(kind)+" 暂不支持工具调用（tools）：已明确拒绝而不是静默忽略，"+
-				"请去掉 tools 或改用支持工具调用的渠道").WithChannel(string(kind)))
-		return
+	useShim := false
+	if len(req.Tools) > 0 {
+		switch {
+		case spec.Tools:
+		case spec.ToolsShim:
+			useShim = true
+		default:
+			writeErr(w, http.StatusBadRequest, errs.New(errs.ModelUnavailable,
+				"渠道 "+string(kind)+" 暂不支持工具调用（tools）：已明确拒绝而不是静默忽略，"+
+					"请去掉 tools 或改用支持工具调用的渠道").WithChannel(string(kind)))
+			return
+		}
 	}
 
 	msgs := make([]channel.Message, len(req.Messages))
@@ -287,6 +299,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		ToolChoice:  req.ToolChoice,
 	}
 
+	// 模拟工具调用：把请求改写成「只会聊天的上游能吃的形态」（工具说明进系统提示词，
+	// 工具结果改写成普通消息）。响应侧再由 Wrap 把标记解析回 tool_calls。
+	if useShim {
+		creq = toolshim.BuildRequest(creq)
+	}
+
 	// 路由：选号 + 换号重试 + 分档冷却。
 	session := r.Header.Get("X-Poolgate-Session")
 	start := time.Now()
@@ -298,12 +316,16 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeErrFromErr(w, err)
 		return
 	}
-	defer res.Stream.Close()
+	st := res.Stream
+	if useShim {
+		st = toolshim.Wrap(st)
+	}
+	defer st.Close()
 	cred := res.Cred
 
 	// 流式：逐 chunk 透传 SSE。
 	if req.Stream {
-		ttft, ok := s.streamChunks(w, kind, cred, res.Stream)
+		ttft, ok := s.streamChunks(w, kind, cred, st)
 		status, errKind, note := "ok", "", ""
 		if !ok {
 			// 空流/流中出错：这里已经写过错误帧，流水必须如实记为失败（红线一）。
@@ -314,7 +336,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 非流式：聚合（SSEOnly 渠道由本地聚合成单个 completion）。
-	ttft, ok := s.aggregateChunks(w, kind, cred, res.Stream, modelName)
+	ttft, ok := s.aggregateChunks(w, kind, cred, st, modelName)
 	status, errKind, note := "ok", "", ""
 	if !ok {
 		status, errKind, note = "error", string(errs.Parse), "上游未返回任何内容"

@@ -99,7 +99,14 @@ type Spec struct {
 	DisplayName string
 	Status      Status
 
-	Tools      bool
+	Tools bool
+	// ToolsShim 表示上游没有原生工具调用，但**网关会代做模拟**：
+	// 把 tools 定义翻成提示词发给上游，再把模型输出的标记解析回结构化 tool_calls
+	// （见 internal/toolshim）。对客户端来说仍是标准的 tools/tool_calls 合同。
+	//
+	// 与 Tools 互斥使用：Tools=true 走原生透传；两个都 false 时网关明确拒绝带 tools
+	// 的请求（F3.7）—— 静默丢弃会让模型把工具调用写成文本，客户端只看到乱码。
+	ToolsShim  bool
 	Images     bool
 	Reasoning  bool
 	SSEOnly    bool // 上游只有流式 → 非流式由本地聚合成

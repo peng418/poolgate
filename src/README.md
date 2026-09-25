@@ -466,6 +466,56 @@ POST https://gateway.qwenwork.cn/api/v1/deviceToken/refresh
 实测：deviceToken 端点仍可用（垃圾 refresh_token → `401 {"errorCode":"INVALID_REFRESH_TOKEN",...}`），
 503 闸门只影响推理端点。协议说明同步写进了 `docs/03-渠道能力矩阵.md` 与适配器包头注释。
 
+### 0.4.4 — 工具调用模拟层：让「只会聊天」的来源也能给 coding agent 用
+
+**动机**：扫码登录来的网页聊天平台（豆包/DeepSeek/Kimi 这类）**没有工具调用协议** —— 接口只有
+「发消息 → 回文本」，没有放 `tools` 的位置。硬要它给 Studio / Claude Code 当后端，模型只能把
+「我要调用工具」写成文本，客户端拿不到 `tool_calls`。
+
+**做法**（业界叫 prompt-based tool calling，`internal/toolshim`）：
+
+```
+客户端发来 tools
+  ↓ 工具定义 + 输出格式写进系统提示词（并要求「只输出 <tool_call>{…}</tool_call>」）
+上游回文本
+  ↓ 把标记解析回**结构化 tool_calls**（含流式分片、代码围栏、arguments 是字符串等变体）
+客户端执行工具、把结果回传
+  ↓ role=tool 改写成「[工具执行结果] …」的普通消息（聊天上游不认识 tool 角色）
+循环
+```
+
+**能力分三档**（`channel.Spec`：`Tools` / `ToolsShim`，面板「接入源」里选）：
+
+| 档位 | 行为 |
+|---|---|
+| `native` | 上游原生支持，`tools` 原样透传 |
+| `shim` | 上游只会聊天，**由网关代做模拟** |
+| `none` | 纯聊天来源；带 tools 的请求**明确拒绝**（不静默丢弃，F3.7） |
+
+**实现要点**：
+
+- `toolshim.ToolPrompt` 把工具 schema 原样写进提示词（简化 schema = 模型编参数）；
+- `toolshim.BuildRequest` 改写请求：系统提示词合并、清掉 tools/tool_choice、工具消息改纯文本；
+- `toolshim.Parser` 增量解析：**标记被 SSE 切成两片也要拼出来**（留可能是前缀的尾巴），
+  宽容处理代码围栏 / `arguments` 是字符串 / 未闭合标记；
+- **解析不出来绝不丢内容** —— 一律当正文交出去（红线一），宁可客户端看到原文；
+- `toolshim.Wrap` 包装 chunk 流：正文照旧，标记变成 `tool_calls` 增量；`finish_reason` **推迟到末尾**
+  再发（解析器可能到流结束才吐出最后一个调用），有调用时归一成 `tool_calls`；
+- OpenAI 与 Anthropic 两个入口都接了这条路（Anthropic 侧先把 `tools` 转成 OpenAI 形态）。
+
+**可靠性如实说**：模拟档靠模型守格式，稳定性比原生低一档。所以「接入源」页的连通性测试会**真发一条
+带工具定义的请求**，拿不到结构化 tool_calls 就标「未确认」；面板里的档位选择也把这段说明写在旁边。
+
+**验证**：
+
+| 场景 | 结果 |
+|---|---|
+| 分片标记 / 纯文本 / 代码围栏 / arguments 是字符串 / 未闭合 | ✅ 单测逐条钉住 |
+| 解析失败不丢内容 | ✅ 原样当正文返回 |
+| 网关层（模拟渠道） | ✅ 客户端发 tools → 网关改写成提示词 → 上游回标记 → 客户端收到标准 `tool_calls` |
+| 真机（模拟的「只会聊天」上游） | ✅ 上游收到 `has_tools:false` + 带工具说明的 system；客户端拿到 `tool_calls` + `finish_reason: tool_calls`，正文保留 |
+| 工具往返 | ✅ 上游收到 `roles: [system, user, assistant, user]`，无 `tool_call_id` 字段（聊天上游不会报错） |
+
 ### 0.4.3 — 接入源：一个适配器覆盖所有官方 API，面板里三类东西一次管完
 
 **做了什么**（原型见 `prototype/08-providers.html`、`prototype/09-provider-add.html`，裁定见 `docs/02` §12）：

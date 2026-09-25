@@ -31,6 +31,7 @@ type Config struct {
 	APIKey        string   //
 	Models        []string // 手填清单（上游没有 /models 时兜底）
 	SupportsTools bool     // 声明能力位；false 时网关明确拒绝带 tools 的请求
+	ToolsMode     string   // native | shim | none（空 = 按 SupportsTools 推）
 	Notes         string   // 免费额度/实名等提示（面板展示）
 }
 
@@ -64,11 +65,20 @@ func (a *Adapter) Spec() channel.Spec {
 	if name == "" {
 		name = a.cfg.Name
 	}
+	mode := a.cfg.ToolsMode
+	if mode == "" {
+		if a.cfg.SupportsTools {
+			mode = "native"
+		} else {
+			mode = "none"
+		}
+	}
 	return channel.Spec{
 		Kind:        channel.Kind(a.cfg.Name),
 		DisplayName: name,
 		Status:      channel.Active,
-		Tools:       a.cfg.SupportsTools,
+		Tools:       mode == "native",
+		ToolsShim:   mode == "shim",
 		Images:      false, // 本适配器不做图片上行；声明 true 会误导客户端
 		Reasoning:   false, // 未知就不猜（上游各家字段不一，reasoning_content 仍会透传）
 		SSEOnly:     true,  // 统一向上游要 stream，非流式由本地聚合
