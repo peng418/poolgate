@@ -466,6 +466,34 @@ POST https://gateway.qwenwork.cn/api/v1/deviceToken/refresh
 实测：deviceToken 端点仍可用（垃圾 refresh_token → `401 {"errorCode":"INVALID_REFRESH_TOKEN",...}`），
 503 闸门只影响推理端点。协议说明同步写进了 `docs/03-渠道能力矩阵.md` 与适配器包头注释。
 
+### 0.4.6 — 通义（Qwen）渠道：扫码登录 + 原生工具调用
+
+**第一个「网页/CLI 登录式」新渠道**（不再是官方 API Key 那一类）。协议取自公开参考实现
+（`Rfym21/Qwen2API`，819★，2026-09 仍在更新）的实测结论，**没有猜**：
+
+| 环节 | 做法 |
+|---|---|
+| 登录 | **设备码（RFC 8628）+ PKCE** → 面板给出 `https://chat.qwen.ai/authorize?user_code=…&client=qwen-code`，用户用手机/浏览器点一下即完成；**我们不要邮箱密码**（参考实现存密码，我们刻意不走那条） |
+| 续期 | `grant_type=refresh_token`，上游轮换 refresh_token → **落盘新值**（只换内存不落盘 = 重启后拿作废旧值） |
+| 对话 | `POST portal.qwen.ai/v1/chat/completions`，**纯 OpenAI 格式**，工具调用是**原生**（含流式 arguments 分片、tool_choice 四态） |
+| 请求体 | 两个硬要求：`qwen3.5-plus → coder-model` 重定向；首条 system 的 content 必须以「空 text + `cache_control: ephemeral`」开头（上游用它表达可缓存前缀） |
+| 指纹 | **不需要**：CLI 端无签名、无 `bx-ua`、无 ssxmod —— 参考实现里的网页端才要伪造指纹，我们刻意不走网页端（网页端的原生工具调用还会被服务端 agent loop 拦掉） |
+| 防封号 | 该渠道 `DefaultMinIntervalSec = 2`（出厂每账号最小间隔 2 秒），配合已就绪的闸门与「一账号一出口」 |
+
+**实测（本机直连，未用任何账号）**：
+
+| 检查点 | 结果 |
+|---|---|
+| 设备码端点（CLI 风格头） | ✅ `HTTP 200`，返回 `user_code` + `verification_uri_complete`（`expires_in: 900`） |
+| **坑**：不带客户端标识 | ❌ 用 Go 默认 UA 会被**阿里云 WAF** 拦成 HTML 页 → 认证请求也带 `QwenCode/…` 与 Origin/Referer |
+| CLI 对话端点 | ✅ 无 token 正确返回 `401 invalid_api_key`（端点存在、鉴权生效） |
+| 面板授权入口 | ✅ 点「添加账号 → 通义 → 授权」拿到真实授权地址 + 二维码（playwright 实测，截图 `prototype/shots/app-qwen-auth-light.png`） |
+| 单测 | ✅ 设备码流程（pending → token）、refresh 轮换、CLI 头与请求体形状、SSE 工具调用分片、不透明 token 也要有 UID、错误归一 |
+| `check.sh` | ✅ 全绿 |
+
+**已知未做**：CLI 端每账号**每日 2000 次**的额度没有本地计数（参考实现有）；余额未知（上游无接口，如实显示「未知」）；
+面板授权窗口是全局 5 分钟，而设备码实际有效期 15 分钟（想更宽松可以重发一次授权）。
+
 ### 0.4.5 — 防封号基础设施：一账号一出口 + 每账号串行与最小间隔
 
 **动机**：接网页渠道（扫码登录那类）最大的风险不是写不出来，是**被封号与下架**

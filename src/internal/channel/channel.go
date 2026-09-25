@@ -21,7 +21,10 @@ const (
 	WorkBuddyCN Kind = "workbuddy"
 	TraeWork    Kind = "traework"
 	// 后三家：协议独立实现，与首发三家并存（2026-09-24 全部接入）。
-	QwenWork    Kind = "qwenwork"    // 千问办公（网页端 chat-ws 协议）
+	QwenWork Kind = "qwenwork" // 千问办公（网页端 chat-ws 协议）
+	// 通义（Qwen 网页/CLI 渠道）：与千问办公不是一回事 —— 前者是通义官网/Qwen Code CLI，
+	// 后者是「千问办公」那个白领助手产品。两个上游协议完全不同，别混。
+	Qwen        Kind = "qwen"
 	QoderCOM    Kind = "qodercom"    // QoderCOM 国际版（COSY 同框架，仅域名不同）
 	WorkBuddyAI Kind = "workbuddyai" // WorkBuddy 国际版（独立域名与模型表）
 )
@@ -111,6 +114,12 @@ type Spec struct {
 	Reasoning  bool
 	SSEOnly    bool // 上游只有流式 → 非流式由本地聚合成
 	CheckinCap bool // 是否支持签到
+	// DefaultMinIntervalSec 是该渠道「同一账号两次请求的最小间隔」的**出厂默认**（秒）。
+	//
+	// 为什么放 Spec 而不是只放设置：网页渠道（反爬敏感）天生就该慢一点，
+	// 默认值为 0 等于把「设一个安全节奏」这件事推给用户，而用户不知道自己在冒什么险。
+	// 设置里的 account_min_interval_sec 可覆盖它（见 docs/06 防封号设计）。
+	DefaultMinIntervalSec int
 
 	Docs string // 渠道说明链接（可为空）
 }

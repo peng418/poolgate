@@ -217,6 +217,10 @@ func main() {
 				return time.Duration(sec) * time.Second
 			}
 		}
+		// 设置里没写：用渠道自己声明的出厂默认（网页渠道通常非 0 —— 见 docs/06）。
+		if spec, ok := registry.GetSpec(kind); ok && spec.DefaultMinIntervalSec > 0 {
+			return time.Duration(spec.DefaultMinIntervalSec) * time.Second
+		}
 		return 0
 	})
 

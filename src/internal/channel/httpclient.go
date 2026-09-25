@@ -49,3 +49,11 @@ func ProxyOf(c *Credential) string {
 	}
 	return strings.TrimSpace(c.Extra["proxy"])
 }
+
+// EgressOf 返回该凭证实际会用的出口（面板/诊断用）：绑了代理给代理地址，否则给空（= 直连/环境变量）。
+func EgressOf(c *Credential) string {
+	if p := ProxyOf(c); p != "" {
+		return p
+	}
+	return ""
+}

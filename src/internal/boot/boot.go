@@ -10,6 +10,7 @@ package boot
 import (
 	"poolgate/internal/adapter/qodercn"
 	"poolgate/internal/adapter/qodercom"
+	"poolgate/internal/adapter/qwen"
 	"poolgate/internal/adapter/qwenwork"
 	"poolgate/internal/adapter/traework"
 	"poolgate/internal/adapter/workbuddy"
@@ -37,6 +38,11 @@ func RegisterChannels() {
 
 	wa := workbuddyai.New()
 	registry.Register(wa, wa.Spec())
+
+	// 通义（Qwen）：设备码登录 + Qwen Code CLI 端点（原生工具调用，无需浏览器指纹）。
+	// 与「千问办公」（qwenwork）是两个完全不同的上游，别混。
+	qn := qwen.New()
+	registry.Register(qn, qn.Spec())
 }
 
 // QoderCN 返回注册的 QoderCN 适配器。未注册返回 nil。
