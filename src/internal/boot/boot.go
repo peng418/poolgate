@@ -8,6 +8,7 @@
 package boot
 
 import (
+	"poolgate/internal/adapter/gemini"
 	"poolgate/internal/adapter/qodercn"
 	"poolgate/internal/adapter/qodercom"
 	"poolgate/internal/adapter/qwen"
@@ -43,6 +44,10 @@ func RegisterChannels() {
 	// 与「千问办公」（qwenwork）是两个完全不同的上游，别混。
 	qn := qwen.New()
 	registry.Register(qn, qn.Spec())
+
+	// Gemini（Google Code Assist）：官方 OAuth 的登录式渠道（原生工具调用、1000 请求/天）。
+	gm := gemini.New()
+	registry.Register(gm, gm.Spec())
 }
 
 // QoderCN 返回注册的 QoderCN 适配器。未注册返回 nil。

@@ -30,7 +30,9 @@ const (
 	QwenWork Kind = "qwenwork" // 千问办公（网页端 chat-ws 协议）
 	// 通义（Qwen 网页/CLI 渠道）：与千问办公不是一回事 —— 前者是通义官网/Qwen Code CLI，
 	// 后者是「千问办公」那个白领助手产品。两个上游协议完全不同，别混。
-	Qwen        Kind = "qwen"
+	Qwen Kind = "qwen"
+	// Gemini（Google）：走 Code Assist CLI 的**官方 OAuth**（登录式，不用 key）。
+	Gemini      Kind = "gemini"
 	QoderCOM    Kind = "qodercom"    // QoderCOM 国际版（COSY 同框架，仅域名不同）
 	WorkBuddyAI Kind = "workbuddyai" // WorkBuddy 国际版（独立域名与模型表）
 )

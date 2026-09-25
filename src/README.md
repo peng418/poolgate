@@ -466,6 +466,25 @@ POST https://gateway.qwenwork.cn/api/v1/deviceToken/refresh
 实测：deviceToken 端点仍可用（垃圾 refresh_token → `401 {"errorCode":"INVALID_REFRESH_TOKEN",...}`），
 503 闸门只影响推理端点。协议说明同步写进了 `docs/03-渠道能力矩阵.md` 与适配器包头注释。
 
+### 0.4.8 — Gemini 渠道：官方 OAuth 的登录式接入（原生工具调用）
+
+**这批「登录式」里最优的一条**：不是逆向网页，而是走 **Gemini Code Assist CLI 的官方 OAuth**。
+
+| 环节 | 做法 |
+|---|---|
+| 授权 | **user-code 流 + PKCE**：面板给 Google 授权地址（可二维码），用户在**自己浏览器**里点完，页面给一串 code → 粘回面板即完成（NAS 不需要公网回调、不需要桌面浏览器） |
+| 令牌 | access + refresh；过期自动用 `refresh_token` 续期（Google 可能轮换 refresh，新值落盘） |
+| **开通** | ⚠️ 只换令牌不够：还要 `loadCodeAssist` → 必要时 `onboardUser`（**free-tier 不能带 project**，带了 Precondition Failed）拿 project；**不开通直接调会 412/403**。这段结果缓存进凭证 |
+| 对话 | `POST cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse`，请求外层包 `{model, project, request:{…}}`，模型名**裸名** |
+| 工具调用 | **原生**：请求 `tools[].functionDeclarations`、响应 `parts[].functionCall{name,args}`（整包到达，不是分片）→ 我们合成标准 `tool_calls` |
+| 指纹 | **不需要任何浏览器指纹**：OAuth 令牌即全部鉴权（本机实测四个 Google 域名都可达，不用代理） |
+| 额度 | Google 账号登入 Code Assist Individual = **1000 请求/用户/天**（官方 quota 文档） |
+
+**验证**：授权地址实测带对全部参数（client_id/redirect_uri/PKCE/state/access_type=offline/scope 含 cloud-platform）；
+面板「添加账号 → Gemini → 授权」实测拿到真实 Google 授权地址且带粘贴入口；单测覆盖
+（授权流、开通两种分支、账号不可用要透出上游枚举原因、原生工具调用与思考分片、请求体转换、
+finishReason/usage 映射、错误归一）；`check.sh`、`audit-ui`、`audit-vue` 全绿。
+
 ### 0.4.7 — 账号分类隔离 + 全局出口代理（通义登录报错的解）
 
 用户实测反馈两件事：**① 通义授权报错；② 新老渠道该分成两个分类**。

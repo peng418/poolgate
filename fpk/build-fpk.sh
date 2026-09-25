@@ -82,7 +82,7 @@ M="$PKG/manifest"
   printf 'service_port          = %s\n'   "$PORT"
   printf 'desktop_uidir         = ui\n'
   printf 'desktop_applaunchname = %s.main\n' "$APPNAME"
-  printf 'changelog = 账号分类隔离（编程助手类 / 聊天平台类两段展示）+ 全局出口代理（登录与对话都能走它）；通义（Qwen）扫码登录渠道；接入源（官方 API 填 base_url+key 即接）| FPK %s\n' "$VERSION"
+  printf 'changelog = Gemini 渠道（Google 官方 OAuth，粘贴授权码即登录，原生工具调用）；通义渠道；防封号：一账号一出口 + 每账号串行与最小间隔；账号分类隔离；接入源 | FPK %s\n' "$VERSION"
 } >> "$M"
 chmod 0644 "$M"
 sed -n '1,20p' "$M" | sed 's/^/  /'
