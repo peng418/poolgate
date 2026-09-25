@@ -206,6 +206,14 @@ func main() {
 			return n, nil
 		},
 	})
+	// 全局出口代理：登录（还没有账号凭证）与对话都能走它。空 = 直连/环境变量。
+	channel.SetEgressDefault(func() string {
+		if settings == nil {
+			return ""
+		}
+		return settings.Get().EgressProxy
+	})
+
 	// 每账号串行 + 最小间隔（防封号）：间隔按渠道可配（设置里的 account_min_interval_sec），
 	// 缺省不限 —— 网页渠道应当设 1–3 秒，见 docs/06。
 	accGate := pool.NewGate(func(kind channel.Kind) time.Duration {

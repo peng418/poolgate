@@ -120,6 +120,7 @@ func Spec() channel.Spec {
 		Kind:        channel.WorkBuddyAI,
 		DisplayName: "WorkBuddyAI",
 		Status:      channel.Active,
+		Category:    channel.CategoryCoding, // 编程助手/IDE 类
 		Tools:       true,
 		Reasoning:   true,
 		SSEOnly:     true,

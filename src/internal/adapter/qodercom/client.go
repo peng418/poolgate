@@ -75,6 +75,7 @@ func Spec() channel.Spec {
 		Kind:        channel.QoderCOM,
 		DisplayName: "QoderCOM",
 		Status:      channel.Active,
+		Category:    channel.CategoryCoding, // 编程助手/IDE 类
 		Tools:       true,
 		Reasoning:   true,
 		SSEOnly:     true,

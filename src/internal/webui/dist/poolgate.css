@@ -416,3 +416,10 @@ table.kv-t td:last-child { overflow-wrap: anywhere; }
 }
 /* 向导里的两个大选项卡 */
 .modal .card { box-shadow: none; }
+
+/* 渠道大类标题（账号页按「编程助手类 / 聊天平台类」分组） */
+.sect-title {
+  font-size: 13px; margin: 18px 0 6px; padding-bottom: 6px;
+  border-bottom: 1px solid var(--border); color: var(--ink-2); font-weight: 600;
+}
+.sect-title:first-child { margin-top: 0; }

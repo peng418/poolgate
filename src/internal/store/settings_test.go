@@ -162,3 +162,18 @@ func TestSettingsAccountMinIntervalRoundTrip(t *testing.T) {
 		t.Fatalf("重启后配置丢了: %+v", got.AccountMinIntervalSec)
 	}
 }
+
+// 全局出口代理同样必须能落盘读回（白名单漏过一次，这里一并钉住）。
+func TestSettingsEgressProxyRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	s := NewSettingsStore(dir)
+	if err := s.Update(func(cur *Settings) error {
+		cur.EgressProxy = "socks5://127.0.0.1:1080"
+		return nil
+	}); err != nil {
+		t.Fatalf("保存失败: %v", err)
+	}
+	if got := NewSettingsStore(dir).Get().EgressProxy; got != "socks5://127.0.0.1:1080" {
+		t.Fatalf("重启后丢了: %q", got)
+	}
+}

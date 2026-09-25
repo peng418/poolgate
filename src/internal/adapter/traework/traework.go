@@ -68,6 +68,7 @@ func Spec() channel.Spec {
 		Kind:        channel.TraeWork,
 		DisplayName: "TraeWork",
 		Status:      channel.Active,
+		Category:    channel.CategoryCoding, // 编程助手/IDE 类
 		Tools:       true,
 		Reasoning:   true,
 		SSEOnly:     true,

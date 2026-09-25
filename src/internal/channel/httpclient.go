@@ -15,6 +15,27 @@ import (
 	"time"
 )
 
+// egressDefault 是「全局默认出口」的提供者（由装配层从设置注入）。
+//
+// 为什么要全局默认：像通义这种**换令牌被边缘按 IP 挡**的情况，登录这一步还没有账号凭证
+// （凭证是登录的结果），所以不可能靠「账号级代理」解决 —— 必须有一个全局出口兜住它。
+// 优先级：凭证绑定的 > 全局默认 > 环境变量。
+var egressDefault func() string
+
+// SetEgressDefault 设置全局默认出口的提供者（读设置）。传 nil 表示清空。
+func SetEgressDefault(fn func() string) { egressDefault = fn }
+
+// EgressOf 返回该凭证实际会用的出口（面板/诊断用）。
+func EgressOf(c *Credential) string {
+	if p := ProxyOf(c); p != "" {
+		return p
+	}
+	if egressDefault != nil {
+		return strings.TrimSpace(egressDefault())
+	}
+	return ""
+}
+
 // NewHTTPClient 按凭证建一个 HTTP 客户端。
 //
 //   - 凭证 Extra["proxy"] 形如 http://user:pass@host:port 或 socks5://host:port；
@@ -30,14 +51,12 @@ func NewHTTPClient(c *Credential, timeout time.Duration) *http.Client {
 		TLSHandshakeTimeout:   15 * time.Second,
 		ResponseHeaderTimeout: timeout,
 	}
-	if c != nil && c.Extra != nil {
-		if raw := strings.TrimSpace(c.Extra["proxy"]); raw != "" {
-			if u, err := url.Parse(raw); err == nil && u.Host != "" {
-				tr.Proxy = http.ProxyURL(u)
-			}
-			// 解析失败就保持环境变量回落：宁可用原出口（可能被封），
-			// 也不要因为一个手滑的代理地址让整个渠道直接不可用 —— 但请去面板看告警。
+	if raw := EgressOf(c); raw != "" {
+		if u, err := url.Parse(raw); err == nil && u.Host != "" {
+			tr.Proxy = http.ProxyURL(u)
 		}
+		// 解析失败就保持环境变量回落：宁可用原出口（可能被封），
+		// 也不要因为一个手滑的代理地址让整个渠道直接不可用 —— 但请去面板看告警。
 	}
 	return &http.Client{Transport: tr, Timeout: timeout}
 }
@@ -48,12 +67,4 @@ func ProxyOf(c *Credential) string {
 		return ""
 	}
 	return strings.TrimSpace(c.Extra["proxy"])
-}
-
-// EgressOf 返回该凭证实际会用的出口（面板/诊断用）：绑了代理给代理地址，否则给空（= 直连/环境变量）。
-func EgressOf(c *Credential) string {
-	if p := ProxyOf(c); p != "" {
-		return p
-	}
-	return ""
 }

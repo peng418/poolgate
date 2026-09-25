@@ -16,6 +16,12 @@ import (
 // Kind 是渠道的唯一标识，同时用作模型前缀，如 "qodercn/claude-sonnet-4.5"。
 type Kind string
 
+// 渠道大类（面板分组用）。
+const (
+	CategoryCoding = "coding" // 编程助手 / IDE 类
+	CategoryChat   = "chat"   // 聊天平台类
+)
+
 const (
 	QoderCN     Kind = "qodercn"
 	WorkBuddyCN Kind = "workbuddy"
@@ -114,6 +120,14 @@ type Spec struct {
 	Reasoning  bool
 	SSEOnly    bool // 上游只有流式 → 非流式由本地聚合成
 	CheckinCap bool // 是否支持签到
+	// Category 是渠道的「大类」，面板按它分组展示：互相隔离、不混在一起。
+	//
+	//   CategoryCoding —— 编程助手 / IDE 类（订阅额度池，扫码或设备码授权后按额度用）
+	//   CategoryChat   —— 聊天平台类（网页/CLI 登录的通义、千问办公这种）
+	//
+	// 分开的理由不是好看：两类的**额度模型、风控强度、能不能调工具**都不同，
+	// 混在一起用户会拿「余额」去理解「限速」，也会以为它们可以互相顶替。
+	Category string
 	// DefaultMinIntervalSec 是该渠道「同一账号两次请求的最小间隔」的**出厂默认**（秒）。
 	//
 	// 为什么放 Spec 而不是只放设置：网页渠道（反爬敏感）天生就该慢一点，

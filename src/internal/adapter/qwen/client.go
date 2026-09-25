@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 
 	"poolgate/internal/channel"
 	"poolgate/internal/errs"
@@ -17,7 +18,10 @@ import (
 
 // Adapter 实现 channel.Channel 与 channel.Authorizer。
 type Adapter struct {
-	http *http.Client
+	// clients 按「有效出口」缓存客户端：全局出口代理能在运行中改，
+	// 每次都新建 Transport 会丢掉连接复用（流式请求尤其吃亏）。
+	mu      sync.Mutex
+	clients map[string]*http.Client
 	// chatBase / cliBase 字段化，便于测试指向 mock server。
 	chatBase string
 	cliBase  string
@@ -26,7 +30,7 @@ type Adapter struct {
 // New 建立适配器。
 func New() *Adapter {
 	return &Adapter{
-		http:     channel.NewHTTPClient(nil, chatTimeout),
+		clients:  map[string]*http.Client{},
 		chatBase: chatBase,
 		cliBase:  cliBase,
 	}
@@ -37,10 +41,15 @@ func New() *Adapter {
 // 没绑代理就复用默认客户端（共享连接池）；绑了代理**按凭证新建** —— 这就是
 // 「一账号一出口」的落点（见 docs/06 防封号设计）。
 func (a *Adapter) clientFor(c *channel.Credential) *http.Client {
-	if channel.ProxyOf(c) == "" {
-		return a.http
+	key := channel.EgressOf(c)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if cl, ok := a.clients[key]; ok {
+		return cl
 	}
-	return channel.NewHTTPClient(c, chatTimeout)
+	cl := channel.NewHTTPClient(c, chatTimeout)
+	a.clients[key] = cl
+	return cl
 }
 
 func (a *Adapter) Kind() channel.Kind { return channel.Qwen }
@@ -54,6 +63,7 @@ func (a *Adapter) Spec() channel.Spec {
 		Kind:        channel.Qwen,
 		DisplayName: "通义（Qwen）",
 		Status:      channel.Active,
+		Category:    channel.CategoryChat, // 聊天平台类：与编程助手类隔离展示
 		Tools:       true,
 		Images:      false,
 		Reasoning:   true, // 上游会给 reasoning_content（参考实现实测）

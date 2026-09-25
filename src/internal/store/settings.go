@@ -57,9 +57,15 @@ type Settings struct {
 	// 0/缺省 = 不限。网页渠道（反爬敏感）应当设 1–3 秒 —— 同一账号连续猛打是
 	// 最容易被平台判成异常行为的模式（见 docs/06 防封号设计）。
 	AccountMinIntervalSec map[string]int `json:"account_min_interval_sec"`
-	LogRetentionDays      int            `json:"log_retention_days"`
-	LogRetentionMaxMB     int            `json:"log_retention_max_mb"`
-	LastBackupAt          string         `json:"last_backup_at,omitempty"`
+	// EgressProxy 是全局出口代理（http/https/socks5）。空 = 直连（或走环境变量）。
+	//
+	// 用途：① 账号级代理没设时的默认出口；② **登录/换令牌这一步也能走它** ——
+	// 有些上游按 IP 挡认证端点（通义实测：`/oauth2/token` 从海外边缘直接 405），
+	// 而那时还没有账号凭证，只能靠全局出口兜住。
+	EgressProxy       string `json:"egress_proxy"`
+	LogRetentionDays  int    `json:"log_retention_days"`
+	LogRetentionMaxMB int    `json:"log_retention_max_mb"`
+	LastBackupAt      string `json:"last_backup_at,omitempty"`
 }
 
 // DefaultSettings 返回出厂设置。数值与原型 06-settings.html 一致。
@@ -145,6 +151,7 @@ func decodeSettings(raw []byte) Settings {
 	// 注意：这里是**白名单**，新字段忘了加进来就会被静默丢掉（本项就漏过一次，
 	// 表现为「面板保存了、重启后失效」）。加字段时务必同时加这一行 + settings_test 的用例。
 	apply("account_min_interval_sec", &out.AccountMinIntervalSec)
+	apply("egress_proxy", &out.EgressProxy)
 	apply("log_retention_days", &out.LogRetentionDays)
 	apply("log_retention_max_mb", &out.LogRetentionMaxMB)
 	apply("last_backup_at", &out.LastBackupAt)

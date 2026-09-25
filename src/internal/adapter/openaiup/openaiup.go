@@ -77,13 +77,15 @@ func (a *Adapter) Spec() channel.Spec {
 		Kind:        channel.Kind(a.cfg.Name),
 		DisplayName: name,
 		Status:      channel.Active,
-		Tools:       mode == "native",
-		ToolsShim:   mode == "shim",
-		Images:      false, // 本适配器不做图片上行；声明 true 会误导客户端
-		Reasoning:   false, // 未知就不猜（上游各家字段不一，reasoning_content 仍会透传）
-		SSEOnly:     true,  // 统一向上游要 stream，非流式由本地聚合
-		CheckinCap:  false, // API 计费没有签到
-		Docs:        a.cfg.BaseURL,
+		// 官方 API 来源不属于「账号」两类中的任何一类：面板把它单独列成「API Key 式来源」。
+		Category:   "api",
+		Tools:      mode == "native",
+		ToolsShim:  mode == "shim",
+		Images:     false, // 本适配器不做图片上行；声明 true 会误导客户端
+		Reasoning:  false, // 未知就不猜（上游各家字段不一，reasoning_content 仍会透传）
+		SSEOnly:    true,  // 统一向上游要 stream，非流式由本地聚合
+		CheckinCap: false, // API 计费没有签到
+		Docs:       a.cfg.BaseURL,
 	}
 }
 

@@ -572,7 +572,12 @@
 
       <!-- ================= 账号 ================= -->
       <template v-if="view==='accounts'">
-        <div class="card" style="margin-bottom:14px" v-for="g in activeGroups" :key="g.kind">
+        <!-- 按大类分组：编程助手类（订阅额度池）与聊天平台类（网页/CLI 登录）性质不同 ——
+             额度模型、风控强度、能不能调工具都不一样；混在一张列表里会让人拿「余额」理解「限速」。 -->
+        <div v-for="sec in accountSections" :key="sec.key">
+          <h2 class="sect-title">{{ sec.title }}</h2>
+          <p class="hint" style="margin:-6px 0 12px">{{ sec.note }}</p>
+        <div class="card" style="margin-bottom:14px" v-for="g in sec.active" :key="g.kind">
           <h2>
             <span class="ch" :class="channelClass(g.kind)"><span class="k"></span>{{ g.name }}</span>
             <span class="pill warn" style="margin-left:6px" v-if="g.degraded">
@@ -611,13 +616,13 @@
           </table>
         </div>
 
-        <div class="card">
-          <h2>暂停的渠道</h2>
+        <div class="card" v-if="sec.paused.length">
+          <h2>暂停的渠道 <span class="hint">· {{ sec.key==='chat' ? '聊天平台类' : '编程助手类' }}</span></h2>
           <div class="sub">保留账号与适配器，但不向客户端下发模型；恢复只需改状态</div>
           <table>
             <thead><tr><th>渠道 / 账号</th><th>暂停原因</th><th class="num">余额</th><th>恢复条件</th><th>操作</th></tr></thead>
             <tbody>
-              <tr v-for="g in pausedGroups" :key="'pg'+g.kind">
+              <tr v-for="g in sec.paused" :key="'pg'+g.kind">
                 <td><b>{{ g.name }}</b><div class="hint">{{ g.accounts.map(a=>a.nickname||a.uid).join(' · ') || '无账号' }}</div></td>
                 <td>
                   <span class="pill" :class="statusPill(g)"><span class="i">{{ statusIcon(g) }}</span><span class="swatch"></span>{{ statusText(g) }}</span>
@@ -632,6 +637,8 @@
               </tr>
             </tbody>
           </table>
+        </div>
+
         </div>
 
         <p class="hint" style="margin-top:14px">
@@ -669,7 +676,8 @@
                   <span class="ch" :class="channelClass(c.kind)"><span class="k"></span><b>{{ c.display_name }}</b></span>
                   <div class="hint">{{ c.account_count }} 个账号<span v-if="c.checkin_cap"> · 可签到</span></div>
                 </td>
-                <td><span class="source-type">登录授权</span></td>
+                <td><span class="source-type">登录授权</span>
+                  <div class="hint">{{ c.category === 'chat' ? '聊天平台类' : '编程助手类' }}</div></td>
                 <td>
                   <span class="pill" :class="c.downstream?'good':'pause'"><span class="i">{{ c.downstream?'✓':'‖' }}</span><span class="swatch"></span>{{ c.downstream?'正常':'已暂停' }}</span>
                   <div class="hint" v-if="!c.downstream">暂停：保留账号但不向客户端下发模型</div>
@@ -1147,6 +1155,14 @@
             <div class="field"><label for="host">监听地址（设置值）</label><input id="host" v-model="form.listen_host"></div>
             <div class="field"><label for="port">端口（设置值）</label><input id="port" type="number" v-model.number="form.listen_port">
               <span class="hint">与 wild-work（5013）错开，便于并存迁移</span></div>
+            <div class="field"><label for="egress">全局出口代理（可选）</label>
+              <input id="egress" v-model="form.egress_proxy"
+                placeholder="socks5://127.0.0.1:1080 或 http://user:pass@host:port">
+              <span class="hint">
+                两个用途：① 账号没单独绑代理时的默认出口；② <b>登录/换令牌也走它</b> ——
+                实测有些上游按 IP 挡认证端点（通义：换令牌从海外边缘直接 405，而设备码能拿到）。
+                留空 = 直连（或走环境变量）。改完**新请求立即生效**，不用重启。
+              </span></div>
             <div class="field"><label for="base">对外基址（客户端填写用）</label>
               <div class="copy-row">
                 <input id="base" v-model="form.base_url" :placeholder="detectedBase">
@@ -1821,6 +1837,20 @@ createApp({
     // 只取登录授权式：API Key 式来源在下面单独一行渲染（后端用 source 字段标出来，
     // 否则同一个来源会被列出两次 —— 实测过，页面上确实重了一行）。
     const providerChannelRows=computed(()=>channels.value.filter(c=>(c.source||'login')!=='api_key'));
+    // 渠道大类：后端 /api/channels 给 category（coding / chat / api），没标的按 coding。
+    const catOf=kind=>{const c=channels.value.find(x=>x.kind===kind);return (c&&c.category)||'coding';};
+    const CAT_SECS=[
+      {key:'coding',title:'编程助手类 · 订阅额度池',
+       note:'扫码/设备码登录，按订阅额度用；这批渠道的模型原生支持工具调用。'},
+      {key:'chat',title:'聊天平台类 · 网页/CLI 登录',
+       note:'网页聊天产品的登录式接入，独立一类：额度与风控模型和上面那类不同，两者不互相顶替。'}
+    ];
+    // 每组渠道按大类拆两段（同类里先可用后暂停），空类不显示。
+    const accountSections=computed(()=>CAT_SECS.map(sec=>{
+      const inCat=g=>catOf(g.kind)===sec.key;
+      return {key:sec.key,title:sec.title,note:sec.note,
+        active:activeGroups.value.filter(inCat),paused:pausedGroups.value.filter(inCat)};
+    }).filter(sec=>sec.active.length||sec.paused.length));
     // supports_tools 是后端字段（兼容旧配置），tools_mode 是面板的三档选择器；
     // 两者必须同步，否则保存时一个字段说 native、另一个说 false，行为取决于读哪边。
     const syncToolMode=()=>{provWiz.cfg.supports_tools=provWiz.cfg.tools_mode==='native';};
@@ -2223,7 +2253,7 @@ createApp({
       authLabel,authCountdown,authMethod,policyRows,pwStrength,
       callbackLockedLocal,callbackViaPanel,qrUsable,authQr,qrTip,qrScanHint,cbRaw,submitCallback,
       channelName,channelClass,statusPill,statusIcon,statusText,sevLabel,
-      accountPill,accountIcon,accountText,checkinPill,checkinText,logPill,logIcon,logText,
+      accountPill,accountIcon,accountText,checkinPill,checkinText,logPill,logIcon,logText,accountSections,catOf,
       srcLabel,humanCtx,capsText,shortUid,fmtNum,fmtTime,fmtDate,barPct,barColor,
       channelCheckin,modelCountOf,channelCredits,historyFailSummary,ask,
       go,loadModels,checkinOne,refreshOne,toggleAccount,checkinAll,refreshAll,askRemoveAccount,

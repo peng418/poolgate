@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"poolgate/internal/channel"
 	"poolgate/internal/errs"
 	"poolgate/internal/health"
 	"poolgate/internal/pool"
@@ -367,6 +368,18 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// categoryOf 归一渠道大类；老的/没标的按 coding 处理（保持既有展示不变）。
+func categoryOf(sp channel.Spec) string {
+	switch sp.Category {
+	case channel.CategoryChat:
+		return channel.CategoryChat
+	case "api":
+		return "api"
+	default:
+		return channel.CategoryCoding
+	}
+}
+
 func (s *Server) handleChannels(w http.ResponseWriter, r *http.Request) {
 	type item struct {
 		Kind        string `json:"kind"`
@@ -383,6 +396,8 @@ func (s *Server) handleChannels(w http.ResponseWriter, r *http.Request) {
 		PanelAuthNote string `json:"panel_auth_note,omitempty"`
 		// AccountCount 该渠道当前账号数（前端据此提示「先去加号」）。
 		AccountCount int `json:"account_count"`
+		// Category 是渠道大类：coding（编程助手/IDE）| chat（聊天平台）| api（API Key 式来源）。
+		Category string `json:"category"`
 		// Source 区分来源类型：login（登录授权式）| api_key（API Key 式来源）。
 		// 「接入源」页把两类并到一张表，靠它去重 —— 否则 key 式来源会被列出两次。
 		Source string `json:"source"`
@@ -419,6 +434,7 @@ func (s *Server) handleChannels(w http.ResponseWriter, r *http.Request) {
 			PanelAuth:     canAuth,
 			PanelAuthNote: note,
 			AccountCount:  n,
+			Category:      categoryOf(e.Spec),
 			Source:        map[bool]string{true: "api_key", false: "login"}[isKeySource(string(e.Spec.Kind))],
 		})
 	}

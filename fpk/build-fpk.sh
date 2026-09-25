@@ -82,7 +82,7 @@ M="$PKG/manifest"
   printf 'service_port          = %s\n'   "$PORT"
   printf 'desktop_uidir         = ui\n'
   printf 'desktop_applaunchname = %s.main\n' "$APPNAME"
-  printf 'changelog = 通义（Qwen）扫码登录渠道（设备码授权 + Qwen Code CLI 端点，原生工具调用）；防封号：一账号一出口 + 每账号串行与最小间隔；接入源：通用 OpenAI 兼容上游适配器（官方 API 填 base_url+key 即接）| FPK %s\n' "$VERSION"
+  printf 'changelog = 账号分类隔离（编程助手类 / 聊天平台类两段展示）+ 全局出口代理（登录与对话都能走它）；通义（Qwen）扫码登录渠道；接入源（官方 API 填 base_url+key 即接）| FPK %s\n' "$VERSION"
 } >> "$M"
 chmod 0644 "$M"
 sed -n '1,20p' "$M" | sed 's/^/  /'
