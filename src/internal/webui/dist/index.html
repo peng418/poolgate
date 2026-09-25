@@ -641,6 +641,207 @@
       </template>
 
       <!-- ================= 模型与费率 ================= -->
+      <!-- ==================== 接入源：登录授权式渠道 + API Key 式来源 ==================== -->
+      <!-- 两类来源混排在一张表里，靠「类型」列与最左侧色块区分（登录式用渠道身份色、
+           key 式用中性方块）。调用入口永远只有一个，分开的只是管理界面。 -->
+      <template v-if="view==='providers'">
+        <div class="banner" style="margin-bottom:14px">
+          <span class="ico">◎</span>
+          <div style="min-width:0">
+            <b>客户端只认一个地址 + 一个 API Key</b>
+            <p>不管模型来自扫码授权的渠道，还是你填 key 的官方 API —— 都从这一个入口调用；
+              模型名带来源前缀区分：<span class="mono">qodercn/glm-5.3</span> ·
+              <span class="mono">google/gemini-3.8-flash</span>。</p>
+          </div>
+        </div>
+
+        <div class="card" style="margin-bottom:14px">
+          <h2>接入源</h2>
+          <div class="sub">状态用「图标 + 文字 + 色块」三重表达；额度列区分「余额」与「配额 / 限速」——恢复方式不同，不能混着说</div>
+          <div style="overflow-x:auto">
+          <table>
+            <thead><tr>
+              <th>接入源</th><th>类型</th><th>状态</th><th>额度 / 凭证</th><th class="num">模型</th><th>操作</th>
+            </tr></thead>
+            <tbody>
+              <tr v-for="c in providerChannelRows" :key="'ch-'+c.kind">
+                <td>
+                  <span class="ch" :class="channelClass(c.kind)"><span class="k"></span><b>{{ c.display_name }}</b></span>
+                  <div class="hint">{{ c.account_count }} 个账号<span v-if="c.checkin_cap"> · 可签到</span></div>
+                </td>
+                <td><span class="source-type">登录授权</span></td>
+                <td>
+                  <span class="pill" :class="c.downstream?'good':'pause'"><span class="i">{{ c.downstream?'✓':'‖' }}</span><span class="swatch"></span>{{ c.downstream?'正常':'已暂停' }}</span>
+                  <div class="hint" v-if="!c.downstream">暂停：保留账号但不向客户端下发模型</div>
+                </td>
+                <td>
+                  <template v-if="c.account_count===0"><span class="muted">还没有账号</span></template>
+                  <template v-else><span>{{ channelCredits(c) }}</span></template>
+                </td>
+                <td class="num">{{ modelCountOf(c.kind) }}</td>
+                <td>
+                  <button class="btn sm" @click="go('accounts')">管理账号</button>
+                  <button class="btn sm" @click="startAddAccount(c.kind)" v-if="c.panel_auth">添加账号</button>
+                </td>
+              </tr>
+
+              <tr v-for="p in providers" :key="'pv-'+p.name">
+                <td>
+                  <span class="ch k-key"><span class="k"></span><b>{{ p.display_name || p.name }}</b></span>
+                  <div class="hint mono">{{ p.base_url }}</div>
+                </td>
+                <td><span class="source-type">API Key</span></td>
+                <td>
+                  <span class="pill" :class="p.status==='paused'?'pause':'good'">
+                    <span class="i">{{ p.status==='paused'?'‖':'✓' }}</span><span class="swatch"></span>{{ p.status==='paused'?'已暂停':'正常' }}</span>
+                  <div class="hint">{{ p.supports_tools ? '工具调用 ✓ 可做 coding agent 后端' : '不支持工具调用：带 tools 的请求会被明确拒绝' }}</div>
+                </td>
+                <td>
+                  <div class="hint mono">{{ p.api_key_masked }}</div>
+                  <div class="hint" v-if="p.notes">{{ p.notes }}</div>
+                </td>
+                <td class="num">{{ p.model_count ? p.model_count : '上游拉取' }}</td>
+                <td>
+                  <button class="btn sm" @click="testSavedProvider(p)" :disabled="busy">测一遍</button>
+                  <button class="btn sm" @click="editProvider(p)">编辑</button>
+                  <button class="btn sm danger" @click="askRemoveProvider(p)">删除</button>
+                </td>
+              </tr>
+
+              <tr v-if="providerChannelRows.length===0 && providers.length===0">
+                <td colspan="6" class="muted">还没有任何接入源</td>
+              </tr>
+            </tbody>
+          </table>
+          </div>
+        </div>
+
+        <div class="grid g2">
+          <div class="card">
+            <h2>两类来源的区别</h2>
+            <div class="sub">同一张表里混着放，语义完全不同</div>
+            <table>
+              <thead><tr><th></th><th>登录授权式</th><th>API Key 式</th></tr></thead>
+              <tbody>
+                <tr><td>怎么来</td><td>扫码 / 浏览器授权一次</td><td>去官网注册后创建 key</td></tr>
+                <tr><td>凭证</td><td>cookie / JWT，可自动续期</td><td>一串 key（等于密码，落盘 0600）</td></tr>
+                <tr><td>额度恢复</td><td>签到、等冷却、换账号</td><td>等限速窗口、充值、换 key</td></tr>
+                <tr><td>工具调用</td><td>协议原生支持（IDE 类）</td><td>看上游；不支持会被明确拒绝</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="card">
+            <h2>添加接入源</h2>
+            <div class="sub">向导三步：选类型 → 填参数 → 连通性测试后保存</div>
+            <p class="hint" style="margin:0 0 10px">测试那一步会真发一条**带工具定义**的请求：拿到结构化 tool_calls 才说明它能给 Studio / Claude Code 当后端。</p>
+            <button class="btn primary" @click="openProviderWizard">＋ 添加接入源</button>
+          </div>
+        </div>
+
+        <!-- ==================== 添加 / 编辑向导 ==================== -->
+        <div class="modal-bg" v-if="provWiz.open" @click.self="provWiz.open=false">
+          <div class="modal" style="max-width:760px">
+            <h3>{{ provWiz.editing ? '编辑接入源：' + provWiz.cfg.name : '添加接入源' }}</h3>
+            <div class="steps" style="margin:10px 0 14px">
+              <span class="step-tab" :class="{on:provWiz.step===1,done:provWiz.step>1}"><span class="n">{{ provWiz.step>1?'✓':'1' }}</span>选类型</span>
+              <span class="step-line"></span>
+              <span class="step-tab" :class="{on:provWiz.step===2,done:provWiz.step>2}"><span class="n">{{ provWiz.step>2?'✓':'2' }}</span>填参数</span>
+              <span class="step-line"></span>
+              <span class="step-tab" :class="{on:provWiz.step===3}"><span class="n">3</span>测试并保存</span>
+            </div>
+
+            <div v-if="provWiz.step===1">
+              <div class="grid g2">
+                <div class="card" style="cursor:pointer" @click="provWiz.type='auth';provWiz.step=2">
+                  <h2>登录授权式</h2>
+                  <div class="sub">扫码 / 浏览器授权一次，凭证自动续期</div>
+                  <p class="hint">适用：QoderCN · TraeWork · WorkBuddy · 腾讯 CodeBuddy · GitHub Copilot …<br>
+                    好处：不用 key，协议原生支持工具调用</p>
+                </div>
+                <div class="card" style="cursor:pointer" @click="provWiz.type='key';provWiz.step=2">
+                  <h2>API Key 式</h2>
+                  <div class="sub">去官网注册后创建一串 key，填进来即可</div>
+                  <p class="hint">适用：Google AI Studio · 阿里百炼 · OpenRouter · DeepSeek · 智谱 GLM · 火山方舟 …<br>
+                    好处：配置级、立刻可用、免费额度明确</p>
+                </div>
+              </div>
+              <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
+                <button class="btn" @click="provWiz.open=false">取消</button>
+              </div>
+            </div>
+
+            <div v-else-if="provWiz.step===2 && provWiz.type==='auth'">
+              <p class="hint" style="margin:0 0 12px">登录授权式渠道在「账号」页添加：点某个渠道的「添加账号」，按提示扫码或授权即可 —— 不需要填 key。</p>
+              <div style="display:flex;gap:8px;justify-content:flex-end">
+                <button class="btn" @click="provWiz.step=1">返回</button>
+                <button class="btn primary" @click="provWiz.open=false;go('accounts')">去「账号」页</button>
+              </div>
+            </div>
+
+            <div v-else-if="provWiz.step===2">
+              <div class="field"><label>预设（选中自动带出 base_url）</label>
+                <select v-model="provWiz.preset" @change="applyPreset">
+                  <option value="">自定义（自己填 base_url）</option>
+                  <option v-for="it in presets" :key="it.name" :value="it.name">{{ it.display_name }}</option>
+                </select>
+              </div>
+              <p class="hint" v-if="presetInfo" style="margin:-4px 0 12px">
+                免费档：{{ presetInfo.free_tier }}<br>门槛：{{ presetInfo.real_name }}
+                <template v-if="presetInfo.note"><br>{{ presetInfo.note }}</template>
+              </p>
+              <div class="field"><label>名称（就是模型前缀，加完别改）</label>
+                <input class="mono" v-model.trim="provWiz.cfg.name" placeholder="google" spellcheck="false"></div>
+              <div class="field"><label>显示名</label>
+                <input v-model.trim="provWiz.cfg.display_name" placeholder="Google AI Studio（Gemini）"></div>
+              <div class="field"><label>base_url（不含 /chat/completions）</label>
+                <input class="mono" v-model.trim="provWiz.cfg.base_url" placeholder="https://…/v1" spellcheck="false"></div>
+              <div class="field"><label>API Key</label>
+                <input type="password" class="mono" v-model.trim="provWiz.cfg.api_key" spellcheck="false">
+                <p class="hint" style="margin:0" v-if="provWiz.editing">留空 = 沿用已保存的 key（面板不会回显明文）</p>
+              </div>
+              <div class="field"><label>模型清单（可选，逗号分隔；上游没有 /v1/models 时手填）</label>
+                <input class="mono" v-model.trim="provWiz.modelsText" placeholder="sonar, sonar-pro" spellcheck="false"></div>
+              <div class="field"><label>工具调用能力</label>
+                <select v-model="provWiz.cfg.supports_tools">
+                  <option :value="true">上游支持 tools（可做 coding agent 后端）</option>
+                  <option :value="false">不支持 —— 带 tools 的请求会被明确拒绝，不会静默丢弃</option>
+                </select>
+              </div>
+              <div style="display:flex;gap:8px;justify-content:flex-end">
+                <button class="btn" @click="provWiz.step=1" v-if="!provWiz.editing">返回</button>
+                <button class="btn primary" @click="runProviderTest" :disabled="provWiz.testing">下一步：测试连通性</button>
+              </div>
+            </div>
+
+            <div v-else>
+              <p class="hint" v-if="provWiz.testing" style="margin:0 0 10px">正在测试：鉴权 → 模型目录 → 工具调用 → 首字延迟 …</p>
+              <table v-else-if="provWiz.test">
+                <tbody>
+                  <tr><td>鉴权</td><td>
+                    <span class="pill" :class="provWiz.test.auth_ok?'good':'crit'"><span class="i">{{ provWiz.test.auth_ok?'✓':'✕' }}</span><span class="swatch"></span>{{ provWiz.test.auth_ok?'通过':'失败' }}</span>
+                    <div class="hint">{{ provWiz.test.auth_note }}</div></td></tr>
+                  <tr><td>模型目录</td><td>
+                    <span class="pill" :class="provWiz.test.model_count?'good':'warn'"><span class="i">{{ provWiz.test.model_count?'✓':'!' }}</span><span class="swatch"></span>{{ provWiz.test.model_count }} 个</span>
+                    <div class="hint mono">{{ (provWiz.test.models||[]).join(' · ') }}<template v-if="provWiz.test.models_source">（来源：{{ provWiz.test.models_source }}）</template></div></td></tr>
+                  <tr><td>工具调用</td><td>
+                    <span class="pill" :class="provWiz.test.tools_ok?'good':'warn'"><span class="i">{{ provWiz.test.tools_ok?'✓':'!' }}</span><span class="swatch"></span>{{ provWiz.test.tools_ok?'可用':'未确认' }}</span>
+                    <div class="hint">{{ provWiz.test.tools_note }}<template v-if="provWiz.test.tools_sample"><br><span class="mono">{{ provWiz.test.tools_sample }}</span></template></div></td></tr>
+                  <tr><td>首字延迟</td><td><b>{{ provWiz.test.error ? '—' : (provWiz.test.ttft_ms ? provWiz.test.ttft_ms + ' ms' : '少于 1 ms') }}</b></td></tr>
+                  <tr v-if="provWiz.test.error"><td>错误</td><td>
+                    <span class="pill crit"><span class="i">✕</span><span class="swatch"></span>失败</span>
+                    <div class="hint mono">{{ provWiz.test.error }}</div></td></tr>
+                </tbody>
+              </table>
+              <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
+                <button class="btn" @click="provWiz.step=2">返回上一步</button>
+                <button class="btn" @click="runProviderTest" :disabled="provWiz.testing">重测</button>
+                <button class="btn primary" @click="saveProvider" :disabled="provWiz.testing">保存并启用</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </template>
+
       <template v-if="view==='models'">
         <div class="banner warn">
           <span class="ico">!</span>
@@ -1184,10 +1385,11 @@ createApp({
     let authTimer=null, authLeft=0;
 
     const navItems=[
-      {k:'overview',label:'总览'},{k:'accounts',label:'账号'},{k:'models',label:'模型与费率'},
+      {k:'overview',label:'总览'},{k:'providers',label:'接入源'},{k:'accounts',label:'账号'},
+      {k:'models',label:'模型与费率'},
       {k:'benchmark',label:'测速与体检'},{k:'logs',label:'日志'},{k:'settings',label:'设置'}
     ];
-    const titles={overview:'总览',accounts:'账号',models:'模型与费率',
+    const titles={overview:'总览',providers:'接入源',accounts:'账号',models:'模型与费率',
       benchmark:'测速与体检',logs:'日志与诊断',settings:'设置'};
 
     // ---------- 接口封装 ----------
@@ -1260,6 +1462,9 @@ createApp({
       if(view.value==='overview'){
         const t=today.value;
         return `数据每 5 秒刷新 · 今日 ${fmtNum(t.requests)} 次请求`;
+      }
+      if(view.value==='providers'){
+        return `${providerChannelRows.value.length} 个登录授权式渠道 · ${providers.value.length} 个 API Key 式来源 · 客户端只连一个入口`;
       }
       if(view.value==='accounts')return `按渠道分组 · ${totalHealthy.value} 个可用 · ${pausedAccountCount.value} 个暂停`;
       if(view.value==='models'){
@@ -1599,6 +1804,83 @@ createApp({
     };
     const ask=(title,body,action)=>{confirmBox.value={title,body,action};};
 
+    // ---------- 接入源：登录授权式渠道 + API Key 式来源 ----------
+    // 渠道行复用 /api/channels 的数据，来源行来自 /api/providers（key 只回掩码）。
+    const providers=ref([]), presets=ref([]);
+    const provWiz=reactive({
+      open:false,step:1,type:'key',editing:false,testing:false,test:null,
+      preset:'',modelsText:'',
+      cfg:{name:'',display_name:'',base_url:'',api_key:'',supports_tools:true,notes:'',models:[]}
+    });
+    // 只取登录授权式：API Key 式来源在下面单独一行渲染（后端用 source 字段标出来，
+    // 否则同一个来源会被列出两次 —— 实测过，页面上确实重了一行）。
+    const providerChannelRows=computed(()=>channels.value.filter(c=>(c.source||'login')!=='api_key'));
+    const presetInfo=computed(()=>presets.value.find(x=>x.name===provWiz.preset)||null);
+    const loadProviders=async()=>{
+      try{
+        const r=await api('/api/providers');
+        providers.value=r.providers||[];
+        presets.value=r.presets||[];
+      }catch(e){/* 这一页挂了不影响别的页 */}
+    };
+    const resetProviderForm=()=>{
+      provWiz.preset='';provWiz.modelsText='';provWiz.test=null;
+      provWiz.cfg={name:'',display_name:'',base_url:'',api_key:'',supports_tools:true,notes:'',models:[]};
+    };
+    const openProviderWizard=()=>{provWiz.editing=false;provWiz.step=1;provWiz.type='key';resetProviderForm();provWiz.open=true;};
+    const editProvider=(p)=>{
+      provWiz.editing=true;provWiz.step=2;provWiz.type='key';provWiz.test=null;provWiz.preset=p.preset||'';
+      provWiz.modelsText=(p.models||[]).join(', ');
+      provWiz.cfg={name:p.name,display_name:p.display_name,base_url:p.base_url,api_key:'',
+        supports_tools:!!p.supports_tools,notes:p.notes||'',models:p.models||[]};
+      provWiz.open=true;
+    };
+    // applyPreset 只填「模板能确定」的字段；名称已存在时不覆盖（改名等于换渠道）。
+    const applyPreset=()=>{
+      const it=presetInfo.value;
+      if(!it||it.name==='custom'){return;}
+      if(!provWiz.editing)provWiz.cfg.name=it.name;
+      provWiz.cfg.display_name=it.display_name;
+      provWiz.cfg.base_url=it.base_url;
+      provWiz.cfg.supports_tools=!!it.supports_tools;
+      provWiz.cfg.notes=it.free_tier||'';
+      if((it.models||[]).length)provWiz.modelsText=it.models.join(', ');
+    };
+    const providerFormPayload=()=>{
+      const cfg=Object.assign({},provWiz.cfg);
+      cfg.models=provWiz.modelsText.split(',').map(x=>x.trim()).filter(Boolean);
+      return cfg;
+    };
+    // 测试那一步真的会发一条带工具定义的请求 —— 拿不到结构化 tool_calls 就说明
+    // 这个来源不能给 coding agent 当后端，用户在这里就该看到，而不是等他去 Studio 里踩。
+    const runProviderTest=async()=>{
+      provWiz.testing=true;provWiz.test=null;provWiz.step=3;
+      try{provWiz.test=await post('/api/providers/test',providerFormPayload());}
+      catch(e){provWiz.test={auth_ok:false,auth_note:'请求失败',model_count:0,models:[],tools_ok:false,
+        tools_note:'',ttft_ms:0,error:e.message};}
+      finally{provWiz.testing=false;}
+    };
+    const saveProvider=async()=>{
+      try{
+        await post('/api/providers/save',providerFormPayload());
+        toast(provWiz.editing?'已更新接入源':'已添加接入源');
+        provWiz.open=false;
+        await loadProviders();
+        await loadModels();
+      }catch(e){fail(e);}
+    };
+    const askRemoveProvider=p=>{
+      ask('删除接入源 '+p.name+'？','它会同时从模型列表与路由里消失，配置和 key 一起删掉，不可恢复。',async()=>{
+        try{await post('/api/providers/delete',{name:p.name});toast('已删除');await loadProviders();await loadModels();}
+        catch(e){fail(e);}
+      });
+    };
+    const testSavedProvider=async p=>{
+      editProvider(p);
+      provWiz.editing=true;
+      await runProviderTest();
+    };
+
     // ---------- 加载 ----------
     const loadOverview=async()=>{overview.value=await api('/api/overview');};
     const loadAccounts=async()=>{accounts.value=(await api('/api/accounts')).accounts||[];};
@@ -1635,7 +1917,7 @@ createApp({
     };
     const loadAll=async()=>{
       try{
-        await Promise.all([loadOverview(),loadAccounts(),loadChannels(),loadModels(),loadHistory(),loadLogs(),loadSettings(),loadKey()]);
+        await Promise.all([loadOverview(),loadAccounts(),loadChannels(),loadModels(),loadHistory(),loadLogs(),loadSettings(),loadKey(),loadProviders()]);
         if(!diag.channel&&overview.value.channels.length)diag.channel=overview.value.channels[0].kind;
       }catch(e){fail(e);}
     };
@@ -1941,6 +2223,8 @@ createApp({
       detectedBase,clientBase,keyShown,keyPlain,keyPath,copyClientBase,useDetectedBase,copyKey,revealKey,hideKey,rotateKey,
       listenEffective,listenPinned,failedModelCount,hiddenByHealthCount,
       reasonText,
+      providers,presets,provWiz,presetInfo,providerChannelRows,openProviderWizard,editProvider,applyPreset,
+      runProviderTest,saveProvider,askRemoveProvider,testSavedProvider,
       authFlowOpen,
       doSetup,doLogin,logout};
   }

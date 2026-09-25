@@ -25,6 +25,10 @@ const PAGES = [
   ['04-benchmark', '测速与体检', ''],
   ['05-logs', '日志与诊断', ''],
   ['06-settings', '设置', ''],
+  ['08-providers', '接入源', ''],
+  ['09-provider-add', '添加接入源·选类型', '#type'],
+  ['09-provider-add', '添加接入源·填参数', '#key'],
+  ['09-provider-add', '添加接入源·测试保存', '#test'],
 ];
 
 const browser = await chromium.launch({

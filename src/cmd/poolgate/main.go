@@ -92,10 +92,26 @@ func main() {
 	// 渠道开关（设置屏「渠道开关」）：把人工裁定叠到注册表上。
 	applyOverrides(settings)
 
+	// API Key 式来源（官方 API）：配置级接入 —— 填 base_url + key 就多一路。
+	//
+	// 与登录授权式渠道**共用同一个网关入口与账号池**（docs/02 §12）：客户端仍然只连
+	// 一个地址、一个 key，模型名用来源前缀区分（如 google/gemini-3.8-flash）。
+	// 这里给它合成一条「账号」：key 式来源没有多账号概念，但必须进池，否则路由层选不到号。
+	providers := store.NewProviderStore(*dataDir)
+	for _, p := range providers.List() {
+		boot.MountProvider(p, accPool)
+		log.Printf("poolgate: 接入源 %s（API Key 式）已挂载，base_url=%s，tools=%v",
+			p.Name, p.BaseURL, p.SupportsTools)
+	}
+
 	// rebuildPool 重新扫描凭证目录 —— 授权成功/删除账号/导入后调用。
 	rebuildPool := func() {}
 	rebuildPool = func() {
 		for _, e := range registry.Active() {
+			// API Key 式来源的「账号」来自 providers.json（合成账号），不在凭证目录里。
+			if _, isProvider := providers.Get(string(e.Spec.Kind)); isProvider {
+				continue
+			}
 			cs, err := creds.Load(e.Spec.Kind)
 			if err != nil {
 				log.Printf("poolgate: 加载渠道 %s 凭证失败: %v", e.Spec.Kind, err)
@@ -166,6 +182,7 @@ func main() {
 		Settings:      settings,
 		Keys:          keys,
 		Checkins:      checkins,
+		Providers:     providerAdmin{store: providers, pool: accPool},
 		Health:        healthRunner,
 		History:       probeHistory,
 		Excluded:      exclusions,
@@ -405,4 +422,33 @@ func defaultConfDir() string {
 		return v
 	}
 	return filepath.Join("/vol6/@appconf", "poolgate")
+}
+
+// providerAdmin 把「接入源」的管理动作接到装配层：
+// 落盘（store）+ 挂载/摘除（boot）+ 连通性测试（boot，真实打一次带 tools 的请求）。
+type providerAdmin struct {
+	store *store.ProviderStore
+	pool  *pool.Pool
+}
+
+func (a providerAdmin) List() []store.ProviderConfig { return a.store.List() }
+
+func (a providerAdmin) Put(cfg store.ProviderConfig) error {
+	if err := a.store.Put(cfg); err != nil {
+		return err
+	}
+	boot.MountProvider(cfg, a.pool) // 热更新：不重启就生效
+	return nil
+}
+
+func (a providerAdmin) Remove(name string) error {
+	if err := a.store.Remove(name); err != nil {
+		return err
+	}
+	boot.UnmountProvider(name, a.pool)
+	return nil
+}
+
+func (a providerAdmin) Test(ctx context.Context, cfg store.ProviderConfig) boot.ProbeResult {
+	return boot.ProbeProvider(ctx, cfg)
 }

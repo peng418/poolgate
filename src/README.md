@@ -466,6 +466,39 @@ POST https://gateway.qwenwork.cn/api/v1/deviceToken/refresh
 实测：deviceToken 端点仍可用（垃圾 refresh_token → `401 {"errorCode":"INVALID_REFRESH_TOKEN",...}`），
 503 闸门只影响推理端点。协议说明同步写进了 `docs/03-渠道能力矩阵.md` 与适配器包头注释。
 
+### 0.4.3 — 接入源：一个适配器覆盖所有官方 API，面板里三类东西一次管完
+
+**做了什么**（原型见 `prototype/08-providers.html`、`prototype/09-provider-add.html`，裁定见 `docs/02` §12）：
+
+- **通用 OpenAI 兼容上游适配器**（`internal/adapter/openaiup`）：官方 API 那边（Google AI Studio / 阿里百炼 /
+  OpenRouter / DeepSeek / 智谱 / 火山方舟 …）线上格式本来就是 OpenAI 兼容，所以**一个适配器覆盖一整类**，
+  不用一家写一个。填 `base_url` + `key` + 模型名即可。
+- **配置存储**（`internal/store/providers.go`）：`providers.json`（0600，明文 key 等于密码）；名称校验，
+  不允许与内置渠道重名（否则会覆盖注册表里的实现）。
+- **统一入口落地**：key 式来源与登录式渠道**共用同一个网关入口与账号池** —— 客户端仍只连一个地址、一个 key，
+  模型名带来源前缀（`google/gemini-3.8-flash`）。key 式来源合成一条「账号」进池，否则路由层选不到号。
+- **面板「接入源」页**（`/api/providers*` 四个接口 + Vue 视图）：两类来源混排一张表，靠「类型」列与
+  最左侧色块区分（登录式=渠道身份色，key 式=中性方块）；**「添加接入源」三步向导**：选类型 → 填参数
+  （17 个主流平台预设，选中自动带出 base_url，并写明免费档能拿到什么 / 要不要实名）→ **连通性测试**后保存。
+- **连通性测试是这一步的重点**：真发一条**带工具定义**的请求，四项分开报 —— 鉴权 / 模型目录 /
+  **工具调用** / 首字延迟。工具调用那项直接决定这个来源能不能给 Studio / Claude Code 当后端
+  （0.4.2 之前我们静默丢掉 tools，客户端拿到的是一堆乱码，就是缺了这一步验证）。
+- **开发工具**：`tools/mock-openai-upstream.py` —— 没有真实 key 时也能端到端验收（分片 tool_calls、
+  非流式整包、错误信封都模拟了）。
+
+**验证**（模拟上游 + 真机面板，全链路）：
+
+| 场景 | 结果 |
+|---|---|
+| 加一个来源 → 模型目录 | ✅ 立刻多出 `google/mock-strong-1` …（新来源自动进目录与路由） |
+| 带工具调用（非流式/流式） | ✅ 真出 `tool_calls`，分片能拼回；上游确认收到 `tools` |
+| 工具往返 | ✅ 上游收到 `roles: [user, assistant, tool]` 且带 `tool_call_id` |
+| 不支持工具的来源 | ✅ 400 + 可读原因（「已明确拒绝而不是静默忽略」） |
+| 面板向导全过程 | ✅ 选预设自动带出 base_url → 测试（鉴权 ✓ / 目录 ✓ 2 个 / 工具调用 ✓ 可用）→ 保存后列表与目录同步更新 |
+| 删除来源 | ✅ 从列表、注册表、池子、模型目录里一起消失 |
+| 非法配置 | ✅ 明确拒绝（如「名称 qodercn 与内置渠道重名」） |
+| `check.sh` / `audit-ui.mjs` / `audit-vue.mjs` | ✅ 全绿：双端 7 屏无溢出、Vue 0 告警、0 页面报错 |
+
 ### 0.4.2 — 工具调用（tools / tool_calls）打通：Studio 里选的模型终于能干活了
 
 **现象**：在 Ekko Studio 里选 PoolGate 下发的模型，别的 provider 都正常，只有它「不干活 / 回一堆乱码」。

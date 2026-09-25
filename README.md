@@ -1,6 +1,6 @@
 # PoolGate · AI 账号池网关
 
-> **立项日期**：2026-09-24 ｜ **状态**：需求 / 设计方案已确认；实现到 **0.4.2**（安装包见 [Releases](https://github.com/peng418/poolgate/releases)）
+> **立项日期**：2026-09-24 ｜ **状态**：需求 / 设计方案已确认；实现到 **0.4.3**（安装包见 [Releases](https://github.com/peng418/poolgate/releases)）
 > **仓库**：https://github.com/peng418/poolgate ｜ **安装包**：https://github.com/peng418/poolgate/releases
 > **前身/借鉴**：`wild-work`（已定版 v2.4.7，代码冻结不再加功能）
 > **交付形态**：Go 单二进制 + `go:embed` + 飞牛 fnOS 的 FPK
@@ -25,7 +25,11 @@ wild-work 证明了这条路走得通；本项目的任务是把**真正能用�
 | M4 | 七屏补全（账号/模型/测速/日志/设置/总览）、一键诊断、真实抽样体检 | ✅ 完成 |
 | M5 | 六渠道全接入（含千问办公网页端协议）、界面一比一还原原型 | ✅ 完成 |
 
-**当前版本 0.4.2**（2026-09-25）：**工具调用（tools / tool_calls）打通** —— 之前网关把客户端的 `tools`
+**当前版本 0.4.3**（2026-09-25）：**接入源** —— 加一个「通用 OpenAI 兼容上游适配器」，官方 API
+（Google AI Studio / 阿里百炼 / OpenRouter / DeepSeek / 智谱 / 火山方舟 …）**填 base_url + key 就能接**，
+与登录授权式渠道共用同一个网关入口；面板新增「接入源」页（两类来源混排 + 三步向导 + **连通性测试**：
+真发一条带工具定义的请求，确认拿得到结构化 `tool_calls` 才算能用）。
+0.4.2：**工具调用（tools / tool_calls）打通** —— 之前网关把客户端的 `tools`
 **静默丢掉**，上游只能把「要调用工具」写成文本，Studio / Claude Code 这类 agent 拿到的就是「不回复 / 一堆乱码」；
 现在 OpenAI 与 Anthropic 两个入口都透传工具定义、输出标准 `tool_calls` / `tool_use`（含流式分片），
 不支持工具调用的渠道（千问办公）改成**明确拒绝并给原因**，不再静默丢弃。

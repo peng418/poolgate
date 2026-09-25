@@ -82,7 +82,7 @@ M="$PKG/manifest"
   printf 'service_port          = %s\n'   "$PORT"
   printf 'desktop_uidir         = ui\n'
   printf 'desktop_applaunchname = %s.main\n' "$APPNAME"
-  printf 'changelog = 工具调用打通（tools/tool_calls：OpenAI 与 Anthropic 两个入口都透传工具定义并输出标准 tool_calls/tool_use，不支持的渠道明确拒绝不再静默丢弃）+ 面板内真二维码授权不跳转 + 账号池与粘性路由 | FPK %s\n' "$VERSION"
+  printf 'changelog = 接入源：通用 OpenAI 兼容上游适配器（填 base_url+key 即接官方 API：Google/百炼/OpenRouter/DeepSeek/智谱/火山方舟…）+ 面板接入源页与连通性测试（验工具调用）；工具调用打通 OpenAI/Anthropic 两个入口，不支持的渠道明确拒绝不静默丢弃；账号池与粘性路由 | FPK %s\n' "$VERSION"
 } >> "$M"
 chmod 0644 "$M"
 sed -n '1,20p' "$M" | sed 's/^/  /'

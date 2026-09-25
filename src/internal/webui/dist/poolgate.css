@@ -399,3 +399,20 @@ table.kv-t td:last-child { overflow-wrap: anywhere; }
   .bar-row { grid-template-columns: 104px 1fr 52px; }
   .kv { grid-template-columns: 96px 1fr; }
 }
+
+/* 接入源页：类型标记与「API Key 式」中性色块。
+ * 登录式来源用渠道身份色，key 式用中性方块 —— 一眼看出这行是人家的账号还是自己的 key；
+ * 类型旁边还有文字，状态/类型永不只用颜色表达。 */
+.ch.k-key .k {
+  background: var(--surface-2);
+  border: 1px solid var(--axis);
+  border-radius: 2px;
+}
+.source-type {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11.5px; color: var(--ink-2);
+  border: 1px solid var(--border); border-radius: 999px;
+  padding: 1px 8px; white-space: nowrap;
+}
+/* 向导里的两个大选项卡 */
+.modal .card { box-shadow: none; }

@@ -88,7 +88,7 @@ for (const [name, w, h] of [["桌面", 1400, 900], ["手机", 390, 844]]) {
   }
   await p.waitForTimeout(2500);
 
-  for (const [k, label] of [["overview", "总览"], ["accounts", "账号"], ["models", "模型与费率"],
+  for (const [k, label] of [["overview", "总览"], ["providers", "接入源"], ["accounts", "账号"], ["models", "模型与费率"],
     ["benchmark", "测速与体检"], ["logs", "日志"], ["settings", "设置"]]) {
     await p.locator(".nav a", { hasText: label }).first().click({ timeout: 5000 });
     await p.waitForTimeout(900);

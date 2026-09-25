@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PoolGate · 添加接入源</title>
+<link rel="stylesheet" href="assets/poolgate.css">
+<style>
+  /* 这一屏只多一点点：向导里的两个大选项卡 */
+  .pick { display: grid; gap: 12px; grid-template-columns: 1fr 1fr; }
+  .pick a.pick-card {
+    display: block; text-decoration: none; color: inherit;
+    border: 1px solid var(--border); border-radius: var(--radius);
+    background: var(--surface); padding: 14px 15px; box-shadow: var(--shadow);
+  }
+  .pick a.pick-card:hover { background: var(--surface-2); }
+  .pick a.pick-card.on { border-color: var(--s1); box-shadow: 0 0 0 2px rgba(42,120,214,.16); }
+  .pick h3 { margin: 0 0 4px; font-size: 13.5px; }
+  .pick .who { color: var(--ink-3); font-size: 12px; line-height: 1.65; margin: 8px 0 0; }
+  @media (max-width: 820px) { .pick { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="shell">
+  <aside class="side">
+    <div class="brand"><span class="mark">PG</span><b>PoolGate<small>AI 账号池网关</small></b></div>
+    <nav class="nav">
+      <a href="01-overview.html"><span class="dot"></span>总览</a>
+      <a class="on" href="08-providers.html"><span class="dot"></span>接入源</a>
+      <a href="02-accounts.html"><span class="dot"></span>账号</a>
+      <a href="03-models.html"><span class="dot"></span>模型与费率</a>
+      <a href="04-benchmark.html"><span class="dot"></span>测速与体检</a>
+      <a href="05-logs.html"><span class="dot"></span>日志</a>
+      <a href="06-settings.html"><span class="dot"></span>设置</a>
+      <a href="07-login.html"><span class="dot"></span>登录</a>
+      <div class="sep">原型</div>
+      <a href="index.html"><span class="dot"></span>全部原型</a>
+    </nav>
+  </aside>
+
+  <main class="main">
+    <div class="top">
+      <div>
+        <h1>添加接入源</h1>
+        <p>两种来源，同一个入口 · 加完立刻出现在「接入源」列表与模型列表里</p>
+      </div>
+      <div class="actions">
+        <button class="btn" id="themeBtn" onclick="pgToggleTheme()">☾ 暗色</button>
+        <a class="btn" href="08-providers.html" style="text-decoration:none">取消</a>
+      </div>
+    </div>
+
+    <div class="steps" style="margin-bottom:14px">
+      <span class="step-tab" data-for="type"><span class="n">1</span>选类型</span>
+      <span class="step-line"></span>
+      <span class="step-tab" data-for="key"><span class="n">2</span>填参数</span>
+      <span class="step-line"></span>
+      <span class="step-tab" data-for="test"><span class="n">3</span>测试并保存</span>
+    </div>
+
+    <!-- ===================== 视图一：选类型 ===================== -->
+    <section class="view" id="view-type" hidden>
+      <div class="card">
+        <h2>这个来源怎么拿凭证？</h2>
+        <div class="sub">选错了也不怕，下一步可以退回来</div>
+        <div class="pick">
+          <a class="pick-card" href="#auth">
+            <h3><span class="ch k1"><span class="k"></span></span> 登录授权式</h3>
+            <div class="sub" style="margin:0">扫码 / 浏览器点一次授权，凭证自动续期</div>
+            <p class="who">
+              <b>适用</b>：编程助手 / IDE 类平台 —— QoderCN · TraeWork · WorkBuddy · 千问办公 ·
+              腾讯 CodeBuddy · GitHub Copilot · Windsurf · Kiro · Gemini CLI …
+              <br><b>好处</b>：不用 key、协议原生支持工具调用（能给 Studio / Claude Code 干活）
+            </p>
+          </a>
+          <a class="pick-card" href="#key">
+            <h3><span class="ch k-key"><span class="k"></span></span> API Key 式</h3>
+            <div class="sub" style="margin:0">去官网注册后创建一串 key，填进来即可</div>
+            <p class="who">
+              <b>适用</b>：官方 API —— Google AI Studio · 阿里百炼 · OpenRouter · DeepSeek ·
+              智谱 GLM · 火山方舟/豆包 · 智谱 · MiniMax · SiliconFlow …
+              <br><b>好处</b>：配置级、立刻可用、免费额度明确
+            </p>
+          </a>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================== 视图二：API Key 表单 ===================== -->
+    <section class="view" id="view-key" hidden>
+      <div class="grid g2">
+        <div class="card">
+          <h2>API Key 式来源</h2>
+          <div class="sub">选个预设，base_url 会自动带出来；模型清单可以从上游拉，也可以手填</div>
+
+          <div class="field">
+            <label>预设</label>
+            <select>
+              <option>Google AI Studio（Gemini）· 免费层</option>
+              <option>阿里百炼（通义千问）· 免费额度</option>
+              <option>OpenRouter · 有 :free 模型</option>
+              <option>DeepSeek 官方</option>
+              <option>智谱 GLM（含永久免费 Flash）</option>
+              <option>火山方舟（豆包）· 送 50 万 tokens/模型</option>
+              <option>自定义（自己填 base_url）</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label>base_url</label>
+            <input class="mono" value="https://generativelanguage.googleapis.com/v1beta/openai" spellcheck="false">
+          </div>
+
+          <div class="field">
+            <label>API Key</label>
+            <div class="pw-row">
+              <input type="password" class="mono" value="AIzaSyD-••••••••••••••••••••••••" spellcheck="false">
+              <button class="btn sm">显示</button>
+            </div>
+            <p class="hint" style="margin:0">key 等于密码，只存在本机 · 落盘 0600 · 面板不会把它写进日志或导出</p>
+          </div>
+
+          <div class="field">
+            <label>模型清单</label>
+            <div class="pw-row">
+              <input class="mono" value="gemini-3.8-flash, gemini-3.7-flash" spellcheck="false">
+              <button class="btn sm">从上游拉取</button>
+            </div>
+            <p class="hint" style="margin:0">拉取失败时可以手填；留空则用上游 <span class="mono">/v1/models</span> 返回的结果</p>
+          </div>
+
+          <div class="field">
+            <label>工具调用能力</label>
+            <select>
+              <option>自动探测（推荐）—— 探测到就声明，探测不到就明确拒绝</option>
+              <option>上游支持 tools</option>
+              <option>上游不支持 tools（带工具的请求会被明确拒绝，不会静默丢弃）</option>
+            </select>
+          </div>
+
+          <div class="actions" style="display:flex;gap:8px;margin-top:4px">
+            <button class="btn">返回上一步</button>
+            <button class="btn primary">下一步：测试连通性</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>填之前先知道（来自实测调研）</h2>
+          <div class="sub">这些数字都是官方页面原文，不是估的</div>
+          <table>
+            <thead><tr><th>来源</th><th>免费档最强模型</th><th>额度</th><th>要实名</th></tr></thead>
+            <tbody>
+              <tr><td>Google AI Studio</td><td>gemini-3.8-flash</td><td>token 全免费 · 限速见控制台</td><td>否</td></tr>
+              <tr><td>阿里百炼</td><td>qwen3.8-max</td><td>每模型约 100 万 token · 90 天</td><td>免费额度不要</td></tr>
+              <tr><td>OpenRouter</td><td>nemotron-3-ultra-550b:free</td><td>20 RPM · 50 次/日</td><td>否</td></tr>
+              <tr><td>智谱 GLM</td><td>glm-4.7-flash</td><td>永久免费</td><td>是</td></tr>
+              <tr><td>火山方舟</td><td>doubao-seed-2.x</td><td>每模型送 50 万 tokens</td><td>是</td></tr>
+            </tbody>
+          </table>
+          <p class="hint" style="margin:10px 0 0">
+            ⚠️ 免费层通常只给中低档模型：<b>Gemini 的 Pro 系免费档不可用</b>（要 Pro 得走 Gemini CLI 的 OAuth）；
+            Copilot Free / Windsurf Free / Cursor Hobby 都<b>没有对外 API</b>，接不了网关。
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================== 视图三：测试并保存 ===================== -->
+    <section class="view" id="view-test" hidden>
+      <div class="card" style="max-width:720px">
+        <h2>连通性测试</h2>
+        <div class="sub">保存前先跑一遍 —— 免得加完才发现 key 不对或模型名写错</div>
+
+        <table>
+          <tbody>
+            <tr><td>鉴权</td><td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>通过</span>
+              <div class="hint">key 有效，未被拒绝</div></td></tr>
+            <tr><td>模型目录</td><td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>拉到 4 个模型</span>
+              <div class="hint mono">gemini-3.8-flash · gemini-3.7-flash · gemini-3.6-flash · gemini-3.5-flash-lite</div></td></tr>
+            <tr><td>工具调用</td><td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>可用</span>
+              <div class="hint">发了一条带 <span class="mono">tools</span> 的请求，收到结构化 <span class="mono">tool_calls</span>（可作为 Studio / Claude Code 后端）</div></td></tr>
+            <tr><td>首字延迟</td><td><b>840 ms</b> <span class="hint">（本机 → 上游，实测 3 次取中位）</span></td></tr>
+            <tr><td>免费额度</td><td><span class="pill warn"><span class="i">!</span><span class="swatch"></span>限速未公开</span>
+              <div class="hint">Google 把免费层 RPM/RPD 从文档撤了，只在 AI Studio 控制台可见 —— 面板只显示「已用/今日」的本地计数</div></td></tr>
+          </tbody>
+        </table>
+
+        <div class="field" style="margin-top:14px">
+          <label>这个来源叫什么（就是模型前缀，加了就不能随便改）</label>
+          <input class="mono" value="google" spellcheck="false">
+          <p class="hint" style="margin:0">客户端里的模型名会变成 <span class="mono">google/gemini-3.8-flash</span></p>
+        </div>
+
+        <div class="actions" style="display:flex;gap:8px">
+          <button class="btn">返回上一步</button>
+          <button class="btn primary">保存并启用</button>
+          <button class="btn">保存但先暂停</button>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script src="assets/poolgate.js"></script>
+<script>
+// hash 切视图（同 07-login：必须监听 hashchange，否则连续换 hash 会停在首视图）
+const VIEWS = ['type', 'key', 'test'];
+function pgShowView() {
+  let h = (location.hash || '#type').slice(1);
+  if (!VIEWS.includes(h)) h = 'type';
+  VIEWS.forEach((v) => {
+    const el = document.getElementById('view-' + v);
+    if (el) el.hidden = v !== h;
+  });
+  document.querySelectorAll('.step-tab').forEach((t) => {
+    const i = VIEWS.indexOf(t.dataset.for), cur = VIEWS.indexOf(h);
+    t.classList.toggle('on', i === cur);
+    t.classList.toggle('done', i < cur);
+    t.querySelector('.n').textContent = i < cur ? '✓' : String(i + 1);
+  });
+}
+window.addEventListener('hashchange', pgShowView);
+document.addEventListener('DOMContentLoaded', pgShowView);
+pgShowView();
+</script>
+</body>
+</html>

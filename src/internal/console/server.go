@@ -49,6 +49,8 @@ type Options struct {
 	Settings *store.SettingsStore
 	// Keys 网关 API Key（面板显示/轮换）。可为 nil（测试）。
 	Keys *store.APIKeyStore
+	// Providers API Key 式来源的管理（面板「接入源」页）。为 nil 时该页只读/不可用。
+	Providers ProviderAdmin
 	// Checkins 签到结果（F1.8）。可为 nil（测试）。
 	Checkins *store.CheckinStore
 	// Health 健康探测执行器（F5.1/F5.3）。可为 nil（测试）。
@@ -194,6 +196,11 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/api/account/refresh", s.withAuth(s.handleAccountRefresh))
 	mux.HandleFunc("/api/account/checkin_all", s.withAuth(s.handleCheckinAll))
 	mux.HandleFunc("/api/account/refresh_all", s.withAuth(s.handleRefreshAll))
+	// 接入源（API Key 式来源）：增删改查 + 连通性测试（含工具调用验证）
+	mux.HandleFunc("/api/providers", s.withAuth(s.handleProviders))
+	mux.HandleFunc("/api/providers/save", s.withAuth(s.handleProviderSave))
+	mux.HandleFunc("/api/providers/delete", s.withAuth(s.handleProviderDelete))
+	mux.HandleFunc("/api/providers/test", s.withAuth(s.handleProviderTest))
 	// 模型与费率（F4.x）
 	mux.HandleFunc("/api/model/catalog", s.withAuth(s.handleModelCatalog))
 	mux.HandleFunc("/api/model/toggle", s.withAuth(s.handleModelToggle))
@@ -376,6 +383,20 @@ func (s *Server) handleChannels(w http.ResponseWriter, r *http.Request) {
 		PanelAuthNote string `json:"panel_auth_note,omitempty"`
 		// AccountCount 该渠道当前账号数（前端据此提示「先去加号」）。
 		AccountCount int `json:"account_count"`
+		// Source 区分来源类型：login（登录授权式）| api_key（API Key 式来源）。
+		// 「接入源」页把两类并到一张表，靠它去重 —— 否则 key 式来源会被列出两次。
+		Source string `json:"source"`
+	}
+	isKeySource := func(kind string) bool {
+		if s.opts.Providers == nil {
+			return false
+		}
+		for _, c := range s.opts.Providers.List() {
+			if c.Name == kind {
+				return true
+			}
+		}
+		return false
 	}
 	out := []item{}
 	for _, e := range registry.All() {
@@ -398,6 +419,7 @@ func (s *Server) handleChannels(w http.ResponseWriter, r *http.Request) {
 			PanelAuth:     canAuth,
 			PanelAuthNote: note,
 			AccountCount:  n,
+			Source:        map[bool]string{true: "api_key", false: "login"}[isKeySource(string(e.Spec.Kind))],
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"channels": out})

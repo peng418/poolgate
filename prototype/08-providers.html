@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PoolGate · 接入源</title>
+<link rel="stylesheet" href="assets/poolgate.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="side">
+    <div class="brand"><span class="mark">PG</span><b>PoolGate<small>AI 账号池网关</small></b></div>
+    <nav class="nav">
+      <a href="01-overview.html"><span class="dot"></span>总览</a>
+      <a class="on" href="08-providers.html"><span class="dot"></span>接入源</a>
+      <a href="02-accounts.html"><span class="dot"></span>账号</a>
+      <a href="03-models.html"><span class="dot"></span>模型与费率</a>
+      <a href="04-benchmark.html"><span class="dot"></span>测速与体检</a>
+      <a href="05-logs.html"><span class="dot"></span>日志</a>
+      <a href="06-settings.html"><span class="dot"></span>设置</a>
+      <a href="07-login.html"><span class="dot"></span>登录</a>
+      <div class="sep">原型</div>
+      <a href="index.html"><span class="dot"></span>全部原型</a>
+    </nav>
+  </aside>
+
+  <main class="main">
+    <div class="top">
+      <div>
+        <h1>接入源</h1>
+        <p>4 个登录授权式渠道 · 4 个 API Key 式来源 · 共下发 76 个模型</p>
+      </div>
+      <div class="actions">
+        <button class="btn" id="themeBtn" onclick="pgToggleTheme()">☾ 暗色</button>
+        <button class="btn">全部测一遍</button>
+        <button class="btn primary">＋ 添加接入源</button>
+      </div>
+    </div>
+
+    <!-- 统一入口：这是全项目最重要的一句话，放在最上面 -->
+    <div class="banner" style="margin-bottom:14px">
+      <span class="ico">◎</span>
+      <div>
+        <b>客户端只认一个地址：<span class="mono">http://&lt;NAS-IP&gt;:5014/v1</span> ＋ 一个 API Key</b>
+        <p>不管模型来自扫码授权的渠道，还是你填 key 的官方 API —— 都从这一个入口调用。
+           模型名带来源前缀区分：<span class="mono">qodercn/glm-5.3</span> ·
+           <span class="mono">traework/Doubao-Seed-2.1-Pro</span> ·
+           <span class="mono">google/gemini-3.8-flash</span>；
+           不带前缀时走「默认来源」（当前 = QoderCN，可在设置里改）。</p>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
+      <h2>全部接入源</h2>
+      <div class="sub">状态列用「图标 + 文字 + 色块」三重表达 · 额度列区分「余额」与「配额」——恢复方式不同，不能混着说</div>
+      <div style="overflow-x:auto">
+      <table>
+        <thead>
+          <tr>
+            <th>接入源</th><th>类型</th><th>状态</th><th>额度 / 余额</th>
+            <th class="num">模型</th><th class="num">近 20 次成功率</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <!-- ===== 登录授权式（扫码/浏览器授权，无需 key）===== -->
+          <tr>
+            <td><span class="ch k1"><span class="k"></span><b>QoderCN</b></span>
+              <div class="hint mono">1 个账号 · 可签到 +100/日</div></td>
+            <td><span class="source-type">登录授权</span></td>
+            <td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>正常</span></td>
+            <td><b>477</b> <span class="hint">Credits</span></td>
+            <td class="num">14</td><td class="num">100%</td>
+            <td><button class="btn sm">测一遍</button> <button class="btn sm">重新登录</button> <button class="btn sm">暂停</button></td>
+          </tr>
+          <tr>
+            <td><span class="ch k2"><span class="k"></span><b>WorkBuddyCN</b></span>
+              <div class="hint mono">1 个账号 · 无图片能力</div></td>
+            <td><span class="source-type">登录授权</span></td>
+            <td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>正常</span></td>
+            <td><b>2024</b> <span class="hint">Credits</span></td>
+            <td class="num">10</td><td class="num">98%</td>
+            <td><button class="btn sm">测一遍</button> <button class="btn sm">重新登录</button> <button class="btn sm">暂停</button></td>
+          </tr>
+          <tr>
+            <td><span class="ch k3"><span class="k"></span><b>TraeWork</b></span>
+              <div class="hint mono">1 个账号 · 豆包 Seed 2.1 Pro 可用</div></td>
+            <td><span class="source-type">登录授权</span></td>
+            <td><span class="pill warn"><span class="i">!</span><span class="swatch"></span>降级</span>
+              <div class="hint">1 个模型连续挂死已剔除</div></td>
+            <td><b>2034</b> <span class="hint">Credits</span></td>
+            <td class="num">27 <span class="hint">/28</span></td><td class="num">96%</td>
+            <td><button class="btn sm">测一遍</button> <button class="btn sm">重新登录</button> <button class="btn sm">暂停</button></td>
+          </tr>
+          <tr>
+            <td><span class="ch k6"><span class="k"></span><b>WorkBuddyAI</b></span>
+              <div class="hint mono">有 gpt-5.5 / 5.6-luna·sol·terra</div></td>
+            <td><span class="source-type">登录授权</span></td>
+            <td><span class="pill crit"><span class="i">✕</span><span class="swatch"></span>额度耗尽</span>
+              <div class="hint">上游 <span class="mono">code 14018</span> Credits exhausted</div></td>
+            <td><b>0</b> <span class="hint">Credits</span></td>
+            <td class="num">19</td><td class="num">62%</td>
+            <td><button class="btn sm">换账号</button> <button class="btn sm">重新登录</button> <button class="btn sm danger">暂停</button></td>
+          </tr>
+
+          <!-- ===== API Key 式（官方 API，填 base_url + key）===== -->
+          <tr>
+            <td><span class="ch k-key"><span class="k"></span><b>Google AI Studio</b></span>
+              <div class="hint mono">generativelanguage.googleapis.com</div></td>
+            <td><span class="source-type">API Key</span></td>
+            <td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>正常</span>
+              <div class="hint">工具调用 ✓ · 免费层</div></td>
+            <td>
+              <div class="quota">
+                <div class="track"><i style="width:38%"></i></div>
+                <div class="n">免费层 · 今日 38%<span class="hint"> · 限速见控制台</span></div>
+              </div>
+            </td>
+            <td class="num">4</td><td class="num">100%</td>
+            <td><button class="btn sm">测一遍</button> <button class="btn sm">编辑</button> <button class="btn sm">暂停</button></td>
+          </tr>
+          <tr>
+            <td><span class="ch k-key"><span class="k"></span><b>阿里百炼</b></span>
+              <div class="hint mono">dashscope…/compatible-mode/v1</div></td>
+            <td><span class="source-type">API Key</span></td>
+            <td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>正常</span>
+              <div class="hint">qwen3.8-max 额度期内</div></td>
+            <td>
+              <div class="quota">
+                <div class="track warn"><i style="width:76%"></i></div>
+                <div class="n">免费额度剩 <b>24 万</b> tokens<span class="hint"> · 89 天到期</span></div>
+              </div>
+            </td>
+            <td class="num">3</td><td class="num">100%</td>
+            <td><button class="btn sm">测一遍</button> <button class="btn sm">编辑</button> <button class="btn sm">暂停</button></td>
+          </tr>
+          <tr>
+            <td><span class="ch k-key"><span class="k"></span><b>OpenRouter</b></span>
+              <div class="hint mono">openrouter.ai/api/v1 · 兜底多路</div></td>
+            <td><span class="source-type">API Key</span></td>
+            <td><span class="pill serious"><span class="i">◐</span><span class="swatch"></span>限速中</span>
+              <div class="hint">20 RPM 打满，正在排队</div></td>
+            <td>
+              <div class="quota">
+                <div class="track crit"><i style="width:92%"></i></div>
+                <div class="n">今日 <b>46/50</b> 次<span class="hint"> · 充 $10 可到 1000/日</span></div>
+              </div>
+            </td>
+            <td class="num">5</td><td class="num">94%</td>
+            <td><button class="btn sm">测一遍</button> <button class="btn sm">编辑</button> <button class="btn sm">暂停</button></td>
+          </tr>
+          <tr>
+            <td><span class="ch k-key"><span class="k"></span><b>智谱 GLM</b></span>
+              <div class="hint mono">open.bigmodel.cn/api/paas/v4</div></td>
+            <td><span class="source-type">API Key</span></td>
+            <td><span class="pill pause"><span class="i">‖</span><span class="swatch"></span>已暂停</span>
+              <div class="hint">人工暂停 · 不影响其它来源</div></td>
+            <td><span class="hint">未启用，不计额度</span></td>
+            <td class="num">1</td><td class="num">—</td>
+            <td><button class="btn sm">启用</button> <button class="btn sm">编辑</button> <button class="btn sm danger">删除</button></td>
+          </tr>
+        </tbody>
+      </table>
+      </div>
+    </div>
+
+    <div class="grid g2">
+      <div class="card">
+        <h2>两类接入源的区别（面板要讲清楚，别让人猜）</h2>
+        <div class="sub">同一张表里混着放，靠「类型」列与色块区分</div>
+        <table>
+          <thead><tr><th></th><th>登录授权式</th><th>API Key 式</th></tr></thead>
+          <tbody>
+            <tr><td>怎么来</td><td>扫码 / 浏览器授权一次</td><td>去官网注册后创建 key</td></tr>
+            <tr><td>凭证</td><td>cookie / JWT，可自动续期</td><td>一串 key（等于密码）</td></tr>
+            <tr><td>额度恢复</td><td>签到、等冷却、换账号</td><td>等限速窗口、充额度、换 key</td></tr>
+            <tr><td>工具调用</td><td>协议原生支持（IDE 类）</td><td>看上游；不支持的会明确拒绝</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h2>额度列的三种形态</h2>
+        <div class="sub">同一列要能表达三种完全不同的东西</div>
+        <p class="hint" style="margin:0 0 10px">
+          <b>余额</b>（Credits，会花完、可签到补）· <b>配额</b>（免费 token 总量 + 到期日）·
+          <b>限速</b>（每分钟/每天次数，滑窗恢复）。混着用一个数字表示，用户就分不清「要不要充值」还是「等一会儿」。
+        </p>
+        <p class="hint" style="margin:0">
+          恢复方式直接写在旁边：<span class="mono">· 89 天到期</span> / <span class="mono">· 充 $10 可到 1000/日</span> /
+          <span class="mono">· 签到 +100/日</span>。
+        </p>
+      </div>
+    </div>
+  </main>
+</div>
+<script src="assets/poolgate.js"></script>
+</body>
+</html>

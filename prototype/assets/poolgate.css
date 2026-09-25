@@ -23,6 +23,9 @@
   --s1: #2a78d6;  /* QoderCN */
   --s2: #eb6834;  /* WorkBuddyCN */
   --s3: #1baf7a;  /* TraeWork */
+  --s4: #eda100;  /* 千问办公 */
+  --s5: #e87ba4;  /* QoderCOM */
+  --s6: #008300;  /* WorkBuddyAI */
   /* 状态（保留语义，永不复用为系列色） */
   --good: #0ca30c;
   --warn: #fab219;
@@ -55,6 +58,12 @@
     --s1: #3987e5;
     --s2: #d95926;
     --s3: #199e70;
+  --s4: #c98500;
+  --s5: #d55181;
+  --s6: #008300;
+    --s4: #c98500;
+    --s5: #d55181;
+    --s6: #008300;
     --good-text: #0ca30c;
     --r1: #184f95; --r2: #1c5cab; --r3: #256abf; --r4: #2a78d6;
     --r5: #3987e5; --r6: #5598e7; --r7: #6da7ec;
@@ -78,6 +87,9 @@
   --s1: #3987e5;
   --s2: #d95926;
   --s3: #199e70;
+  --s4: #c98500;
+  --s5: #d55181;
+  --s6: #008300;
   --good-text: #0ca30c;
   --r1: #184f95; --r2: #1c5cab; --r3: #256abf; --r4: #2a78d6;
   --r5: #3987e5; --r6: #5598e7; --r7: #6da7ec;
@@ -191,6 +203,9 @@ td .muted { color: var(--ink-3); }
 .ch.k1 .k { background: var(--s1); }
 .ch.k2 .k { background: var(--s2); }
 .ch.k3 .k { background: var(--s3); }
+.ch.k4 .k { background: var(--s4); }
+.ch.k5 .k { background: var(--s5); }
+.ch.k6 .k { background: var(--s6); }
 
 /* 条形（单色阶，量值编码） */
 .bars { display: grid; gap: 8px; }
@@ -364,18 +379,52 @@ table.kv-t td:last-child { overflow-wrap: anywhere; }
 }
 .hint { color: var(--ink-3); font-size: 11.5px; }
 @media (max-width: 820px) {
-  .shell { grid-template-columns: 1fr; }
-  .side { flex-direction: row; overflow-x: auto; align-items: center; padding: 10px; }
+  /* minmax(0,1fr) 而不是 1fr：栅格列默认是 min-content 下限，卡片里的宽表格
+   * 会把整列撑到 499px（视口 390），于是整页横向溢出。这是栅格布局的经典坑。 */
+  .shell { grid-template-columns: minmax(0, 1fr); }
+  .grid { min-width: 0; }
+  .grid > * { min-width: 0; }
+  /* select 的宽度会被最长 option 的文字撑开（实测 416px > 视口 390）—— 必须限住 */
+  .field select { width: 100%; max-width: 100%; min-width: 0; }
+  .card { min-width: 0; max-width: 100%; }
+  /* min-width:0 是必须的：栅格子项默认 min-width:auto，导航条的内容宽度会把整页撑破
+   * （实测 390px 下 documentElement 横向溢出）。加上之后导航在自身容器里横滚，页面不滚。 */
+  .side { flex-direction: row; overflow-x: auto; align-items: center; padding: 10px; min-width: 0; }
   .brand { padding: 0 10px 0 4px; }
   .brand small { display: none; }
-  .nav { display: flex; gap: 4px; }
+  .nav { display: flex; gap: 4px; min-width: 0; }
+  .main { min-width: 0; }
   .nav .sep { display: none; }
   .main { padding: 16px; }
   .top { flex-wrap: wrap; }
   .top .actions { flex-wrap: wrap; }
+  /* 卡片内的按钮行同样要能换行：设置页那几个按钮在 390px 下会把页面撑到 523px */
+  .actions { flex-wrap: wrap; min-width: 0; }
   /* 宽表格在卡片内横向滚动：页面本身不横向滚动，按钮不换行 */
   .card table { display: block; overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
   .card table th, .card table td { white-space: nowrap; }
   .bar-row { grid-template-columns: 104px 1fr 52px; }
   .kv { grid-template-columns: 96px 1fr; }
 }
+
+/* 接入源类型标记：登录授权式用渠道身份色块，API Key 式用中性方块 + 字形，
+ * 这样「一眼看出这一行是人家的账号还是自己的 key」——状态/类型永不只用颜色表达。 */
+.ch.k-key .k {
+  background: var(--surface-2);
+  border: 1px solid var(--axis);
+  border-radius: 2px;
+}
+.source-type {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11.5px; color: var(--ink-2);
+  border: 1px solid var(--border); border-radius: 999px;
+  padding: 1px 8px; white-space: nowrap;
+}
+.source-type .g { font-size: 10px; color: var(--ink-3); }
+/* 配额条（key 式接入源没有「余额」，用额度条表达） */
+.quota { display: grid; gap: 4px; min-width: 132px; }
+.quota .track { height: 5px; background: var(--surface-2); border-radius: 3px; overflow: hidden; }
+.quota .track > i { display: block; height: 100%; background: var(--s1); }
+.quota .track.warn > i { background: var(--warn); }
+.quota .track.crit > i { background: var(--crit); }
+.quota .n { font-size: 12px; color: var(--ink-2); }
