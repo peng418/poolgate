@@ -265,7 +265,7 @@ func (a *Adapter) Chat(ctx context.Context, c *channel.Credential, req channel.C
 	msgs := make([]channel.Message, len(req.Messages))
 	copy(msgs, req.Messages)
 
-	rawBody, err := buildAgentBody(msgs, a.modelEntry(modelKey), false, req.MaxTokens, a.userTypeOf(c))
+	rawBody, err := buildAgentBody(msgs, a.modelEntry(modelKey), req.ForwardTools(), false, req.MaxTokens, a.userTypeOf(c))
 	if err != nil {
 		return nil, errs.New(errs.Parse, "构造请求体失败").WithAccount(c.UID).WithCause(err)
 	}

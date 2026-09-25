@@ -61,8 +61,11 @@ fi
 echo "  通过（相对路径 + 单引号接口路径）"
 
 # -s -w 去掉符号表与调试信息，单文件交付体积更小。
+# -trimpath：不把构建机的绝对路径编进二进制（wild-work 那边实测过 93 处泄漏，
+# 交付物要「只有干净的代码和包」，这条是硬要求）。
 cd "$ROOT"
 "$GO" build \
+  -trimpath \
   -ldflags "-s -w -X main.Version=$VERSION" \
   -o "$OUT/poolgate" \
   ./cmd/poolgate

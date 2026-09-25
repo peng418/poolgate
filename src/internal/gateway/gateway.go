@@ -165,19 +165,61 @@ func (s *Server) modelsFor(r *http.Request, e registry.Entry) []channel.ModelInf
 
 // chatRequest 是 OpenAI chat.completions 请求的解析子集。
 type chatRequest struct {
-	Model       string         `json:"model"`
-	Messages    []chatMessage  `json:"messages"`
-	MaxTokens   int            `json:"max_tokens"`
-	Temperature *float64       `json:"temperature"`
-	Stream      bool           `json:"stream"`
-	Stop        []string       `json:"stop"`
-	TopP        *float64       `json:"top_p"`
-	Extra       map[string]any `json:"-"`
+	Model       string           `json:"model"`
+	Messages    []chatMessage    `json:"messages"`
+	MaxTokens   int              `json:"max_tokens"`
+	Temperature *float64         `json:"temperature"`
+	Stream      bool             `json:"stream"`
+	Stop        []string         `json:"stop"`
+	TopP        *float64         `json:"top_p"`
+	Tools       []map[string]any `json:"tools"`
+	ToolChoice  any              `json:"tool_choice"`
 }
 
+// chatMessage 是一条入站消息。content 允许三种形态（OpenAI 规范）：
+// 字符串、parts 数组、null（assistant 只发 tool_calls 时可以是 null）。
+// 这里用 RawMessage 收下来再归一成文本 —— 工具结果本来就是文本。
 type chatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string             `json:"role"`
+	Content    json.RawMessage    `json:"content"`
+	ToolCalls  []channel.ToolCall `json:"tool_calls"`
+	ToolCallID string             `json:"tool_call_id"`
+	Name       string             `json:"name"`
+}
+
+// text 把 content 归一成纯文本：字符串直用；parts 数组取 text 片段；null/缺失为空串。
+func (m chatMessage) text() string {
+	if len(m.Content) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(m.Content, &s); err == nil {
+		return s
+	}
+	var parts []map[string]any
+	if err := json.Unmarshal(m.Content, &parts); err == nil {
+		var b strings.Builder
+		for _, p := range parts {
+			if t, _ := p["text"].(string); t != "" {
+				b.WriteString(t)
+			}
+		}
+		return b.String()
+	}
+	return ""
+}
+
+// toChannel 归一成内部消息，**保留工具调用的往返结构**：
+// assistant 的 tool_calls 与 role=tool 消息的 tool_call_id 必须原样带给上游，
+// 否则模型会以为自己上一轮什么都没调用，从而重复调用同一个工具。
+func (m chatMessage) toChannel() channel.Message {
+	return channel.Message{
+		Role:       m.Role,
+		Content:    m.text(),
+		ToolCalls:  m.ToolCalls,
+		ToolCallID: m.ToolCallID,
+		Name:       m.Name,
+	}
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -220,10 +262,20 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			WithChannel(string(kind)))
 		return
 	}
+	// 工具调用：渠道实现不了就**明确拒绝**（F3.7）。
+	// 静默丢掉 tools 是最坏的一种处理：上游收不到工具定义，会把「我要调用工具」
+	// 写成普通文本（各家的标记还不一样），客户端拿不到 tool_calls，
+	// 表现成「模型不回复 / 回一堆看不懂的乱码」—— coding agent 直接不可用。
+	if len(req.Tools) > 0 && !spec.Tools {
+		writeErr(w, http.StatusBadRequest, errs.New(errs.ModelUnavailable,
+			"渠道 "+string(kind)+" 暂不支持工具调用（tools）：已明确拒绝而不是静默忽略，"+
+				"请去掉 tools 或改用支持工具调用的渠道").WithChannel(string(kind)))
+		return
+	}
 
 	msgs := make([]channel.Message, len(req.Messages))
 	for i, m := range req.Messages {
-		msgs[i] = channel.Message{Role: m.Role, Content: m.Content}
+		msgs[i] = m.toChannel()
 	}
 	creq := channel.ChatRequest{
 		Model:       modelName,
@@ -231,6 +283,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		MaxTokens:   req.MaxTokens,
 		Temperature: req.Temperature,
 		Stream:      req.Stream,
+		Tools:       req.Tools,
+		ToolChoice:  req.ToolChoice,
 	}
 
 	// 路由：选号 + 换号重试 + 分档冷却。
@@ -360,17 +414,59 @@ func hasContent(c channel.ChatCompletionChunk) bool {
 	return false
 }
 
+// mergeToolCalls 把流式 tool_calls 分片拼回完整调用。
+//
+// 两种上游形态都要吃下：
+//   - OpenAI 式增量：首片带 id/type/name，后续片只有 arguments 片段，靠 index 归并；
+//   - agent 式整包：每帧就是一个完整调用（带 id），此时按 id 归并、遇到新 id 就新增。
+//
+// 只按 index 归并会把「没有 index 的多个完整调用」错误地粘成一个，所以优先认 id。
+func mergeToolCalls(acc []channel.ToolCall, delta []channel.ToolCall) []channel.ToolCall {
+	for _, d := range delta {
+		idx := -1
+		for i := range acc {
+			if d.ID != "" {
+				if acc[i].ID == d.ID {
+					idx = i
+					break
+				}
+				continue
+			}
+			if acc[i].Index == d.Index {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			acc = append(acc, d)
+			continue
+		}
+		if d.ID != "" {
+			acc[idx].ID = d.ID
+		}
+		if d.Type != "" {
+			acc[idx].Type = d.Type
+		}
+		if d.Function.Name != "" {
+			acc[idx].Function.Name = d.Function.Name
+		}
+		acc[idx].Function.Arguments += d.Function.Arguments
+	}
+	return acc
+}
+
 // aggregateChunks 聚合为单个 chat.completion 响应（非流式）。
 // 返回首字延迟与「是否真的收到了内容」，与 streamChunks 同一套判据。
 func (s *Server) aggregateChunks(w http.ResponseWriter, kind channel.Kind, cred channel.Credential, stream channel.Stream, model string) (time.Duration, bool) {
 	var (
-		id      string
-		created int64
-		content strings.Builder
-		role    = "assistant"
-		finish  = "stop"
-		usage   map[string]any
-		got     int // 收到的 chunk 数：一个都没收到 = 上游空流，不能当成功
+		id        string
+		created   int64
+		content   strings.Builder
+		role      = "assistant"
+		finish    = "stop"
+		usage     map[string]any
+		toolCalls []channel.ToolCall // 流式 tool_calls 分片按 index 拼回完整调用
+		got       int                // 收到的 chunk 数：一个都没收到 = 上游空流，不能当成功
 	)
 	start := time.Now()
 	var ttft time.Duration
@@ -399,6 +495,7 @@ func (s *Server) aggregateChunks(w http.ResponseWriter, kind channel.Kind, cred 
 				role = c.Delta.Role
 			}
 			content.WriteString(c.Delta.Content)
+			toolCalls = mergeToolCalls(toolCalls, c.Delta.ToolCalls)
 			if c.FinishReason != "" {
 				finish = c.FinishReason
 			}
@@ -418,6 +515,15 @@ func (s *Server) aggregateChunks(w http.ResponseWriter, kind channel.Kind, cred 
 		created = time.Now().Unix()
 	}
 	s.pool.NoteSuccess(kind, cred.UID)
+	message := map[string]any{"role": role, "content": content.String()}
+	if len(toolCalls) > 0 {
+		message["tool_calls"] = toolCalls
+		// 有工具调用时 finish_reason 必须是 tool_calls（客户端据此判断「先执行工具再继续」）。
+		// 上游常常仍报 stop/空，这里按事实纠正；length 等真实截断原因不动。
+		if finish == "" || finish == "stop" {
+			finish = "tool_calls"
+		}
+	}
 	resp := map[string]any{
 		"id":      id,
 		"object":  "chat.completion",
@@ -426,7 +532,7 @@ func (s *Server) aggregateChunks(w http.ResponseWriter, kind channel.Kind, cred 
 		"choices": []any{
 			map[string]any{
 				"index":         0,
-				"message":       map[string]any{"role": role, "content": content.String()},
+				"message":       message,
 				"finish_reason": finish,
 			},
 		},

@@ -28,11 +28,13 @@ type ModelEntry struct {
 // buildAgentBody 构造请求体。
 //   - messages：客户端消息列表（可含 system/assistant/tool 多轮）
 //   - mc：model_config 条目（来自动态模型表；nil 时用 auto 兜底）
+//   - tools：客户端传来的 OpenAI tools 数组；为空则不注入 tools 字段
 //   - enableReasoning：是否启用思考模式
 //   - maxTokens：客户端请求的 max_tokens，<=0 时用模板默认 32768
 //
-// 注意：developer 角色必须改写为 system。
-func buildAgentBody(messages []channel.Message, mc *ModelEntry, enableReasoning bool, maxTokens int, userType string) ([]byte, error) {
+// 注意：developer 角色必须改写为 system；assistant 的 tool_calls 与
+// role=tool 消息的 tool_call_id 必须原样回传，否则模型会重复调用同一个工具。
+func buildAgentBody(messages []channel.Message, mc *ModelEntry, tools []map[string]any, enableReasoning bool, maxTokens int, userType string) ([]byte, error) {
 	// developer → system（避免污染调用方数据，逐条浅拷贝）
 	msgs := make([]map[string]any, len(messages))
 	for i, m := range messages {
@@ -40,7 +42,19 @@ func buildAgentBody(messages []channel.Message, mc *ModelEntry, enableReasoning 
 		if role == "developer" {
 			role = "system"
 		}
-		msgs[i] = map[string]any{"role": role, "content": m.Content}
+		msg := map[string]any{"role": role, "content": m.Content}
+		if role == "assistant" && len(m.ToolCalls) > 0 {
+			msg["tool_calls"] = m.ToolCalls
+		}
+		if role == "tool" {
+			if m.ToolCallID != "" {
+				msg["tool_call_id"] = m.ToolCallID
+			}
+			if m.Name != "" {
+				msg["name"] = m.Name
+			}
+		}
+		msgs[i] = msg
 	}
 
 	// 最后一条 user 消息文本（chat_context.text 上游协议要求必填）
@@ -101,6 +115,12 @@ func buildAgentBody(messages []channel.Message, mc *ModelEntry, enableReasoning 
 			"begin_at": now.UnixMilli(),
 			"name":     truncateRunes(prompt, 30),
 		},
+	}
+
+	// 工具定义原样带上（上游就是 OpenAI 形态的 tools 数组）。
+	// 不注入工具定义时，模型只能把「要调用工具」写成文本，coding agent 直接不可用。
+	if len(tools) > 0 {
+		base["tools"] = tools
 	}
 
 	return json.Marshal(base)

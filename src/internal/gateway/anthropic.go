@@ -34,6 +34,14 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		maxTokens = n
 	}
 
+	// 工具调用：Anthropic tools → OpenAI tools（input_schema → function.parameters）。
+	tools := anthropicToolsToOpenAI(body["tools"])
+	if len(tools) > 0 && !ch.Spec().Tools {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error",
+			"渠道 "+string(kind)+" 暂不支持工具调用（tools）：已明确拒绝而不是静默忽略")
+		return
+	}
+
 	// system（string 或 block 数组）→ 首条 system 消息。
 	var msgs []channel.Message
 	if sys := flattenText(body["system"]); strings.TrimSpace(sys) != "" {
@@ -44,18 +52,102 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "messages is required and must be non-empty")
 		return
 	}
+	// tool_use_id → 函数名：Anthropic 的 tool_result 只带 id 不带名字，
+	// 而多数上游要求 role=tool 的消息带 name，所以先扫一遍 assistant 的 tool_use。
+	toolNames := map[string]string{}
+	for _, m := range rawMsgs {
+		mm, _ := m.(map[string]any)
+		blocks, _ := mm["content"].([]any)
+		for _, b := range blocks {
+			bm, _ := b.(map[string]any)
+			if bm == nil || !strings.EqualFold(asString(bm["type"]), "tool_use") {
+				continue
+			}
+			toolNames[asString(bm["id"])] = asString(bm["name"])
+		}
+	}
 	for _, m := range rawMsgs {
 		mm, _ := m.(map[string]any)
 		if mm == nil {
 			continue
 		}
-		role := strings.ToLower(strings.TrimSpace(asString(mm["role"])))
-		role = normalizeAnthropicRole(role)
-		content := flattenAnthropicContent(mm["content"])
-		msgs = append(msgs, channel.Message{Role: role, Content: content})
+		role := normalizeAnthropicRole(strings.ToLower(strings.TrimSpace(asString(mm["role"]))))
+		blocks, isBlocks := mm["content"].([]any)
+		if !isBlocks {
+			// 纯字符串 content（老式客户端）。
+			msgs = append(msgs, channel.Message{Role: role, Content: flattenAnthropicContent(mm["content"])})
+			continue
+		}
+		if role == "assistant" {
+			var texts []string
+			var calls []channel.ToolCall
+			for _, b := range blocks {
+				bm, _ := b.(map[string]any)
+				if bm == nil {
+					continue
+				}
+				switch strings.ToLower(asString(bm["type"])) {
+				case "text":
+					if t := asString(bm["text"]); t != "" {
+						texts = append(texts, t)
+					}
+				case "tool_use":
+					id, name := asString(bm["id"]), asString(bm["name"])
+					if name == "" {
+						continue
+					}
+					args := "{}"
+					if bm["input"] != nil {
+						if raw, err := json.Marshal(bm["input"]); err == nil {
+							args = string(raw)
+						}
+					}
+					calls = append(calls, channel.ToolCall{
+						ID: id, Type: "function",
+						Function: channel.FunctionCall{Name: name, Arguments: args},
+					})
+				}
+			}
+			msgs = append(msgs, channel.Message{
+				Role: role, Content: strings.Join(texts, "\n"), ToolCalls: calls,
+			})
+			continue
+		}
+		// user：文本块合成一条 user 消息；**每个 tool_result 单独成一条 tool 消息**
+		// （OpenAI 侧工具结果必须独立成条，和 assistant 的 tool_calls 一一对应）。
+		var texts []string
+		var results []channel.Message
+		for _, b := range blocks {
+			bm, _ := b.(map[string]any)
+			if bm == nil {
+				continue
+			}
+			switch strings.ToLower(asString(bm["type"])) {
+			case "text":
+				if t := asString(bm["text"]); t != "" {
+					texts = append(texts, t)
+				}
+			case "tool_result":
+				res := flattenText(bm["content"])
+				if res == "" && bm["content"] != nil {
+					if raw, err := json.Marshal(bm["content"]); err == nil {
+						res = string(raw)
+					}
+				}
+				id := asString(bm["tool_use_id"])
+				results = append(results, channel.Message{
+					Role: "tool", Content: res, ToolCallID: id, Name: toolNames[id],
+				})
+			}
+		}
+		if len(texts) > 0 || len(results) == 0 {
+			msgs = append(msgs, channel.Message{Role: role, Content: strings.Join(texts, "\n")})
+		}
+		msgs = append(msgs, results...)
 	}
 
-	creq := channel.ChatRequest{Model: modelName, Messages: msgs, MaxTokens: maxTokens, Stream: asBool(body["stream"])}
+	creq := channel.ChatRequest{Model: modelName, Messages: msgs, MaxTokens: maxTokens, Stream: asBool(body["stream"]),
+		Tools: tools, ToolChoice: anthropicToolChoiceToOpenAI(body["tool_choice"])}
 
 	// 路由。
 	res, err := s.router.Route(r.Context(), ch, kind, r.Header.Get("X-Poolgate-Session"), creq)
@@ -95,6 +187,7 @@ type aggMessage struct {
 	ID        string
 	Finish    string
 	Usage     map[string]any
+	ToolCalls []channel.ToolCall
 }
 
 func aggregate(st channel.Stream, model string) aggMessage {
@@ -113,6 +206,7 @@ func aggregate(st channel.Stream, model string) aggMessage {
 		for _, ch := range c.Choices {
 			a.Content += ch.Delta.Content
 			a.Reasoning += ch.Delta.ReasoningContent
+			a.ToolCalls = mergeToolCalls(a.ToolCalls, ch.Delta.ToolCalls)
 			if ch.FinishReason != "" {
 				a.Finish = ch.FinishReason
 			}
@@ -130,13 +224,25 @@ func buildAnthropicMessage(a aggMessage, model string) map[string]any {
 	if t := strings.TrimSpace(a.Content); t != "" {
 		content = append(content, map[string]any{"type": "text", "text": t})
 	}
+	// 工具调用 → tool_use 块（Claude Code 靠它决定去执行哪个工具）。
+	for _, tc := range a.ToolCalls {
+		if strings.TrimSpace(tc.Function.Name) == "" {
+			continue
+		}
+		content = append(content, map[string]any{
+			"type":  "tool_use",
+			"id":    anthropicToolUseID(tc.ID),
+			"name":  tc.Function.Name,
+			"input": parseToolArguments(tc.Function.Arguments),
+		})
+	}
 	out := map[string]any{
 		"id":          anthropicMessageID(a.ID),
 		"type":        "message",
 		"role":        "assistant",
 		"model":       model,
 		"content":     content,
-		"stop_reason": anthropicStopReason(a.Finish, false),
+		"stop_reason": anthropicStopReason(a.Finish, len(a.ToolCalls) > 0),
 	}
 	if u := anthropicUsage(a.Usage); u != nil {
 		out["usage"] = u
@@ -182,6 +288,97 @@ func anthropicMessageID(upstreamID string) string {
 // ---------------------------------------------------------------------------
 // 请求转换辅助
 // ---------------------------------------------------------------------------
+
+// anthropicToolsToOpenAI 把 Anthropic 的 tools 转成 OpenAI 形态：
+// {name, description, input_schema} → {type:"function", function:{name, description, parameters}}。
+// 带 type 的内置工具（如 computer_20241022）语义不同，不猜、跳过。
+func anthropicToolsToOpenAI(v any) []map[string]any {
+	list, ok := v.([]any)
+	if !ok || len(list) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(list))
+	for _, it := range list {
+		tm, _ := it.(map[string]any)
+		if tm == nil {
+			continue
+		}
+		if typ := asString(tm["type"]); typ != "" && !strings.HasPrefix(typ, "custom") && tm["input_schema"] == nil {
+			continue
+		}
+		name := asString(tm["name"])
+		if name == "" {
+			continue
+		}
+		fn := map[string]any{"name": name}
+		if d := asString(tm["description"]); d != "" {
+			fn["description"] = d
+		}
+		if schema, ok := tm["input_schema"].(map[string]any); ok {
+			fn["parameters"] = schema
+		} else {
+			// 上游普遍要求 parameters 存在；缺省给空对象 schema，不编造字段。
+			fn["parameters"] = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
+		out = append(out, map[string]any{"type": "function", "function": fn})
+	}
+	return out
+}
+
+// anthropicToolChoiceToOpenAI 转换 tool_choice：auto / any / tool → auto / required / {function}。
+func anthropicToolChoiceToOpenAI(v any) any {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil
+	}
+	switch strings.ToLower(strings.TrimSpace(asString(m["type"]))) {
+	case "auto":
+		return "auto"
+	case "any":
+		return "required"
+	case "none":
+		return "none"
+	case "tool":
+		if name := asString(m["name"]); name != "" {
+			return map[string]any{"type": "function", "function": map[string]any{"name": name}}
+		}
+		return "required"
+	}
+	return nil
+}
+
+// anthropicToolUseID 保留上游的调用 id（客户端要用它把 tool_result 对回来），
+// 但按 Anthropic 的约束过滤成 ^[a-zA-Z0-9_-]+$；为空或过滤后为空则新生成一个。
+func anthropicToolUseID(upstream string) string {
+	var b strings.Builder
+	for _, r := range strings.TrimSpace(upstream) {
+		if r == '_' || r == '-' ||
+			(r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "toolu_" + randSuffix()
+	}
+	return b.String()
+}
+
+// parseToolArguments 把 OpenAI 的 arguments（JSON 字符串）解成 tool_use.input。
+// 解不出来时不丢信息：用 _raw 包一层（与 wild-work 的处理一致）。
+func parseToolArguments(args string) any {
+	s := strings.TrimSpace(args)
+	if s == "" {
+		return map[string]any{}
+	}
+	var v any
+	if err := json.Unmarshal([]byte(s), &v); err == nil {
+		if m, ok := v.(map[string]any); ok {
+			return m
+		}
+		return map[string]any{"_raw": v}
+	}
+	return map[string]any{"_raw": s}
+}
 
 func normalizeAnthropicRole(role string) string {
 	if strings.EqualFold(role, "assistant") {

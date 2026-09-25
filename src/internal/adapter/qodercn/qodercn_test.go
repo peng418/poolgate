@@ -1,6 +1,7 @@
 package qodercn
 
 import (
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -122,5 +123,47 @@ func TestSpecActiveAndCapable(t *testing.T) {
 	}
 	if !s.Tools || !s.Reasoning || !s.SSEOnly {
 		t.Fatalf("能力位声明不符: %+v", s)
+	}
+}
+
+// 工具调用：工具定义与工具消息必须进上游请求体。
+// 丢了 tools，上游只能把「要调用工具」写成文本，客户端拿不到 tool_calls。
+func TestBuildAgentBodyCarriesTools(t *testing.T) {
+	tools := []map[string]any{{
+		"type":     "function",
+		"function": map[string]any{"name": "get_weather", "parameters": map[string]any{"type": "object"}},
+	}}
+	msgs := []channel.Message{
+		{Role: "user", Content: "北京天气"},
+		{Role: "assistant", ToolCalls: []channel.ToolCall{{ID: "call_1", Type: "function",
+			Function: channel.FunctionCall{Name: "get_weather", Arguments: `{"city":"北京"}`}}}},
+		{Role: "tool", Content: "晴 26℃", ToolCallID: "call_1", Name: "get_weather"},
+	}
+	raw, err := buildAgentBody(msgs, nil, tools, false, 0, "")
+	if err != nil {
+		t.Fatalf("构造请求体失败：%v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("请求体不是合法 JSON：%v", err)
+	}
+	ts, _ := body["tools"].([]any)
+	if len(ts) != 1 {
+		t.Fatalf("tools 未进上游请求体：%v", body["tools"])
+	}
+	fn, _ := ts[0].(map[string]any)["function"].(map[string]any)
+	if fn["name"] != "get_weather" || fn["parameters"] == nil {
+		t.Fatalf("tools 内容不对：%v", ts[0])
+	}
+	um, _ := body["messages"].([]any)
+	if len(um) != 3 {
+		t.Fatalf("应 3 条消息，got %d：%v", len(um), um)
+	}
+	if a, _ := um[1].(map[string]any); a["tool_calls"] == nil {
+		t.Fatalf("assistant 的 tool_calls 丢了：%v", a)
+	}
+	tl, _ := um[2].(map[string]any)
+	if tl["role"] != "tool" || tl["tool_call_id"] != "call_1" || tl["name"] != "get_weather" {
+		t.Fatalf("tool 消息缺 tool_call_id/name：%v", tl)
 	}
 }

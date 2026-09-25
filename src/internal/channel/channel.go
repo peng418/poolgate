@@ -7,6 +7,7 @@ package channel
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"poolgate/internal/errs"
@@ -113,14 +114,46 @@ func (s Spec) Downstream() bool { return s.Status == Active }
 // ChatRequest 是一次对话请求的标准形态。上游协议差异（COSY 签名、信封、
 // QoderEncoding 编码、嵌套 SSE）全部由适配器消化，网关与路由只见到这个结构。
 //
-// 字段是 OpenAI chat.completions 请求的归一子集：M1 只发文本对话；
-// 工具/图片在后续里程碑按 Spec 能力位做清洗（F3.7）。
+// 字段是 OpenAI chat.completions 请求的归一子集：文本对话 + 工具调用。
+// 图片仍按 Spec 能力位做清洗（F3.7）。
 type ChatRequest struct {
 	Model       string // 客户端请求的模型名（含渠道前缀剥离后的部分）
 	Messages    []Message
 	MaxTokens   int
 	Temperature *float64
 	Stream      bool // 是否要求流式返回
+
+	// Tools 是客户端（OpenAI 形态）的工具定义，适配器原样放进上游请求体。
+	// 为空 = 客户端没要工具调用。渠道不支持时必须由网关**明确拒绝**，
+	// 不允许静默丢弃 —— 丢掉 tools 会让上游把工具调用写成普通文本，
+	// 客户端拿不到 tool_calls，表现成「模型不回复/回一堆乱码」（红线一、F3.7）。
+	Tools []map[string]any
+	// ToolChoice 是 tool_choice 原样值（"auto" / "none" / {"type":"function",…}）。
+	// nil = 客户端没指定，按上游默认。
+	ToolChoice any
+}
+
+// ForwardTools 返回应当转发给上游的工具定义。
+//
+// 唯一的过滤是「客户端显式说了 tool_choice:"none"」—— 那是明确的「本轮不要用工具」，
+// 不是静默丢弃：网关已按渠道能力位校验过，能走到这里的渠道都是支持工具的。
+func (r ChatRequest) ForwardTools() []map[string]any {
+	if len(r.Tools) == 0 || toolChoiceIsNone(r.ToolChoice) {
+		return nil
+	}
+	return r.Tools
+}
+
+// toolChoiceIsNone 判断 tool_choice 是否显式要求「不用工具」。
+func toolChoiceIsNone(v any) bool {
+	switch t := v.(type) {
+	case string:
+		return strings.EqualFold(strings.TrimSpace(t), "none")
+	case map[string]any:
+		s, _ := t["type"].(string)
+		return strings.EqualFold(strings.TrimSpace(s), "none")
+	}
+	return false
 }
 
 // Message 是一条对话消息。role 取 system / user / assistant / tool；
@@ -128,11 +161,23 @@ type ChatRequest struct {
 type Message struct {
 	Role    string
 	Content string
+
+	// ToolCalls 仅 assistant 消息使用：本轮的若干个工具调用，回传给上游时
+	// 必须原样带上，否则模型看到的是「自己上次什么都没调用」，会重复调用同一个工具。
+	ToolCalls []ToolCall
+	// ToolCallID 仅 role=="tool" 使用：这条结果对应哪一次工具调用。
+	ToolCallID string
+	// Name 仅 role=="tool" 使用：函数名（部分上游要求 tool 消息带 name）。
+	Name string
 }
 
 // ToolCall 是标准 OpenAI tool_call（工具调用）。适配器把上游任意工具调用形态
 // （如 Trae 的 function_call 字段）归一成这个结构。
 type ToolCall struct {
+	// Index 是流式分片里的序号（OpenAI delta 规范）：同一个工具调用的 name 与
+	// arguments 可能分几片到达，客户端靠它拼回去。**不 omitempty** —— OpenAI 的
+	// 流式帧里 index=0 也是显式出现的，缺了它客户端可能把分片当成多个调用。
+	Index    int          `json:"index"`
 	ID       string       `json:"id"`
 	Type     string       `json:"type"` // 恒 "function"
 	Function FunctionCall `json:"function"`
@@ -142,6 +187,49 @@ type ToolCall struct {
 type FunctionCall struct {
 	Name      string `json:"name"`
 	Arguments string `json:"arguments"` // JSON 字符串
+}
+
+// ParseOpenAIToolCalls 解析 OpenAI 形态的 tool_calls 数组：
+// [{"index":0,"id":"call_x","type":"function","function":{"name":…,"arguments":…}}]。
+// 上游本身是 OpenAI 兼容 SSE 的适配器（WorkBuddy 两家、COSY 两家）共用它，
+// 顺带兼容 SOLO 的 "function_call" 键名 —— 少写四份几乎一样的解析。
+func ParseOpenAIToolCalls(raw any) []ToolCall {
+	list, ok := raw.([]any)
+	if !ok || len(list) == 0 {
+		return nil
+	}
+	out := make([]ToolCall, 0, len(list))
+	for _, it := range list {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		fn, ok := m["function"].(map[string]any)
+		if !ok {
+			fn, ok = m["function_call"].(map[string]any)
+		}
+		if !ok {
+			continue
+		}
+		tc := ToolCall{Type: "function"}
+		if v, ok := m["id"].(string); ok {
+			tc.ID = v
+		}
+		if v, ok := m["type"].(string); ok && v != "" {
+			tc.Type = v
+		}
+		if v, ok := m["index"].(float64); ok {
+			tc.Index = int(v)
+		}
+		if v, ok := fn["name"].(string); ok {
+			tc.Function.Name = v
+		}
+		if v, ok := fn["arguments"].(string); ok {
+			tc.Function.Arguments = v
+		}
+		out = append(out, tc)
+	}
+	return out
 }
 
 // ChunkChoice 是 ChatCompletionChunk.Choices 的元素类型（具名，便于适配器复用）。

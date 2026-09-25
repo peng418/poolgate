@@ -466,6 +466,53 @@ POST https://gateway.qwenwork.cn/api/v1/deviceToken/refresh
 实测：deviceToken 端点仍可用（垃圾 refresh_token → `401 {"errorCode":"INVALID_REFRESH_TOKEN",...}`），
 503 闸门只影响推理端点。协议说明同步写进了 `docs/03-渠道能力矩阵.md` 与适配器包头注释。
 
+### 0.4.2 — 工具调用（tools / tool_calls）打通：Studio 里选的模型终于能干活了
+
+**现象**：在 Ekko Studio 里选 PoolGate 下发的模型，别的 provider 都正常，只有它「不干活 / 回一堆乱码」。
+
+**根因（本机实测，不是猜）**：网关**静默丢弃了客户端的 `tools`** —— `gateway.go` 的入参结构里没有
+`tools/tool_choice`，内部契约 `channel.ChatRequest` 也没有，消息体只有 `role` + `content(string)`。
+上游收不到工具定义，只能把「我要调用工具」写成文本。拿现网凭证打**旧版**实例，模型回的是：
+
+```
+我来调用 get_weather 工具查询北京现在的天气。
+  <function_calls><invoke name="get_weather"><parameter name="city">北京</parameter></invoke></function_calls>
+```
+
+客户端（Claude Code / Studio）解析不到 `tool_calls` → 表现成「模型不回复 / 回一堆看不懂的乱码」。
+顺带这也违反 F3.7「不支持的参数按能力位降级或明确拒绝，不静默丢弃」。
+
+**修法（移植 wild-work 已验证的做法，并补上它没有的诚实声明）**：
+
+- **契约**：`channel.ChatRequest` 加 `Tools`/`ToolChoice`；`channel.Message` 加 `ToolCalls`/`ToolCallID`/`Name`；
+  `channel.ToolCall` 加 `Index`（流式分片序号，**不 omitempty**：OpenAI 的 `index=0` 也是显式出现的，
+  缺了它客户端可能把分片当成多个调用）。
+- **网关 · OpenAI 入口**：解析 `tools`/`tool_choice` 并透传；`content` 支持 字符串 / parts 数组 / null；
+  保留 assistant 的 `tool_calls` 与 `role=tool` 消息的 `tool_call_id`/`name`；非流式聚合按 index 拼回工具调用，
+  并把 `finish_reason` 纠正成 `tool_calls`。
+- **网关 · Anthropic 入口（`/v1/messages`）**：`tools[].input_schema → function.parameters`；
+  assistant 的 `tool_use` → `tool_calls`，user 的 `tool_result` → 独立的 `role=tool` 消息（带 id/name）；
+  响应侧输出 `tool_use` 块 + `stop_reason=tool_use`，流式侧输出 `input_json_delta`。
+- **适配器**：QoderCN / QoderCOM（COSY）与 WorkBuddy 两家的请求体带上 `tools`；TraeWork 按 SOLO 形态改写
+  （`function → function_call`、`parameters` 序列化成字符串、`tool_choice` 归一成函数名）；
+  四家的 SSE 解析统一走 `channel.ParseOpenAIToolCalls`（顺带补上 `index`）。
+- **能力位说实话**：千问办公（chat-ws 的 `new_prompt` 根本放不下工具定义）改成 `Tools: false`，
+  网关对它的工具请求**明确拒绝并给原因**，而不是静默丢掉。
+
+**真上游验证（现网 QoderCN 凭证，五个场景全过）**：
+
+| 场景 | 结果 |
+|---|---|
+| 旧版 + tools（复现） | `finish_reason: stop`、无 `tool_calls`，content 是 `<function_calls>…` 文本标记 |
+| 非流式 + tools | `finish_reason: tool_calls`，`tool_calls[0] = {id, get_weather, {"city":"北京"}}` |
+| 流式 + tools | 5 个分片（首片带 id/name，后续只带 arguments 片段，`index: 0`），按 index 能拼回完整调用 |
+| `/v1/messages` + tools | `stop_reason: tool_use` + `tool_use` 块（`input.city = 上海`） |
+| 工具往返（第二轮把结果喂回） | 模型拿到 `{"temp":22,"desc":"多云"}` 后正常作答 |
+
+`check.sh` 全绿（新增：网关 6 例 —— tools 透传、parts content、不支持时明确拒绝、非流式工具调用聚合、
+mergeToolCalls 的两种上游形态、Anthropic tools 往返；适配器 4 例 —— COSY body 带 tools 与工具消息、
+SOLO 形态改写、SOLO 工具帧解析、千问办公能力位）。
+
 ### 0.4.1 — 能扫码就别抢着跳浏览器
 
 用户实测反馈：「如果能正常生成二维码，则不要自动跳转登录页面，像千问这种不能自动生成的，再跳转页面。」

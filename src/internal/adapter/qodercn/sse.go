@@ -124,30 +124,9 @@ func toChunk(raw map[string]any, model string) (channel.ChatCompletionChunk, boo
 				ch.Delta.ReasoningContent = v
 				used = true
 			}
-			if tcs, ok := delta["tool_calls"].([]any); ok {
-				for _, tci := range tcs {
-					tc, ok := tci.(map[string]any)
-					if !ok {
-						continue
-					}
-					var t channel.ToolCall
-					if v, ok := tc["id"].(string); ok {
-						t.ID = v
-					}
-					if v, ok := tc["type"].(string); ok {
-						t.Type = v
-					}
-					if fn, ok := tc["function"].(map[string]any); ok {
-						if v, ok := fn["name"].(string); ok {
-							t.Function.Name = v
-						}
-						if v, ok := fn["arguments"].(string); ok {
-							t.Function.Arguments = v
-						}
-					}
-					ch.Delta.ToolCalls = append(ch.Delta.ToolCalls, t)
-					used = true
-				}
+			if tcs := channel.ParseOpenAIToolCalls(delta["tool_calls"]); len(tcs) > 0 {
+				ch.Delta.ToolCalls = append(ch.Delta.ToolCalls, tcs...)
+				used = true
 			}
 		}
 		c.Choices = append(c.Choices, ch)

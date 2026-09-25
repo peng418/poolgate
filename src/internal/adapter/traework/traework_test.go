@@ -355,3 +355,55 @@ func TestRefreshNormalizesMillisExpiry(t *testing.T) {
 		t.Fatalf("毫秒时间戳未归一为秒，解析成 %s", nc.ExpiresAt)
 	}
 }
+
+// SOLO 形态的工具调用改写：function→function_call、parameters 必须是字符串、
+// tool_choice 归一成函数名。
+func TestBuildBodyNormalizesTools(t *testing.T) {
+	req := channel.ChatRequest{
+		Model: "DeepSeek-V4-Flash",
+		Tools: []map[string]any{{
+			"type": "function",
+			"function": map[string]any{"name": "f",
+				"parameters": map[string]any{"type": "object", "properties": map[string]any{}}},
+		}},
+		ToolChoice: map[string]any{"type": "function", "function": map[string]any{"name": "f"}},
+		Messages: []channel.Message{{Role: "assistant", ToolCalls: []channel.ToolCall{
+			{ID: "c1", Type: "function", Function: channel.FunctionCall{Name: "f", Arguments: "{}"}},
+		}}},
+	}
+	var body map[string]any
+	if err := json.Unmarshal(buildBody(req), &body); err != nil {
+		t.Fatalf("请求体不是合法 JSON：%v", err)
+	}
+	ts, _ := body["tools"].([]any)
+	if len(ts) != 1 {
+		t.Fatalf("tools 丢了：%v", body["tools"])
+	}
+	fn, _ := ts[0].(map[string]any)["function"].(map[string]any)
+	if _, ok := fn["parameters"].(string); !ok {
+		t.Fatalf("SOLO 要求 parameters 是字符串，实际 %T", fn["parameters"])
+	}
+	if body["tool_choice"] != "f" {
+		t.Fatalf("tool_choice 应归一成函数名，实际 %v", body["tool_choice"])
+	}
+	msgs, _ := body["messages"].([]any)
+	tcs, _ := msgs[0].(map[string]any)["tool_calls"].([]any)
+	if len(tcs) != 1 {
+		t.Fatalf("tool_calls 丢了：%v", msgs[0])
+	}
+	if _, ok := tcs[0].(map[string]any)["function_call"]; !ok {
+		t.Fatalf("SOLO 认 function_call：%v", tcs[0])
+	}
+}
+
+// output 事件里的 tool_calls 要能被解析出来（两种键名都认）。
+func TestParseSOLOToolCalls(t *testing.T) {
+	ev := parseSOLOLine("output", `{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"f","arguments":"{}"}}]}`)
+	if len(ev.ToolCalls) != 1 || ev.ToolCalls[0].Function.Name != "f" || ev.ToolCalls[0].ID != "call_1" {
+		t.Fatalf("OpenAI 形态解析失败：%+v", ev.ToolCalls)
+	}
+	ev = parseSOLOLine("output", `{"tool_calls":[{"function_call":{"name":"g","arguments":"{\"a\":1}"}}]}`)
+	if len(ev.ToolCalls) != 1 || ev.ToolCalls[0].Function.Name != "g" {
+		t.Fatalf("SOLO 形态解析失败：%+v", ev.ToolCalls)
+	}
+}

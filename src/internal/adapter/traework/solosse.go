@@ -24,6 +24,7 @@ type soloEvent struct {
 	Reasoning    string
 	Usage        map[string]any
 	FinishReason string
+	ToolCalls    []channel.ToolCall
 	ErrorCode    int64
 	ErrorMessage string
 }
@@ -45,6 +46,7 @@ func parseSOLOLine(eventName, dataLine string) *soloEvent {
 		if v, ok := raw["reasoning_content"].(string); ok {
 			ev.Reasoning = v
 		}
+		ev.ToolCalls = parseToolCalls(raw["tool_calls"])
 	case "token_usage":
 		ev.Usage = raw
 	case "done":
@@ -79,11 +81,54 @@ func newStream(rc io.ReadCloser, model string) *stream {
 	return s
 }
 
+// parseToolCalls 把 output 事件里的 tool_calls 归一化。
+// 两种形态都吃下：OpenAI 的 {"function":{"name","arguments"}} 与 SOLO 的
+// {"function_call":{...}}（wild-work 实测 SOLO 用后者，前者是兼容旧形态）。
+func parseToolCalls(raw any) []channel.ToolCall {
+	list, ok := raw.([]any)
+	if !ok || len(list) == 0 {
+		return nil
+	}
+	out := make([]channel.ToolCall, 0, len(list))
+	for _, it := range list {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		fn, ok := m["function"].(map[string]any)
+		if !ok {
+			fn, ok = m["function_call"].(map[string]any)
+		}
+		if !ok {
+			continue
+		}
+		tc := channel.ToolCall{Type: "function"}
+		if v, ok := m["id"].(string); ok {
+			tc.ID = v
+		}
+		if v, ok := m["type"].(string); ok && v != "" {
+			tc.Type = v
+		}
+		if v, ok := m["index"].(float64); ok {
+			tc.Index = int(v)
+		}
+		if v, ok := fn["name"].(string); ok {
+			tc.Function.Name = v
+		}
+		if v, ok := fn["arguments"].(string); ok {
+			tc.Function.Arguments = v
+		}
+		out = append(out, tc)
+	}
+	return out
+}
+
 func (s *stream) pump() {
 	defer close(s.ch)
 	br := bufio.NewReaderSize(s.rc, 64*1024)
 	id := "chatcmpl-" + time.Now().Format("20060102150405.000000000")
 	var pendingUsage map[string]any
+	sawToolCalls := false
 	event := ""
 	var data strings.Builder
 
@@ -99,6 +144,7 @@ func (s *stream) pump() {
 		ch.Delta.Role = "assistant"
 		ch.Delta.Content = delta.content
 		ch.Delta.ReasoningContent = delta.reasoning
+		ch.Delta.ToolCalls = delta.toolCalls
 		ch.FinishReason = finish
 		c.Choices = append(c.Choices, ch)
 		s.ch <- chunkOrErr{chunk: c}
@@ -117,13 +163,22 @@ func (s *stream) pump() {
 				ev := parseSOLOLine(event, data.String())
 				switch ev.Event {
 				case "output":
-					if ev.Response != "" || ev.Reasoning != "" {
-						emit(contentDelta{content: ev.Response, reasoning: ev.Reasoning}, "")
+					if ev.Response != "" || ev.Reasoning != "" || len(ev.ToolCalls) > 0 {
+						if len(ev.ToolCalls) > 0 {
+							sawToolCalls = true
+						}
+						emit(contentDelta{content: ev.Response, reasoning: ev.Reasoning, toolCalls: ev.ToolCalls}, "")
 					}
 				case "token_usage":
 					pendingUsage = ev.Usage
 				case "done":
-					emit(contentDelta{}, ev.FinishReason)
+					finish := ev.FinishReason
+					// 有工具调用时 finish_reason 必须是 tool_calls，客户端据此先执行工具。
+					// SOLO 常报 stop/空，这里按事实纠正。
+					if sawToolCalls && (finish == "" || finish == "stop") {
+						finish = "tool_calls"
+					}
+					emit(contentDelta{}, finish)
 				case "error":
 					// 上游明确报错：立刻把错误交给客户端，不等连接关闭。
 					// 之前是攒到流结束才发 —— 上游报错后若继续压着连接不关，
@@ -148,6 +203,7 @@ func (s *stream) pump() {
 type contentDelta struct {
 	content   string
 	reasoning string
+	toolCalls []channel.ToolCall
 }
 
 type soloErr struct {

@@ -93,6 +93,10 @@ func toChunk(raw map[string]any, model string) (channel.ChatCompletionChunk, boo
 				ch.Delta.ReasoningContent = v
 				used = true
 			}
+			if tcs := channel.ParseOpenAIToolCalls(delta["tool_calls"]); len(tcs) > 0 {
+				ch.Delta.ToolCalls = tcs
+				used = true
+			}
 		}
 		c.Choices = append(c.Choices, ch)
 	}

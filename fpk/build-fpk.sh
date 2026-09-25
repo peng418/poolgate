@@ -82,7 +82,7 @@ M="$PKG/manifest"
   printf 'service_port          = %s\n'   "$PORT"
   printf 'desktop_uidir         = ui\n'
   printf 'desktop_applaunchname = %s.main\n' "$APPNAME"
-  printf 'changelog = 三渠道适配器 + 网关(/v1/chat/completions,/v1/messages,/v1/responses) + 账号池与粘性路由 + 控制台(含渠道授权) | FPK %s\n' "$VERSION"
+  printf 'changelog = 工具调用打通（tools/tool_calls：OpenAI 与 Anthropic 两个入口都透传工具定义并输出标准 tool_calls/tool_use，不支持的渠道明确拒绝不再静默丢弃）+ 面板内真二维码授权不跳转 + 账号池与粘性路由 | FPK %s\n' "$VERSION"
 } >> "$M"
 chmod 0644 "$M"
 sed -n '1,20p' "$M" | sed 's/^/  /'

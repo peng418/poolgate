@@ -435,3 +435,292 @@ func TestHealthFilterDoesNotBlockDirectCall(t *testing.T) {
 		t.Fatalf("直连调用应正常返回，实际 %d %s", w.Code, w.Body.String())
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 工具调用（tools / tool_calls）—— Studio 这类 coding agent 的命门
+//
+// 背景：工具定义只要在网关这一层被丢掉，上游就会把「我要调用工具」写成普通文本，
+// 客户端拿不到 tool_calls，表现成「模型不回复 / 回一堆乱码」。所以这里逐条钉死。
+// ---------------------------------------------------------------------------
+
+func toolCallChunk(index int, id, name, args string) channel.ChatCompletionChunk {
+	c := channel.ChatCompletionChunk{ID: "chatcmpl-t", Model: "qwen3.8-max"}
+	ch := channel.ChunkChoice{}
+	ch.Delta.ToolCalls = []channel.ToolCall{{
+		Index: index, ID: id, Type: "function",
+		Function: channel.FunctionCall{Name: name, Arguments: args},
+	}}
+	c.Choices = append(c.Choices, ch)
+	return c
+}
+
+func postJSON(t *testing.T, srv *Server, path string, body map[string]any) *httptest.ResponseRecorder {
+	t.Helper()
+	raw, _ := json.Marshal(body)
+	r := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(raw))
+	r.Header.Set("Authorization", "Bearer good-key")
+	w := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, r)
+	return w
+}
+
+// tools 与工具消息必须原样到达渠道层。
+func TestToolsForwardedToChannel(t *testing.T) {
+	var got channel.ChatRequest
+	ch := &fakeChannel{
+		kind: channel.QoderCN,
+		spec: channel.Spec{Kind: channel.QoderCN, Status: channel.Active, Tools: true},
+		chat: func(ctx context.Context, c *channel.Credential, req channel.ChatRequest) (channel.Stream, error) {
+			got = req
+			return &sliceStream{chunks: []channel.ChatCompletionChunk{chunk("ok")}}, nil
+		},
+	}
+	srv, _ := newTestGateway(t, ch, true)
+	w := postJSON(t, srv, "/v1/chat/completions", map[string]any{
+		"model": "qodercn/qwen3.8-max",
+		"messages": []map[string]any{
+			{"role": "user", "content": "北京天气"},
+			{"role": "assistant", "content": nil, "tool_calls": []map[string]any{{
+				"id": "call_1", "type": "function",
+				"function": map[string]any{"name": "get_weather", "arguments": `{"city":"北京"}`},
+			}}},
+			{"role": "tool", "tool_call_id": "call_1", "name": "get_weather", "content": "晴 26℃"},
+		},
+		"tools": []map[string]any{{
+			"type": "function",
+			"function": map[string]any{"name": "get_weather", "description": "查天气",
+				"parameters": map[string]any{"type": "object", "properties": map[string]any{}}},
+		}},
+		"stream": false,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("应 200，实际 %d body=%s", w.Code, w.Body.String())
+	}
+	if len(got.Tools) != 1 {
+		t.Fatalf("tools 应原样到达渠道层，got %+v", got.Tools)
+	}
+	if fn, _ := got.Tools[0]["function"].(map[string]any); fn["name"] != "get_weather" {
+		t.Fatalf("tools 内容不对：%+v", got.Tools[0])
+	}
+	if len(got.Messages) != 3 {
+		t.Fatalf("应 3 条消息，got %d：%+v", len(got.Messages), got.Messages)
+	}
+	if asst := got.Messages[1]; len(asst.ToolCalls) != 1 || asst.ToolCalls[0].Function.Name != "get_weather" {
+		t.Fatalf("assistant 的 tool_calls 丢了：%+v", asst)
+	}
+	if toolMsg := got.Messages[2]; toolMsg.Role != "tool" || toolMsg.ToolCallID != "call_1" || toolMsg.Name != "get_weather" {
+		t.Fatalf("tool 消息的 tool_call_id/name 丢了：%+v", toolMsg)
+	}
+}
+
+// content 是 parts 数组（多模态形态）时也要解析出文本，不能整条消息变空。
+func TestChatMessageContentParts(t *testing.T) {
+	var got channel.ChatRequest
+	ch := &fakeChannel{
+		kind: channel.QoderCN,
+		spec: channel.Spec{Kind: channel.QoderCN, Status: channel.Active, Tools: true},
+		chat: func(ctx context.Context, c *channel.Credential, req channel.ChatRequest) (channel.Stream, error) {
+			got = req
+			return &sliceStream{chunks: []channel.ChatCompletionChunk{chunk("ok")}}, nil
+		},
+	}
+	srv, _ := newTestGateway(t, ch, true)
+	w := postJSON(t, srv, "/v1/chat/completions", map[string]any{
+		"model": "qodercn/qwen3.8-max",
+		"messages": []map[string]any{
+			{"role": "user", "content": []map[string]any{
+				{"type": "text", "text": "前半"},
+				{"type": "text", "text": "后半"},
+			}},
+		},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("应 200，实际 %d body=%s", w.Code, w.Body.String())
+	}
+	if len(got.Messages) != 1 || got.Messages[0].Content != "前半后半" {
+		t.Fatalf("parts 数组应拼成文本，got %+v", got.Messages)
+	}
+}
+
+// 渠道声明不支持 tools 时必须明确拒绝（可读原因），不能静默丢掉。
+func TestToolsRejectedWhenUnsupported(t *testing.T) {
+	called := false
+	ch := &fakeChannel{
+		kind: channel.QwenWork,
+		spec: channel.Spec{Kind: channel.QwenWork, Status: channel.Active, Tools: false},
+		chat: func(ctx context.Context, c *channel.Credential, req channel.ChatRequest) (channel.Stream, error) {
+			called = true
+			return nil, nil
+		},
+	}
+	srv, _ := newTestGateway(t, ch, true)
+	w := postJSON(t, srv, "/v1/chat/completions", map[string]any{
+		"model":    "qwenwork/pro",
+		"messages": []map[string]any{{"role": "user", "content": "hi"}},
+		"tools": []map[string]any{{
+			"type":     "function",
+			"function": map[string]any{"name": "f", "parameters": map[string]any{"type": "object"}},
+		}},
+	})
+	if called {
+		t.Fatal("不支持的渠道不应打到上游")
+	}
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("应明确拒绝（400），实际 %d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "工具调用") {
+		t.Fatalf("拒绝原因要能读懂，实际 %s", w.Body.String())
+	}
+}
+
+// 非流式：上游分片的 tool_calls 要按 index 拼回完整调用，finish_reason 变 tool_calls。
+func TestToolCallsAggregatedNonStream(t *testing.T) {
+	ch := &fakeChannel{
+		kind: channel.QoderCN,
+		spec: channel.Spec{Kind: channel.QoderCN, Status: channel.Active, Tools: true},
+		chat: func(ctx context.Context, c *channel.Credential, req channel.ChatRequest) (channel.Stream, error) {
+			return &sliceStream{chunks: []channel.ChatCompletionChunk{
+				toolCallChunk(0, "call_1", "get_weather", `{"city"`),
+				toolCallChunk(0, "", "", `:"北京"}`),
+			}}, nil
+		},
+	}
+	srv, _ := newTestGateway(t, ch, true)
+	w := postJSON(t, srv, "/v1/chat/completions", map[string]any{
+		"model":    "qodercn/qwen3.8-max",
+		"messages": []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("应 200，实际 %d body=%s", w.Code, w.Body.String())
+	}
+	var out struct {
+		Choices []struct {
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("响应不是合法 JSON：%v", err)
+	}
+	if len(out.Choices) != 1 || len(out.Choices[0].Message.ToolCalls) != 1 {
+		t.Fatalf("应聚合成 1 个工具调用，got %s", w.Body.String())
+	}
+	tc := out.Choices[0].Message.ToolCalls[0]
+	if tc.ID != "call_1" || tc.Function.Name != "get_weather" || tc.Function.Arguments != `{"city":"北京"}` {
+		t.Fatalf("工具调用拼装不对：%+v", tc)
+	}
+	if out.Choices[0].FinishReason != "tool_calls" {
+		t.Fatalf("有工具调用时 finish_reason 应为 tool_calls，got %q", out.Choices[0].FinishReason)
+	}
+}
+
+// mergeToolCalls：OpenAI 式分片按 index 归并，agent 式整包按 id 区分。
+func TestMergeToolCalls(t *testing.T) {
+	acc := mergeToolCalls(nil, []channel.ToolCall{
+		{Index: 0, ID: "call_1", Function: channel.FunctionCall{Name: "f", Arguments: "{"}},
+	})
+	acc = mergeToolCalls(acc, []channel.ToolCall{
+		{Index: 0, Function: channel.FunctionCall{Arguments: "}"}},
+	})
+	if len(acc) != 1 || acc[0].Function.Arguments != "{}" || acc[0].Function.Name != "f" {
+		t.Fatalf("按 index 归并失败：%+v", acc)
+	}
+
+	// 没有 index、但每帧都是完整调用（各带 id）时不能被粘成一个。
+	acc = mergeToolCalls(nil, []channel.ToolCall{
+		{ID: "a", Function: channel.FunctionCall{Name: "f1", Arguments: "{}"}},
+		{ID: "b", Function: channel.FunctionCall{Name: "f2", Arguments: "{}"}},
+	})
+	if len(acc) != 2 {
+		t.Fatalf("两个不同 id 的调用应各自保留，got %+v", acc)
+	}
+}
+
+// Anthropic 入口：tools / tool_use / tool_result 的往返 + 响应里的 tool_use 块。
+func TestAnthropicToolsRoundTrip(t *testing.T) {
+	var got channel.ChatRequest
+	ch := &fakeChannel{
+		kind: channel.QoderCN,
+		spec: channel.Spec{Kind: channel.QoderCN, Status: channel.Active, Tools: true},
+		chat: func(ctx context.Context, c *channel.Credential, req channel.ChatRequest) (channel.Stream, error) {
+			got = req
+			return &sliceStream{chunks: []channel.ChatCompletionChunk{
+				toolCallChunk(0, "call_9", "get_weather", `{"city":"北京"}`),
+			}}, nil
+		},
+	}
+	srv, _ := newTestGateway(t, ch, true)
+	w := postJSON(t, srv, "/v1/messages", map[string]any{
+		"model":      "qodercn/qwen3.8-max",
+		"max_tokens": 256,
+		"tools": []map[string]any{{
+			"name": "get_weather", "description": "查天气",
+			"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
+		}},
+		"messages": []map[string]any{
+			{"role": "user", "content": "北京天气"},
+			{"role": "assistant", "content": []map[string]any{
+				{"type": "text", "text": "我查一下"},
+				{"type": "tool_use", "id": "toolu_1", "name": "get_weather",
+					"input": map[string]any{"city": "北京"}},
+			}},
+			{"role": "user", "content": []map[string]any{
+				{"type": "tool_result", "tool_use_id": "toolu_1", "content": "晴 26℃"},
+			}},
+		},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("应 200，实际 %d body=%s", w.Code, w.Body.String())
+	}
+	// 请求侧：Anthropic tools → OpenAI tools
+	if len(got.Tools) != 1 {
+		t.Fatalf("tools 未转换：%+v", got.Tools)
+	}
+	if fn, _ := got.Tools[0]["function"].(map[string]any); fn["name"] != "get_weather" || fn["parameters"] == nil {
+		t.Fatalf("tools 转换不对（input_schema→parameters）：%+v", got.Tools[0])
+	}
+	// 请求侧：tool_use → assistant.tool_calls；tool_result → role=tool + tool_call_id + name
+	if len(got.Messages) != 3 {
+		t.Fatalf("应 3 条消息，got %d：%+v", len(got.Messages), got.Messages)
+	}
+	if a := got.Messages[1]; len(a.ToolCalls) != 1 || a.ToolCalls[0].Function.Name != "get_weather" ||
+		a.ToolCalls[0].Function.Arguments != `{"city":"北京"}` {
+		t.Fatalf("tool_use 未转成 tool_calls：%+v", a)
+	}
+	if tr := got.Messages[2]; tr.Role != "tool" || tr.ToolCallID != "toolu_1" || tr.Name != "get_weather" || tr.Content != "晴 26℃" {
+		t.Fatalf("tool_result 未转成 tool 消息：%+v", tr)
+	}
+	// 响应侧：tool_use 块 + stop_reason=tool_use
+	var out struct {
+		StopReason string `json:"stop_reason"`
+		Content    []struct {
+			Type  string         `json:"type"`
+			ID    string         `json:"id"`
+			Name  string         `json:"name"`
+			Input map[string]any `json:"input"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("响应不是合法 JSON：%v", err)
+	}
+	if out.StopReason != "tool_use" {
+		t.Fatalf("stop_reason 应为 tool_use，got %q（body=%s）", out.StopReason, w.Body.String())
+	}
+	found := false
+	for _, b := range out.Content {
+		if b.Type == "tool_use" && b.Name == "get_weather" && b.Input["city"] == "北京" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("响应里应含 tool_use 块（含 id/name/input），实际 %s", w.Body.String())
+	}
+}

@@ -292,14 +292,18 @@ func TestEmitUpdateSkipsEmptyText(t *testing.T) {
 	}
 }
 
-// 能力声明：千问办公支持 tools/图片/推理，但没有签到。
+// 能力声明：千问办公支持图片/推理但没有签到，**不支持工具调用**
+// （chat-ws 的 new_prompt 只有纯文本，放不下工具定义 → 如实声明，交给网关明确拒绝）。
 func TestSpec(t *testing.T) {
 	sp := New().Spec()
 	if sp.Kind != "qwenwork" {
 		t.Fatalf("Kind 不对：%v", sp.Kind)
 	}
-	if !sp.Tools || !sp.Images || !sp.Reasoning {
-		t.Fatal("应声明 tools/图片/推理能力")
+	if sp.Tools {
+		t.Fatal("本渠道不实现工具调用，Tools 应为 false")
+	}
+	if !sp.Images || !sp.Reasoning {
+		t.Fatal("应声明图片/推理能力")
 	}
 	if sp.CheckinCap {
 		t.Fatal("无签到活动，CheckinCap 应为 false")

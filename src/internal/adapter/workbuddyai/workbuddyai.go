@@ -410,7 +410,19 @@ func buildBody(req channel.ChatRequest) []byte {
 		if role == "developer" {
 			role = "system"
 		}
-		msgs[i] = map[string]any{"role": role, "content": m.Content}
+		msg := map[string]any{"role": role, "content": m.Content}
+		if role == "assistant" && len(m.ToolCalls) > 0 {
+			msg["tool_calls"] = m.ToolCalls
+		}
+		if role == "tool" {
+			if m.ToolCallID != "" {
+				msg["tool_call_id"] = m.ToolCallID
+			}
+			if m.Name != "" {
+				msg["name"] = m.Name
+			}
+		}
+		msgs[i] = msg
 	}
 	obj := map[string]any{
 		"model":          req.Model,
@@ -418,6 +430,9 @@ func buildBody(req channel.ChatRequest) []byte {
 		"stream":         true,
 		"max_tokens":     req.MaxTokens,
 		"stream_options": map[string]any{"include_usage": true},
+	}
+	if tools := req.ForwardTools(); len(tools) > 0 {
+		obj["tools"] = tools
 	}
 	if len(msgs) == 0 || msgs[0]["role"] != "system" {
 		obj["messages"] = append([]map[string]any{{"role": "system", "content": "You are a helpful assistant."}}, msgs...)

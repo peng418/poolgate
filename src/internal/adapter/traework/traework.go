@@ -270,6 +270,11 @@ func (a *Adapter) fetchModels(ctx context.Context, c *channel.Credential) ([]cha
 }
 
 // buildBody 构造 SOLO llm_utils_chat 请求体（强制 stream，content 转多模态数组）。
+//
+// 工具调用按 SOLO 的形态改写（移植自 wild-work traework/payload.go 的实测结论）：
+//   - assistant.tool_calls[].function → function_call（SOLO 认这个键名）
+//   - tools[].function.parameters 必须是**字符串**（SOLO 不收对象）
+//   - tool_choice 归一成字符串（auto / required / 函数名）；none 时连 tools 一起去掉
 func buildBody(req channel.ChatRequest) []byte {
 	msgs := make([]map[string]any, len(req.Messages))
 	for i, m := range req.Messages {
@@ -277,7 +282,24 @@ func buildBody(req channel.ChatRequest) []byte {
 		if role == "developer" {
 			role = "system"
 		}
-		msgs[i] = map[string]any{"role": role, "content": []any{map[string]any{"type": "text", "text": m.Content}}}
+		msg := map[string]any{"role": role}
+		if m.Content != "" || role != "assistant" {
+			msg["content"] = []any{map[string]any{"type": "text", "text": m.Content}}
+		}
+		if role == "assistant" && len(m.ToolCalls) > 0 {
+			if tcs := soloToolCalls(m.ToolCalls); len(tcs) > 0 {
+				msg["tool_calls"] = tcs
+			}
+		}
+		if role == "tool" {
+			if m.ToolCallID != "" {
+				msg["tool_call_id"] = m.ToolCallID
+			}
+			if m.Name != "" {
+				msg["name"] = m.Name
+			}
+		}
+		msgs[i] = msg
 	}
 	model := strings.TrimSpace(req.Model)
 	if model == "" {
@@ -290,8 +312,92 @@ func buildBody(req channel.ChatRequest) []byte {
 		"function":    Function,
 		"messages":    msgs,
 	}
+	if tools := soloTools(req.ForwardTools()); len(tools) > 0 {
+		obj["tools"] = tools
+		if tc := soloToolChoice(req.ToolChoice); tc != "" {
+			obj["tool_choice"] = tc
+		}
+	}
 	raw, _ := json.Marshal(obj)
 	return raw
+}
+
+// soloToolCalls 把 OpenAI 形态的 tool_calls 改写成 SOLO 认的形态：
+// function → function_call，并丢掉没有函数名的空条目。
+func soloToolCalls(in []channel.ToolCall) []map[string]any {
+	out := make([]map[string]any, 0, len(in))
+	for _, tc := range in {
+		if strings.TrimSpace(tc.Function.Name) == "" {
+			continue
+		}
+		item := map[string]any{"function_call": map[string]any{
+			"name":      tc.Function.Name,
+			"arguments": tc.Function.Arguments,
+		}}
+		if tc.ID != "" {
+			item["id"] = tc.ID
+		}
+		if tc.Type != "" {
+			item["type"] = tc.Type
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+// soloTools 转换 tools 数组：function.parameters 从对象序列化成 JSON 字符串。
+// 不修改调用方的 map（网关解析出来的请求体还在用）。
+func soloTools(in []map[string]any) []map[string]any {
+	out := make([]map[string]any, 0, len(in))
+	for _, t := range in {
+		fn, ok := t["function"].(map[string]any)
+		if !ok {
+			continue
+		}
+		cp := make(map[string]any, len(fn))
+		for k, v := range fn {
+			cp[k] = v
+		}
+		if params, ok := cp["parameters"].(map[string]any); ok {
+			if b, err := json.Marshal(params); err == nil {
+				cp["parameters"] = string(b)
+			}
+		}
+		item := map[string]any{"function": cp}
+		if typ, ok := t["type"].(string); ok && typ != "" {
+			item["type"] = typ
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+// soloToolChoice 把 tool_choice 归一成 SOLO 认的字符串；返回空串表示不带这个字段。
+func soloToolChoice(v any) string {
+	switch t := v.(type) {
+	case string:
+		s := strings.ToLower(strings.TrimSpace(t))
+		if s == "auto" || s == "required" {
+			return s
+		}
+	case map[string]any:
+		typRaw, _ := t["type"].(string)
+		typ := strings.ToLower(strings.TrimSpace(typRaw))
+		switch typ {
+		case "auto", "required":
+			return typ
+		case "function":
+			if fn, ok := t["function"].(map[string]any); ok {
+				if nameRaw, ok := fn["name"].(string); ok {
+					if name := strings.TrimSpace(nameRaw); name != "" {
+						return name
+					}
+				}
+			}
+			return "auto"
+		}
+	}
+	return ""
 }
 
 func soloHeaders(req *http.Request, c *channel.Credential, stream bool) {
