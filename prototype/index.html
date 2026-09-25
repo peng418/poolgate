@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PoolGate · UI 原型</title>
+<link rel="stylesheet" href="assets/poolgate.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="side">
+    <div class="brand"><span class="mark">PG</span><b>PoolGate<small>AI 账号池网关</small></b></div>
+    <nav class="nav">
+      <div class="sep">七屏原型</div>
+      <a href="07-login.html"><span class="dot"></span>0 登录 / 授权</a>
+      <a href="01-overview.html"><span class="dot"></span>1 总览</a>
+      <a href="02-accounts.html"><span class="dot"></span>2 账号</a>
+      <a href="03-models.html"><span class="dot"></span>3 模型与费率</a>
+      <a href="04-benchmark.html"><span class="dot"></span>4 测速与体检</a>
+      <a href="05-logs.html"><span class="dot"></span>5 日志与诊断</a>
+      <a href="06-settings.html"><span class="dot"></span>6 设置</a>
+    </nav>
+  </aside>
+
+  <main class="main">
+    <div class="top">
+      <div>
+        <h1>PoolGate · UI 原型</h1>
+        <p>纯 HTML/CSS，双击即开 · 无需构建 · 右上角可切深浅主题</p>
+      </div>
+      <div class="actions">
+        <button class="btn" id="themeBtn" onclick="pgToggleTheme()">☾ 暗色</button>
+      </div>
+    </div>
+
+    <div class="grid g3" style="margin-bottom:16px">
+      <a class="card" href="07-login.html" style="text-decoration:none;color:inherit;display:block">
+        <h2>0 · 登录 / 授权</h2>
+        <div class="sub">进控制台之前的那一步</div>
+        <p class="hint" style="margin:0">登录 · 首次设置密码 · 渠道授权绑号（成功态与失败态各一屏，失败必带 kind 与上游原话）</p>
+      </a>
+      <a class="card" href="01-overview.html" style="text-decoration:none;color:inherit;display:block">
+        <h2>1 · 总览</h2>
+        <div class="sub">整体健康、能撑多久、告警</div>
+        <p class="hint" style="margin:0">渠道健康状态块 · 4 个关键指标 · 近 7 日请求量 · 渠道延迟条形 · 待处理列表</p>
+      </a>
+      <a class="card" href="02-accounts.html" style="text-decoration:none;color:inherit;display:block">
+        <h2>2 · 账号</h2>
+        <div class="sub">每个号的状态与操作</div>
+        <p class="hint" style="margin:0">按渠道分组 · 余额/签到/冷却/成功率 · 暂停渠道单独成区并写明恢复条件</p>
+      </a>
+      <a class="card" href="03-models.html" style="text-decoration:none;color:inherit;display:block">
+        <h2>3 · 模型与费率</h2>
+        <div class="sub">哪些能用、多贵、能力如何</div>
+        <p class="hint" style="margin:0">渠道×模型矩阵 · 能力位 · 倍率与来源标注 · 健康度与下发开关</p>
+      </a>
+      <a class="card" href="04-benchmark.html" style="text-decoration:none;color:inherit;display:block">
+        <h2>4 · 测速与体检</h2>
+        <div class="sub">哪个快、哪个坏、为什么</div>
+        <p class="hint" style="margin:0">抽样体检 + 全量测速 · 失败必带原因 · 体检历史可回看判据</p>
+      </a>
+      <a class="card" href="05-logs.html" style="text-decoration:none;color:inherit;display:block">
+        <h2>5 · 日志与诊断</h2>
+        <div class="sub">刚才发生了什么</div>
+        <p class="hint" style="margin:0">错误分类聚合 · 一键诊断结论 · 请求流水（失败永远带 kind 与上游原话）</p>
+      </a>
+      <a class="card" href="06-settings.html" style="text-decoration:none;color:inherit;display:block">
+        <h2>6 · 设置</h2>
+        <div class="sub">怎么改、怎么退</div>
+        <p class="hint" style="margin:0">服务/鉴权/路由冷却/健康探测/签到保活/渠道开关/备份/危险区</p>
+      </a>
+    </div>
+
+    <div class="grid g2">
+      <div class="card">
+        <h2>设计约束（硬性）</h2>
+        <div class="sub">这些不是风格偏好，是验收项</div>
+        <table>
+          <tbody>
+            <tr><td><b>状态三重表达</b></td><td>图标 + 文字 + 颜色齐备，色觉障碍下仍可辨（原型已如此实现）</td></tr>
+            <tr><td><b>判据可见</b></td><td>面板上明确写出「收到内容才算通过」，不让人以为在看状态码</td></tr>
+            <tr><td><b>失败必带原因</b></td><td>任何 error 行都必须有 <span class="mono">kind</span> + 上游原话，禁止空白</td></tr>
+            <tr><td><b>来源标注</b></td><td>能力位/上下文窗口标「上游 / 本地 / 未知」，未知不猜数字</td></tr>
+            <tr><td><b>图表可替代</b></td><td>每个图都有「表格视图」，图例与直标可见（不靠颜色单独承载身份）</td></tr>
+            <tr><td><b>数字对齐</b></td><td>金额/延迟/计数用等宽数字，列右对齐</td></tr>
+            <tr><td><b>危险可逆</b></td><td>危险操作二次确认并写明后果；配置改动可回滚</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>配色（已通过色彩校验）</h2>
+        <div class="sub">渠道身份色 3 槽 · 明暗两模式全对比较通过（最差 CVD ΔE 9.2/9.4）</div>
+        <div class="legend" style="font-size:13px">
+          <span><i style="width:12px;height:12px;background:var(--s1)"></i>QoderCN</span>
+          <span><i style="width:12px;height:12px;background:var(--s2)"></i>WorkBuddyCN</span>
+          <span><i style="width:12px;height:12px;background:var(--s3)"></i>TraeWork</span>
+        </div>
+        <table style="margin-top:12px">
+          <thead><tr><th>状态角色</th><th>色值</th><th>用于</th></tr></thead>
+          <tbody>
+            <tr><td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>正常</span></td><td class="mono">#0ca30c</td><td>健康、成功</td></tr>
+            <tr><td><span class="pill warn"><span class="i">!</span><span class="swatch"></span>降级</span></td><td class="mono">#fab219</td><td>部分模型异常、额度将尽</td></tr>
+            <tr><td><span class="pill serious"><span class="i">≈</span><span class="swatch"></span>冷却中</span></td><td class="mono">#ec835a</td><td>临时不可用</td></tr>
+            <tr><td><span class="pill crit"><span class="i">×</span><span class="swatch"></span>故障</span></td><td class="mono">#d03b3b</td><td>不可用、失败</td></tr>
+            <tr><td><span class="pill pause"><span class="i">–</span><span class="swatch"></span>暂停</span></td><td class="mono">#898781</td><td>人工/额度暂停</td></tr>
+          </tbody>
+        </table>
+        <div class="hint" style="margin-top:10px">
+          状态色是保留语义，永不当作第 N 条系列色使用；亮色模式下部分分类色对比度低于 3:1，
+          因此图表一律带可见图例或直标（已按此实现）。
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <h2>响应式</h2>
+      <div class="sub">手机竖屏至少要能看状态、开关账号</div>
+      <p class="hint" style="margin:0">
+        窗口缩到 820px 以下时，左侧导航折叠为顶部横向滚动条，卡片栅格降为单列，
+        宽表格改为<b>卡片内横向滚动</b>、按钮不换行 —— 页面本身不产生横向滚动。
+        <b>账号页与总览页</b>是手机端的主要使用场景（看余额、看告警、开关账号）；
+        <b>登录页</b>在 900px 以下收为单列，左侧说明落到表单上方。
+      </p>
+      <p class="hint" style="margin-top:8px">
+        渲染产物见 <span class="mono">shots/</span>（7 屏 × 明暗 + 登录页移动端），
+        用 <span class="mono">node shoot.mjs</span> 可重现。
+        <b>已知取舍</b>：移动端表格采用卡片内横滚而非堆叠卡片，实现阶段若嫌窄可改为「每账号一张堆叠卡」。
+      </p>
+    </div>
+  </main>
+</div>
+<script src="assets/poolgate.js"></script>
+</body>
+</html>

@@ -1,0 +1,1950 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PoolGate · AI 账号池网关</title>
+<!-- 不提供 favicon：用 data: 空图标抑制浏览器自动请求，免得留一个 404 -->
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="./poolgate.css">
+<script src="./vue.global.prod.js"></script>
+<!-- 二维码：把渠道授权地址画成真码，手机扫码完成授权（见 dist/VENDOR.md） -->
+<script src="./qrcode.js"></script>
+<style>
+/* 只放原型没有、但真实实现必需的少量补充；其余一律用 poolgate.css 的令牌与组件。 */
+[v-cloak]{visibility:hidden}
+.pill.plain{color:var(--ink-2)}
+.chart-empty{color:var(--ink-3);font-size:12.5px;padding:14px 0}
+.toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);z-index:60;
+  background:var(--surface);color:var(--ink);border:1px solid var(--border);
+  border-radius:9px;padding:10px 16px;font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.16);max-width:90vw}
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.45);display:grid;place-items:center;z-index:55;padding:20px}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px 20px;max-width:460px;width:100%}
+.modal h3{margin:0 0 8px;font-size:15px}
+.modal p{margin:0 0 16px;color:var(--ink-2);font-size:12.5px;line-height:1.7}
+.modal .row{display:flex;gap:8px;justify-content:flex-end}
+.btn[disabled]{opacity:.5;cursor:not-allowed}
+.spin.sm{width:11px;height:11px;border-width:2px}
+/* 「值 + 复制按钮」一行：地址与 Key 都要能一键拿走，不该让人用鼠标划选。
+   .field 是 grid，所以这里显式 flex；input 要 min-width:0，否则长 Key 会把卡片撑宽。 */
+.copy-row{display:flex;gap:8px;align-items:center}
+.copy-row input{flex:1 1 auto;min-width:0}
+.copy-row .btn{flex:none}
+.btn-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+/* 设置页的布尔开关（如「只下发可用模型」）。原生复选框在暗色主题下几乎看不见，
+   给它固定尺寸 + 强调色，「开没开」不该靠猜。 */
+.switch{display:flex;align-items:center;gap:8px;cursor:pointer}
+.switch input[type="checkbox"]{width:auto;flex:none;margin:0;accent-color:var(--s1);cursor:pointer}
+
+/* 添加账号的覆盖层：桌面宽、手机窄。auth-card 默认 420px 是给登录表单用的，
+   选渠道要展示六张卡，沿用窄栏会变成手机布局。 */
+.auth-card.auth-card-wide{max-width:920px}
+/* 授权视图：有二维码 + 长回调地址 + 键值表，420px 在桌面太窄（长 URL 频繁折行）。 */
+.auth-card.auth-card-mid{max-width:620px}
+.pick-grid{display:grid;gap:12px;grid-template-columns:repeat(2,minmax(0,1fr))}
+.pick-item{border:1px solid var(--border);border-radius:9px;padding:13px 14px;
+  display:flex;flex-direction:column;gap:9px;min-width:0}
+.pick-head{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+.pick-note{margin:0;line-height:1.5}
+.pick-item .btn{align-self:flex-start}
+/* 真二维码：底色必须是白的（扫码器要深模块+浅底），所以这里不跟随主题的 surface 色。
+   这不是漏改主题，是功能要求。 */
+.qr-frame{background:#fff}
+.qr-real{width:100%;height:100%;max-width:100%;display:grid;place-items:center}
+/* 用 max-width + height:auto 而不是 width/height:100%：万一库给出的是像素尺寸，
+   也不会把卡片撑宽（授权页里已经塞了长 URL 与长文案，窄屏很容易被撑破）。 */
+.qr-real svg{max-width:100%;max-height:100%;width:auto;height:auto;display:block}
+/* QR 必须硬边：SVG 缩放到小尺寸时如果做了抗锯齿，模块边缘发灰，
+   手机摄像头（和我们自己的验证脚本）都可能解不出来。 */
+.qr-real svg, .qr-blank{shape-rendering:crispEdges}
+.qr-blank{opacity:.35}
+/* 手工回填回调地址（浏览器跳回本机打不开时的兜底） */
+.cb-paste{max-width:100%;margin-top:12px;border:1px solid var(--border);border-radius:9px;padding:10px 12px;background:var(--surface-2)}
+.cb-paste summary{cursor:pointer;font-size:12.5px;color:var(--ink-2)}
+.cb-paste[open] summary{color:var(--ink)}
+
+/* 覆盖层自己滚：内容高过视口时不该把整页撑长（否则背后页面能被滑出来）。 */
+.auth-main{padding:22px 18px 40px}
+@media(min-width:901px){ .auth-main{align-items:start} }
+/* 栅格/弹性子项默认 min-width:auto，宽内容（表格、长 URL）会把整页撑出横向滚动。
+   这两条是手机端「页面本身不横向滚动」的兜底（原型 CSS 未覆盖到）。 */
+.grid > *{min-width:0}
+.card{min-width:0}
+.side,.nav{min-width:0}
+@media(max-width:820px){
+  .auth-card.auth-card-wide,.auth-card.auth-card-mid{max-width:100%}
+  /* 授权页里有长 URL、长文案、二维码，窄屏极易被内容撑破：这里逐层兜住
+     （实测偶发过 scrollWidth 到 1500+，靠这些 min-width/max-width 与换行规则钉死）。 */
+  .auth-main,.auth-card,.auth-card .card{max-width:100%;min-width:0}
+  .auth-card .card h2,.auth-card .card .sub,.auth-card .card .hint{overflow-wrap:anywhere}
+  .steps{min-width:0}
+  .step-line{min-width:0}
+  .kv-t td{overflow-wrap:anywhere}
+  .pick-grid{grid-template-columns:1fr}
+  /* 顶部导航条在窄屏要能横向滑动，而不是把页面撑宽。 */
+  .nav{overflow-x:auto;max-width:100%}
+}
+</style>
+</head>
+<body>
+<div id="app" v-cloak>
+
+  <!-- ==================== 登录 / 首次设置 / 渠道授权 ==================== -->
+  <!-- ==================== 登录 / 首次设置（未登录时） ==================== -->
+  <div class="auth" v-if="!authed && !authFlowOpen">
+    <aside class="auth-aside">
+      <div class="auth-brand">
+        <span class="mark" style="width:32px;height:32px;border-radius:8px;background:linear-gradient(140deg,var(--s1),var(--s3));display:grid;place-items:center;color:#fff;font-weight:700;font-size:15px">PG</span>
+        <b style="font-size:16px">PoolGate<small style="display:block;color:var(--ink-3);font-size:11px;font-weight:400">AI 账号池网关</small></b>
+      </div>
+      <div>
+        <h1>把多个 AI 订阅账号<br>汇成一个池子，一处管理。</h1>
+        <p class="lead">对外提供 OpenAI / Anthropic 兼容接口，Studio、Claude Code、Codex 直连即用。</p>
+      </div>
+      <ul class="auth-points">
+        <li><span class="n">1</span><div><b>失败一定看得见</b>
+          <p>上游异常会回传结构化错误并落一条流水，不会出现「不回复也不报错」。</p></div></li>
+        <li><span class="n">2</span><div><b>面板不撒谎</b>
+          <p>只有真的收到内容才算通过；空流与错误信封一律判失败，并附上上游原话。</p></div></li>
+        <li><span class="n">3</span><div><b>渠道可插拔</b>
+          <p>上游改版是常态。摘掉一个渠道是配置级操作，不用改代码。</p></div></li>
+      </ul>
+      <div class="auth-foot">
+        单用户自用 · 不做多租户与计费<br>
+        凭证 AES-GCM 加密落盘（0600），永不进入日志与导出
+      </div>
+    </aside>
+
+    <main class="auth-main">
+      <div class="auth-card">
+
+        <!-- 视图 A：登录 -->
+        <section class="card" v-if="initialized && authView==='signin'">
+          <h2>登录控制台</h2>
+          <div class="sub">管理端入口 · 仅本机或局域网内可访问</div>
+
+          <div class="auth-err" v-if="err">
+            <span class="ico" style="font-size:14px;line-height:1.3">×</span>
+            <div><b>登录失败</b><span>{{ err }}</span>
+              <span class="mono" v-if="errDetail">{{ errDetail }}</span></div>
+          </div>
+
+          <div class="field">
+            <label for="pw">管理员密码</label>
+            <div class="pw-row">
+              <input id="pw" :type="showPw?'text':'password'" v-model="pw" autocomplete="current-password"
+                @keyup.enter="doLogin">
+              <button class="btn sm" type="button" @click="showPw=!showPw">{{ showPw?'隐藏':'显示' }}</button>
+            </div>
+          </div>
+
+          <div class="field">
+            <label class="pw-row" style="gap:8px">
+              <input type="checkbox" v-model="remember" style="width:auto">
+              <span>在这台设备上记住我（30 天）</span>
+            </label>
+          </div>
+
+          <button class="btn primary" style="width:100%" @click="doLogin" :disabled="busy">登录</button>
+
+          <p class="auth-alt">忘记密码？用服务器上的 <span class="mono">poolgate admin reset-password</span> 重置</p>
+
+          <div class="banner warn" style="margin:16px 0 0">
+            <span class="ico">!</span>
+            <div><b>连续失败 5 次将锁定 15 分钟</b>
+              <p>失败次数与来源 IP 会落日志；锁定期间本页仍可打开，但登录被拒。</p></div>
+          </div>
+        </section>
+
+        <!-- 视图 B：首次设置 -->
+        <section class="card" v-else-if="!initialized">
+          <div class="steps">
+            <span class="step-tab done"><span class="n">✓</span>检查环境</span>
+            <span class="step-line"></span>
+            <span class="step-tab on"><span class="n">2</span>设置密码</span>
+            <span class="step-line"></span>
+            <span class="step-tab"><span class="n">3</span>完成</span>
+          </div>
+
+          <h2>首次设置</h2>
+          <div class="sub">还没有管理员账号 —— 设置一个密码即可开始</div>
+
+          <div class="field">
+            <label for="np">管理员密码</label>
+            <div class="pw-row">
+              <input id="np" :type="showPw?'text':'password'" v-model="pw" autocomplete="new-password">
+              <button class="btn sm" type="button" @click="showPw=!showPw">{{ showPw?'隐藏':'显示' }}</button>
+            </div>
+            <div class="pw-meter" aria-hidden="true">
+              <i v-for="i in 4" :key="i" :class="{on:i<=pwStrength.level, warn:pwStrength.level<=1}"></i>
+            </div>
+            <p class="pw-note">强度：<b>{{ pwStrength.word }}</b> · {{ pwStrength.note }}</p>
+          </div>
+
+          <div class="field">
+            <label for="np2">再输一次</label>
+            <input id="np2" type="password" v-model="pw2" autocomplete="new-password" @keyup.enter="doSetup">
+            <span class="hint">两次一致才会启用「创建」按钮</span>
+          </div>
+
+          <div class="field">
+            <label for="listen">面板监听地址</label>
+            <input id="listen" v-model="listenHint" readonly>
+            <span class="hint">与 wild-work（5013）错开，便于并存迁移</span>
+          </div>
+
+          <button class="btn primary" style="width:100%" @click="doSetup" :disabled="busy">创建并进入</button>
+
+          <div class="auth-err" v-if="err" style="margin-top:14px">
+            <span class="ico" style="font-size:14px;line-height:1.3">×</span>
+            <div><b>设置失败</b><span>{{ err }}</span>
+              <span class="mono" v-if="errDetail">{{ errDetail }}</span></div>
+          </div>
+
+          <p class="auth-alt">密码以 Argon2id 哈希存放，明文不落盘、不入日志</p>
+        </section>
+
+      </div>
+    </main>
+  </div>
+
+
+  <!-- ==================== 添加账号 / 渠道授权（覆盖层，登录前后都能用） ==================== -->
+  <div class="auth" v-if="authFlowOpen" style="grid-template-columns:1fr">
+    <main class="auth-main">
+      <div class="auth-card" :class="{'auth-card-wide':authView==='pick','auth-card-mid':authView==='oauth'||authView==='done'}">
+        <!-- 视图 C0：选渠道（加号第一步） -->
+        <section class="card" v-if="authView==='pick'">
+          <div class="steps">
+            <span class="step-tab on"><span class="n">1</span>选渠道</span>
+            <span class="step-line"></span>
+            <span class="step-tab"><span class="n">2</span>授权</span>
+            <span class="step-line"></span>
+            <span class="step-tab"><span class="n">3</span>绑号</span>
+          </div>
+
+          <h2>添加账号</h2>
+          <div class="sub">选一个渠道，然后在浏览器里完成授权</div>
+
+          <!-- 桌面端两列、手机端单列：六张卡竖排在手机上要滑很久。 -->
+          <div class="pick-grid">
+            <div class="pick-item" v-for="c in channels" :key="'pick'+c.kind">
+              <div class="pick-head">
+                <div class="ch" :class="channelClass(c.kind,c.status)">
+                  <span class="k"></span><b>{{ c.display_name }}</b>
+                </div>
+                <span class="pill" :class="c.panel_auth?'good':'plain'">
+                  <span class="i">{{ c.panel_auth?'✓':'–' }}</span><span class="swatch"></span>
+                  {{ c.panel_auth ? (c.account_count ? c.account_count+' 个账号' : '可授权') : '不可面板授权' }}
+                </span>
+              </div>
+              <div class="hint pick-note">
+                {{ c.panel_auth ? '点右侧按钮，在浏览器里完成授权后账号自动入池。' : c.panel_auth_note }}
+              </div>
+              <button class="btn primary" v-if="c.panel_auth" @click="startAuth(c.kind)" :disabled="busy">
+                授权{{ c.account_count ? '（再加一个）' : '' }}
+              </button>
+              <span v-else class="muted">请用「从 wild-work 导入账号」</span>
+            </div>
+          </div>
+
+          <p class="auth-alt"><a href="#" @click.prevent="closeAuthFlow()">取消</a></p>
+        </section>
+
+        <!-- 视图 C：渠道授权 -->
+        <section class="card" v-else-if="authView==='oauth'">
+          <div class="steps">
+            <span class="step-tab done"><span class="n">✓</span>选渠道</span>
+            <span class="step-line"></span>
+            <span class="step-tab on"><span class="n">2</span>授权</span>
+            <span class="step-line"></span>
+            <span class="step-tab"><span class="n">3</span>绑号</span>
+          </div>
+
+          <h2>添加账号 · {{ auth.channel }}</h2>
+          <div class="sub" v-if="qrUsable">用手机扫下面的二维码，在<b>手机上</b>完成 <b>{{ auth.channel }}</b> 授权，账号会自动回到池子里（桌面不用跳转）</div>
+          <div class="sub" v-else>这个渠道<b>没法扫码</b>（它的回调地址被上游锁死在本机）：点下面的「打开授权页」在浏览器里完成，
+            或者完成之后用「手工回填」把那串地址粘回来</div>
+
+          <div class="qr-wrap">
+            <div class="qr-frame" :data-tip="qrTip">
+              <!-- 真二维码：内容是这次授权的地址，手机扫完在手机上完成登录，
+                   桌面不用跳转（设备码流与 state 轮询流天然支持这种「另一台设备完成」）。 -->
+              <div class="qr-real" v-if="authQr" v-html="authQr"></div>
+              <svg v-else class="qr-blank" viewBox="0 0 33 33" role="img" aria-label="二维码占位">
+                <rect width="33" height="33" fill="#fff"/>
+                <g fill="var(--ink-3)">
+                  <path d="M2 2h7v7H2z M4 4h3v3H4z"/>
+                  <path d="M24 2h7v7h-7z M26 4h3v3h-3z"/>
+                  <path d="M2 24h7v7H2z M4 26h3v3H4z"/>
+                </g>
+              </svg>
+            </div>
+            <div class="qr-state" v-if="auth.status==='waiting'">
+              <span class="spin" aria-hidden="true"></span>
+              <span>{{ qrScanHint }} · 剩余 <b style="font-variant-numeric:tabular-nums">{{ authCountdown }}</b></span>
+            </div>
+            <div class="qr-state" v-else>
+              <span>{{ authLabel }}</span>
+            </div>
+          </div>
+
+          <div class="banner warn" v-if="callbackLockedLocal && !browserIsLocal && auth.url">
+            <span class="ico">!</span>
+            <div><b>这个渠道的回调地址被上游锁死在本机（127.0.0.1），扫码对它无效</b>
+              <p>它的 <span class="mono">redirect_uri</span> 必须命中上游预注册清单，只能是
+                 <span class="mono">127.0.0.1:随机端口</span> —— 从别的机器打开面板时，授权页跳回的是
+                 你那台电脑，面板收不到授权码。<b>两个办法</b>：① 在这台 NAS 上的浏览器里打开下面的授权地址；
+                 ② 在任意浏览器完成授权（跳回会打不开），然后把地址栏里那串地址<b>粘到下面的「手工回填」</b>里。</p></div>
+          </div>
+
+          <div class="banner" v-if="callbackViaPanel && auth.url">
+            <span class="ico">✓</span>
+            <div><b>扫码就能完成，不必和面板同机</b>
+              <p>这个渠道的回调地址用的是面板自己的地址（<span class="mono">{{ auth.callbackBase }}</span>），
+                 手机扫码或别的电脑的浏览器都能把授权码送回来。</p></div>
+          </div>
+
+          <div class="banner" style="margin:12px 0 0">
+            <span class="ico">↗</span>
+            <div><b>{{ qrUsable ? '没有手机 / 扫码不方便？用浏览器打开授权页' : '在浏览器里打开授权页' }}</b>
+              <p>{{ qrUsable ? '扫码那条路更省事；这里只是兜底。' : '这个渠道的授权只能在浏览器里完成。' }}
+                 授权完成后会自动回填，不需要手工粘 token；若浏览器跳回来打不开（回调锁死本机时很常见），
+                 再用上面的「手工回填」把那串地址粘回来。</p></div>
+          </div>
+
+          <table class="kv-t" style="margin-top:12px">
+            <tbody>
+              <tr><td>登录方式</td><td>{{ authMethod }}</td></tr>
+              <tr v-if="auth.url"><td>授权地址</td><td class="mono" style="word-break:break-all">{{ auth.url }}</td></tr>
+              <tr><td>超时</td><td class="num">5 分钟</td></tr>
+            </tbody>
+          </table>
+
+          <details class="cb-paste" v-if="auth.url">
+            <summary>浏览器跳回来打不开？把地址栏里的整串地址粘到这里</summary>
+            <div class="copy-row" style="margin-top:8px">
+              <input v-model="cbRaw" placeholder="http://127.0.0.1:54321/callback?code=…（只贴 code 也行）"
+                @keyup.enter="submitCallback">
+              <button class="btn sm" @click="submitCallback" :disabled="busy">提交</button>
+            </div>
+            <span class="hint">
+              授权完成后浏览器会跳到回调地址；如果那个页面打不开（从别的机器操作时很常见），
+              把地址栏里的整串内容复制过来即可 —— 面板拿里面的授权码去兑换，不改任何回调地址、不额外开放端口。
+            </span>
+          </details>
+
+          <div style="display:flex;gap:8px;margin-top:14px" class="row">
+            <button class="btn primary" v-if="auth.url" @click="openAuth">打开授权页</button>
+            <button class="btn" v-if="auth.url" @click="copyAuth">复制链接</button>
+            <!-- 取消按钮不设 v-if：服务端可能正在跑一次授权而面板没拿到地址
+                 （授权失败后重试、或页面刷新过），这时用户最需要的就是「取消掉重来」。 -->
+            <button class="btn danger" @click="cancelAuth">取消授权</button>
+          </div>
+
+          <div class="auth-err" v-if="auth.message && auth.status!=='waiting'" style="margin-top:14px">
+            <span class="ico" style="font-size:14px;line-height:1.3">×</span>
+            <div><b>授权未完成 · kind={{ auth.kind || 'Unknown' }}</b>
+              <span>{{ auth.message }}</span>
+              <span class="mono" v-if="auth.upstream">上游原话：{{ auth.upstream }}</span></div>
+          </div>
+
+          <p class="auth-alt"><a href="#" @click.prevent="closeAuthFlow()">取消</a></p>
+        </section>
+
+        <!-- 视图 D：授权成功 -->
+        <section class="card" v-else-if="authView==='done'">
+          <div class="steps">
+            <span class="step-tab done"><span class="n">✓</span>选渠道</span>
+            <span class="step-line"></span>
+            <span class="step-tab done"><span class="n">✓</span>授权</span>
+            <span class="step-line"></span>
+            <span class="step-tab on"><span class="n">3</span>绑号</span>
+          </div>
+
+          <div class="banner good" style="margin:0 0 14px">
+            <span class="ico">✓</span>
+            <div><b>账号已加入池子</b><p>凭证已加密落盘，现在就可以被路由选中。</p></div>
+          </div>
+
+          <table class="kv-t">
+            <tbody>
+              <tr><td>渠道</td><td><span class="ch" :class="channelClass(auth.channel)"><span class="k"></span>{{ auth.channelName }}</span></td></tr>
+              <tr><td>账号</td><td><b>{{ auth.account && (auth.account.nickname || auth.account.uid) }}</b>
+                <div class="hint mono" v-if="auth.account">{{ shortUid(auth.account.uid) }}</div></td></tr>
+              <tr><td>可用模型</td><td class="num">{{ auth.modelCount || '—' }}</td></tr>
+              <tr><td>余额</td><td>
+                <b v-if="auth.balance && auth.balance.known" class="num">{{ auth.balance.credits }}</b>
+                <span v-else class="muted">未知</span>
+                <div class="hint" v-if="auth.balanceError">未取到余额：{{ auth.balanceError }}</div>
+              </td></tr>
+            </tbody>
+          </table>
+
+          <div class="hint" style="margin-top:12px">
+            模型目录与余额都已按新账号刷新过。要不要体检由你决定：去「测速与体检」页跑抽样体检，
+            判据是「真的收到内容」—— 没跑过体检的模型在页面里显示「未体检」，不会被当成可用。
+          </div>
+
+          <div style="display:flex;gap:8px;margin-top:14px">
+            <button class="btn primary" @click="closeAuthFlow();view='accounts'">完成，回到账号页</button>
+            <button class="btn" @click="closeAuthFlow()">关闭</button>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <!-- ==================== 主面板 ==================== -->
+  <!-- 必须同时满足「已登录」且「没在走加号流程」：只判 authFlowOpen 的话，
+       未登录时登录页与面板会同时渲染，手机上往下一滑就能看到面板内容。 -->
+  <div class="shell" v-else-if="authed">
+    <aside class="side">
+      <div class="brand"><span class="mark">PG</span><b>PoolGate<small>AI 账号池网关</small></b></div>
+      <nav class="nav">
+        <a v-for="n in navItems" :key="n.k" :class="{on:view===n.k}" @click="go(n.k)">
+          <span class="dot"></span>{{ n.label }}
+        </a>
+      </nav>
+    </aside>
+
+    <main class="main">
+      <div class="top">
+        <div>
+          <h1>{{ title }}</h1>
+          <p>{{ subtitle }}</p>
+        </div>
+        <div class="actions">
+          <button class="btn" id="themeBtn" onclick="pgToggleTheme()">☾ 暗色</button>
+          <template v-if="view==='overview'">
+            <button class="btn" @click="go('logs')">一键诊断</button>
+            <button class="btn primary" @click="probe('full')" :disabled="probing">全量体检</button>
+          </template>
+          <template v-else-if="view==='accounts'">
+            <button class="btn" @click="checkinAll" :disabled="busy">全部签到</button>
+            <button class="btn" @click="refreshAll" :disabled="busy">刷新余额</button>
+            <button class="btn primary" @click="startAddAccount">＋ 添加账号</button>
+          </template>
+          <template v-else-if="view==='models'">
+            <button class="btn" @click="loadModels" :disabled="busy">刷新目录</button>
+          </template>
+          <template v-else-if="view==='benchmark'">
+            <button class="btn" @click="probe('sample')" :disabled="probing">抽样体检（快）</button>
+            <button class="btn primary" @click="probe('full')" :disabled="probing">全量测速（{{ modelRows.length }} 模型）</button>
+          </template>
+          <template v-else-if="view==='logs'">
+            <button class="btn" @click="exportLogs">导出 CSV</button>
+          </template>
+          <template v-else-if="view==='settings'">
+            <button class="btn" @click="saveSettings" :disabled="busy">保存</button>
+          </template>
+          <button class="btn" @click="logout">登出</button>
+        </div>
+      </div>
+
+      <!-- ================= 总览 ================= -->
+      <template v-if="view==='overview'">
+        <div class="banner crit" v-for="(p,i) in pendingCrit" :key="'c'+i">
+          <span class="ico">×</span>
+          <div><b>{{ p.title }}</b><p>{{ p.meta }}</p></div>
+        </div>
+
+        <div class="grid g4" style="margin-bottom:14px">
+          <div class="card stat">
+            <div class="label">可用渠道</div>
+            <div class="val">{{ usableChannels.length }}<span class="unit">/ {{ activeChannels.length }} 启用</span></div>
+            <div class="note">
+              <span v-if="!usableChannels.length" class="pill warn"><span class="i">!</span><span class="swatch"></span>还没有可用账号</span>
+              <span v-else-if="noAccountChannels.length" class="pill warn"><span class="i">!</span><span class="swatch"></span>{{ noAccountChannels.length }} 个渠道没账号</span>
+              <span v-else-if="allProbedOK" class="pill good"><span class="i">✓</span><span class="swatch"></span>全部通过体检</span>
+              <span v-else class="pill warn"><span class="i">!</span><span class="swatch"></span>有模型未通过</span>
+            </div>
+          </div>
+          <div class="card stat">
+            <div class="label">账号</div>
+            <div class="val">{{ totalHealthy }}<span class="unit">可用</span></div>
+            <div class="note">另有 {{ pausedAccountCount }} 个暂停渠道账号</div>
+          </div>
+          <div class="card stat">
+            <div class="label">今日请求</div>
+            <div class="val">{{ fmtNum(today.requests) }}</div>
+            <div class="note">失败 {{ today.failed }} · <span class="mono">{{ failRate }}</span></div>
+          </div>
+          <div class="card stat">
+            <div class="label">中位首字延迟 TTFT</div>
+            <div class="val">{{ today.ttft_ms ? (today.ttft_ms/1000).toFixed(1) : '—' }}<span class="unit" v-if="today.ttft_ms">s</span></div>
+            <div class="note" v-if="today.ttft_ms">P95 <span class="mono">{{ (today.p95_ms/1000).toFixed(1) }}s</span></div>
+            <div class="note" v-else>暂无成功样本</div>
+          </div>
+        </div>
+
+        <div class="grid g2" style="margin-bottom:14px">
+          <div class="card">
+            <h2>渠道健康</h2>
+            <div class="sub">判据：真实抽样请求「收到首个内容」才算通过（不看 HTTP 状态码）</div>
+            <table>
+              <thead><tr><th>渠道</th><th>状态</th><th class="num">账号</th><th class="num">余额</th><th class="num">模型通过</th></tr></thead>
+              <tbody>
+                <tr v-for="c in overview.channels" :key="c.kind">
+                  <td><span class="ch" :class="channelClass(c.kind,c.status)"><span class="k"></span>{{ c.display_name }}</span></td>
+                  <td><span class="pill" :class="statusPill(c)"><span class="i">{{ statusIcon(c) }}</span><span class="swatch"></span>{{ statusText(c) }}</span></td>
+                  <td class="num">{{ c.total_accounts }}</td>
+                  <td class="num">{{ channelCredits(c.kind) }}</td>
+                  <td class="num">
+                    <span v-if="c.total_models">{{ c.healthy_models }}/{{ c.total_models }}</span>
+                    <span v-else class="muted">未体检</span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="card">
+            <h2>渠道首字延迟（TTFT 中位）</h2>
+            <div class="sub">条形按量值取单色阶</div>
+            <div class="bars" v-if="ttftBars.length">
+              <div class="bar-row" v-for="b in ttftBars" :key="b.channel"
+                :data-tip="'<b>'+b.value+'</b><br>'+b.label+' · n='+b.n">
+                <span class="name">{{ b.label }}</span>
+                <span class="bar-track"><span class="bar-fill" :style="{width:b.pct+'%',background:b.color}"></span></span>
+                <span class="v">{{ b.value }}</span>
+              </div>
+            </div>
+            <div class="chart-empty" v-else>还没有成功的请求样本 —— 跑一次「全量体检」看看。</div>
+            <div class="legend" v-if="ttftBars.length">
+              <span><i style="background:var(--r3)"></i>≤1.5s</span>
+              <span><i style="background:var(--r5)"></i>1.5–3s</span>
+              <span><i style="background:var(--r7)"></i>&gt;3s</span>
+            </div>
+            <details class="tbl" v-if="ttftBars.length">
+              <summary>表格视图</summary>
+              <table>
+                <thead><tr><th>渠道</th><th class="num">TTFT 中位</th><th class="num">样本</th></tr></thead>
+                <tbody><tr v-for="b in ttftBars" :key="'t'+b.channel">
+                  <td>{{ b.label }}</td><td class="num">{{ b.value }}</td><td class="num">{{ b.n }}</td></tr></tbody>
+              </table>
+            </details>
+          </div>
+        </div>
+
+        <div class="card" style="margin-bottom:14px">
+          <h2>近 7 日请求量</h2>
+          <div class="sub">单系列（请求数）· 悬停看当日明细</div>
+          <div class="cols">
+            <div class="col" v-for="d in daily" :key="d.date"
+              :data-tip="'<b>'+fmtNum(d.requests)+'</b> 请求<br>失败 '+d.failed+(d.ttft_ms?' · TTFT '+(d.ttft_ms/1000).toFixed(1)+'s':'')">
+              <div class="bar" :style="{height: dailyHeight(d)+'px'}"></div>
+              <span class="lab">{{ d.date }}</span>
+            </div>
+          </div>
+          <div class="baseline"></div>
+          <details class="tbl">
+            <summary>表格视图</summary>
+            <table>
+              <thead><tr><th>日期</th><th class="num">请求</th><th class="num">失败</th><th class="num">TTFT 中位</th></tr></thead>
+              <tbody><tr v-for="d in daily" :key="'dt'+d.date">
+                <td>{{ d.date }}</td><td class="num">{{ fmtNum(d.requests) }}</td><td class="num">{{ d.failed }}</td>
+                <td class="num">{{ d.ttft_ms ? (d.ttft_ms/1000).toFixed(1)+'s' : '—' }}</td></tr></tbody>
+            </table>
+          </details>
+        </div>
+
+        <div class="card">
+          <h2>待处理</h2>
+          <div class="sub">按严重度排序，每条都能点进上下文</div>
+          <table v-if="pending.length">
+            <tbody>
+              <tr v-for="(p,i) in pending" :key="'p'+i">
+                <td style="width:96px">
+                  <span class="pill" :class="p.severity">
+                    <span class="i">{{ p.severity==='crit'?'×':(p.severity==='warn'?'!':'–') }}</span>
+                    <span class="swatch"></span>{{ sevLabel(p.severity) }}
+                  </span>
+                </td>
+                <td>{{ p.title }}</td>
+                <td class="muted">{{ p.meta }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="chart-empty" v-else>没有待处理事项。</div>
+        </div>
+      </template>
+
+      <!-- ================= 账号 ================= -->
+      <template v-if="view==='accounts'">
+        <div class="card" style="margin-bottom:14px" v-for="g in activeGroups" :key="g.kind">
+          <h2>
+            <span class="ch" :class="channelClass(g.kind)"><span class="k"></span>{{ g.name }}</span>
+            <span class="pill warn" style="margin-left:6px" v-if="g.degraded">
+              <span class="i">!</span><span class="swatch"></span>降级 · {{ g.degraded }} 个模型挂死</span>
+          </h2>
+          <div class="sub">{{ g.note }}</div>
+          <table>
+            <thead><tr>
+              <th>账号</th><th>状态</th><th class="num">余额</th><th>到期</th><th>签到</th>
+              <th class="num">成功率</th><th>操作</th>
+            </tr></thead>
+            <tbody>
+              <tr v-for="a in g.accounts" :key="a.uid">
+                <td><b>{{ a.nickname || a.uid }}</b><div class="hint mono">{{ shortUid(a.uid) }}</div></td>
+                <td>
+                  <span class="pill" :class="accountPill(a)"><span class="i">{{ accountIcon(a) }}</span><span class="swatch"></span>{{ accountText(a) }}</span>
+                  <div class="hint" v-if="a.reason">{{ reasonText(a.reason) }}</div>
+                </td>
+                <td class="num">{{ a.credits_known ? a.credits : '未知' }}</td>
+                <td>{{ a.expires_at ? fmtDate(a.expires_at) : '未知' }}</td>
+                <td>
+                  <span v-if="!a.checkin" class="muted">—</span>
+                  <span v-else class="pill" :class="checkinPill(a.checkin)">
+                    <span class="i">{{ a.checkin.ok?'✓':'!' }}</span><span class="swatch"></span>{{ checkinText(a.checkin) }}</span>
+                </td>
+                <td class="num">{{ a.success_rate==null ? '—' : a.success_rate+'%' }}</td>
+                <td>
+                  <button class="btn sm" @click="checkinOne(a)" :disabled="busy">签到</button>
+                  <button class="btn sm" @click="refreshOne(a)" :disabled="busy">刷新余额</button>
+                  <button class="btn sm" @click="startRelogin(a)">重新登录</button>
+                  <button class="btn sm danger" @click="toggleAccount(a)" :disabled="busy">{{ a.disabled?'启用':'禁用' }}</button>
+                  <button class="btn sm danger" @click="askRemoveAccount(a)">删除</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h2>暂停的渠道</h2>
+          <div class="sub">保留账号与适配器，但不向客户端下发模型；恢复只需改状态</div>
+          <table>
+            <thead><tr><th>渠道 / 账号</th><th>暂停原因</th><th class="num">余额</th><th>恢复条件</th><th>操作</th></tr></thead>
+            <tbody>
+              <tr v-for="g in pausedGroups" :key="'pg'+g.kind">
+                <td><b>{{ g.name }}</b><div class="hint">{{ g.accounts.map(a=>a.nickname||a.uid).join(' · ') || '无账号' }}</div></td>
+                <td>
+                  <span class="pill" :class="statusPill(g)"><span class="i">{{ statusIcon(g) }}</span><span class="swatch"></span>{{ statusText(g) }}</span>
+                  <div class="hint mono">{{ g.reason ? reasonText(g.reason) : '—' }}</div>
+                </td>
+                <td class="num">{{ g.credits }}</td>
+                <td class="hint">{{ g.recover }}</td>
+                <td>
+                  <button class="btn sm" @click="go('logs')">查看诊断</button>
+                  <button class="btn sm" @click="toggleChannel(g)" :disabled="busy">恢复</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p class="hint" style="margin-top:14px">
+          说明：凭证以加密形式存放于 <span class="mono">{{ paths.creds_dir || '配置目录/creds/' }}</span>（0600），
+          日志与导出永远不含 token；「重新登录」会在浏览器完成授权后自动回填，无需手工粘贴。
+        </p>
+      </template>
+
+      <!-- ================= 模型与费率 ================= -->
+      <template v-if="view==='models'">
+        <div class="banner warn">
+          <span class="ico">!</span>
+          <div><b>能力位与上下文窗口必须标注来源</b>
+            <p>上游给的值标「上游」，本地声明标「本地」，拿不到就显示 <b>未知</b> —— 不猜数字（野生估算会把 1M 窗口写进 200K 的模型里，实测踩过）。</p></div>
+        </div>
+
+        <div class="card" style="margin-bottom:14px">
+          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:end">
+            <div class="field" style="margin:0;min-width:210px">
+              <label for="q">搜索模型</label>
+              <input id="q" v-model="modelQ" placeholder="如 qwen3.8 / kimi">
+            </div>
+            <div class="field" style="margin:0">
+              <label for="c">渠道</label>
+              <select id="c" v-model="modelChannel">
+                <option value="all">全部</option>
+                <option v-for="c in catalogChannels" :key="c.kind" :value="c.kind">{{ c.name }}</option>
+              </select>
+            </div>
+            <div class="field" style="margin:0">
+              <label for="s">状态</label>
+              <select id="s" v-model="modelState">
+                <option value="all">全部</option><option value="ok">仅可用</option>
+                <option value="error">仅异常</option><option value="excluded">仅已剔除</option>
+              </select>
+            </div>
+            <button class="btn" @click="modelQ='';modelChannel='all';modelState='all'">重置</button>
+          </div>
+        </div>
+
+        <div class="banner warn" v-if="hiddenByHealthCount">
+          <span class="ico">!</span>
+          <div><b>{{ hiddenByHealthCount }} 个模型因体检失败不下发给客户端</b>
+            <p>设置里的「只下发可用模型」已开启，它们在 <span class="mono">/v1/models</span> 里不会出现（下面这张表仍然列出，方便你复检或跑一次体检）。
+              想放回来：关掉那个开关，或先跑一次体检 —— 探测通过就会自动回到下发列表。
+              <a href="#" @click.prevent="go('settings')">去设置</a></p></div>
+        </div>
+
+        <div class="card" style="margin-bottom:14px" v-for="g in modelGroups" :key="'mg'+g.kind">
+          <h2><span class="ch" :class="channelClass(g.kind)"><span class="k"></span>{{ g.name }}</span>
+            <span class="hint">{{ g.hint }}</span></h2>
+          <table>
+            <thead><tr>
+              <th>模型</th><th>能力位</th><th class="num">倍率</th><th class="num">上下文</th>
+              <th>健康</th><th class="num">TTFT</th><th>人工下发</th>
+            </tr></thead>
+            <tbody>
+              <tr v-for="m in g.models" :key="m.id"
+                :style="m.excluded?{background:'color-mix(in srgb, var(--crit) 7%, transparent)'}:{}">
+                <td class="mono">{{ m.id }}
+                  <span class="pill" style="margin-left:6px" v-if="m.isDefault"><span class="i">★</span>默认</span>
+                </td>
+                <td>{{ capsText(m) }}</td>
+                <td class="num muted">未知</td>
+                <td class="num">
+                  <template v-if="m.context_window">{{ humanCtx(m.context_window) }}
+                    <span class="hint">{{ srcLabel(m.context_source) }}</span></template>
+                  <template v-else>未知</template>
+                </td>
+                <td>
+                  <span v-if="m.healthy==='ok'" class="pill good"><span class="i">✓</span><span class="swatch"></span>可用</span>
+                  <span v-else-if="m.healthy==='error'" class="pill crit"><span class="i">×</span><span class="swatch"></span>探测失败</span>
+                  <span v-else class="muted">未体检</span>
+                  <!-- 被开关藏起来的模型必须在这一页看得见、还得说明白为什么，
+                       否则用户只会觉得「模型怎么少了」。 -->
+                  <div class="hint" v-if="m.hidden_by_health">已按健康度隐藏，不下发给客户端</div>
+                </td>
+                <td class="num">{{ m.ttft_ms ? (m.ttft_ms/1000).toFixed(1)+'s' : '—' }}</td>
+                <td>
+                  <button class="btn sm" @click="toggleModel(m)" :disabled="busy">{{ m.downstream?'开':'关' }}</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="card" v-if="!modelGroups.length">
+          <div class="chart-empty" v-if="modelsLoading">正在向上游拉取模型目录…（真实请求，通常几秒）</div>
+          <div class="chart-empty" v-else-if="!modelRows.length">
+            还没有模型。模型是「用账号向上游问出来的」—— 先到「账号」页点「＋ 添加账号」授权一个渠道。
+          </div>
+          <div class="chart-empty" v-else>没有匹配的模型（换个搜索词或筛选条件）。</div>
+        </div>
+        <p class="hint">
+          倍率显示「未知」是刻意的：上游费率接口未回该渠道数据，不折算、不编造。
+          两种「不下发」是两回事：<b>人工剔除</b>的模型不出现在 <span class="mono">/v1/models</span>、直连也会被拒；
+          <b>按健康度隐藏</b>的只是从列表里消失，直连仍会尝试（失败照常带原因回传）。
+        </p>
+      </template>
+
+      <!-- ================= 测速与体检 ================= -->
+      <template v-if="view==='benchmark'">
+        <div class="banner" :class="lastRun && lastRun.failed ? 'warn' : 'good'">
+          <span class="ico">{{ lastRun && lastRun.failed ? '!' : '✓' }}</span>
+          <div>
+            <b>{{ lastRun && lastRun.failed ? '体检有失败项' : '体检通过' }} —— 判据是「收到首个内容」，不是 HTTP 状态码</b>
+            <p v-if="lastRun">
+              {{ lastRun.kind==='full'?'全量测速':'抽样体检' }}：<b>{{ lastRun.passed }}/{{ lastRun.total }} 收到内容</b>。
+              空流、错误信封、超时一律判失败并记录上游原话。
+            </p>
+            <p v-else>还没跑过体检 —— 点右上角「抽样体检（快）」发一次真实请求。</p>
+          </div>
+        </div>
+
+        <div class="card" style="margin-bottom:14px">
+          <h2>抽样体检结果</h2>
+          <div class="sub">每渠道取代表模型（含默认模型）· {{ lastRun?fmtTime(lastRun.started_at):'—' }} · 耗时 {{ lastRun?(lastRun.duration_ms/1000).toFixed(1):'—' }}s</div>
+          <div class="bars" v-if="lastResults.length">
+            <div class="bar-row" v-for="r in lastResults" :key="'b'+r.channel+r.model"
+              :data-tip="'<b>'+r.channel+' / '+r.model+'</b><br>'+(r.ok?'首字 '+(r.ttft_ms/1000).toFixed(1)+'s · 收到内容 ✓':'失败 · '+(r.reason||r.kind))">
+              <span class="name"><span class="ch" :class="channelClass(r.channel)"><span class="k"></span>{{ r.model }}</span></span>
+              <span class="bar-track"><span class="bar-fill"
+                :style="{width:barPct(r.ttft_ms)+'%',background:r.ok?barColor(r.ttft_ms):'var(--crit)'}"></span></span>
+              <span class="v">{{ r.ok ? (r.ttft_ms/1000).toFixed(1)+'s' : '失败' }}</span>
+            </div>
+          </div>
+          <div class="chart-empty" v-else>还没有体检结果。</div>
+          <div class="legend" v-if="lastResults.length">
+            <span><i style="background:var(--r3)"></i>≤0.8s</span>
+            <span><i style="background:var(--r4)"></i>0.8–1.5s</span>
+            <span><i style="background:var(--r5)"></i>1.5–3s</span>
+            <span><i style="background:var(--r7)"></i>&gt;3s</span>
+          </div>
+        </div>
+
+        <div class="card" style="margin-bottom:14px" v-if="lastResults.length">
+          <h2>失败明细</h2>
+          <div class="sub">失败必带分类与上游原话 —— 不写「请重试」</div>
+          <table>
+            <thead><tr><th>渠道</th><th>模型</th><th>分类</th><th>原因</th><th>上游原话</th></tr></thead>
+            <tbody>
+              <tr v-for="r in failedResults" :key="'f'+r.channel+r.model">
+                <td><span class="ch" :class="channelClass(r.channel)"><span class="k"></span>{{ channelName(r.channel) }}</span></td>
+                <td class="mono">{{ r.model }}</td>
+                <td><span class="pill crit"><span class="i">×</span><span class="swatch"></span>{{ r.kind || '失败' }}</span></td>
+                <td>{{ r.reason }}</td>
+                <td class="mono" style="font-size:11.5px;max-width:320px;word-break:break-all">{{ r.upstream || '—' }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="chart-empty" v-if="!failedResults.length">本次没有失败。</div>
+        </div>
+
+        <div class="card">
+          <h2>体检历史</h2>
+          <div class="sub">每条保留结论与原始报文摘要，可回看「当时为什么判它坏」</div>
+          <table v-if="history.length">
+            <thead><tr><th>时间</th><th>类型</th><th>结论</th><th>失败明细</th><th class="num">耗时</th></tr></thead>
+            <tbody>
+              <tr v-for="(h,i) in historyDesc" :key="'h'+i">
+                <td class="mono">{{ fmtTime(h.started_at) }}</td>
+                <td>{{ h.kind==='full'?'全量测速':'抽样体检' }}</td>
+                <td><span class="pill" :class="h.failed?'warn':'good'">
+                  <span class="i">{{ h.failed?'!':'✓' }}</span><span class="swatch"></span>{{ h.passed }}/{{ h.total }} 通过</span></td>
+                <td>{{ historyFailSummary(h) }}</td>
+                <td class="num">{{ (h.duration_ms/1000).toFixed(1) }}s</td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="chart-empty" v-else>还没有体检历史。</div>
+        </div>
+      </template>
+
+      <!-- ================= 日志与诊断 ================= -->
+      <template v-if="view==='logs'">
+        <div class="grid g4" style="margin-bottom:14px">
+          <div class="card stat">
+            <div class="label">今日请求</div>
+            <div class="val">{{ fmtNum(today.requests) }}</div>
+            <div class="note">成功 {{ fmtNum(today.requests-today.failed) }} · 失败 {{ today.failed }}</div>
+          </div>
+          <div class="card stat">
+            <div class="label">失败率</div>
+            <div class="val">{{ failRate.replace('%','') }}<span class="unit">%</span></div>
+            <div class="note">昨日失败 {{ today.yesterday }} 次</div>
+          </div>
+          <div class="card stat">
+            <div class="label">失败构成</div>
+            <div class="val">{{ upstreamShare }}<span class="unit">% 上游类</span></div>
+            <div class="note">账号类故障 <span class="mono">{{ today.account_failed }}</span> 次</div>
+          </div>
+          <div class="card stat">
+            <div class="label">自动换号</div>
+            <div class="val">{{ today.rotations }}<span class="unit">次</span></div>
+            <div class="note">其中 {{ today.rotated_ok }} 次换号后成功</div>
+          </div>
+        </div>
+
+        <div class="grid g2" style="margin-bottom:14px">
+          <div class="card">
+            <h2>错误分类</h2>
+            <div class="sub">上游五花八门的错误归一成有限枚举 —— 这是路由与面板共用的字段</div>
+            <div class="bars" v-if="errorKinds.length">
+              <div class="bar-row" v-for="k in errorKinds" :key="k.name"
+                :data-tip="'<b>'+k.count+'</b> 次 · '+k.channels">
+                <span class="name">{{ k.label }}</span>
+                <span class="bar-track"><span class="bar-fill" :style="{width:k.pct+'%',background:'var(--r5)'}"></span></span>
+                <span class="v">{{ k.count }}</span>
+              </div>
+            </div>
+            <div class="chart-empty" v-else>还没有失败请求。</div>
+            <div class="hint" style="margin-top:10px">
+              注意：<b>上游故障不计入账号错误</b>。旧实现会把上游 503 当成账号故障累积，最终把好号也冷却掉。
+            </div>
+          </div>
+
+          <div class="card">
+            <h2>一键诊断<span v-if="diag.result"> · {{ diag.channel }}</span></h2>
+            <div class="sub">30 秒内回答「是本地配置问题还是上游问题」</div>
+            <div style="display:flex;gap:10px;align-items:end;margin-bottom:12px">
+              <div class="field" style="margin:0;flex:1">
+                <label for="dc">渠道</label>
+                <select id="dc" v-model="diag.channel">
+                  <option v-for="c in overview.channels" :key="c.kind" :value="c.kind">{{ c.display_name }}</option>
+                </select>
+              </div>
+              <button class="btn primary" @click="runDiagnose" :disabled="busy">开始诊断</button>
+            </div>
+            <dl class="kv" v-if="diag.result">
+              <dt>结论</dt>
+              <dd><span class="pill" :class="diag.result.kind?'crit':'good'">
+                <span class="i">{{ diag.result.kind?'×':'✓' }}</span><span class="swatch"></span>{{ diag.result.verdict }}</span></dd>
+              <template v-for="(st,i) in diag.result.steps" :key="'ds'+i">
+                <dt>{{ st.name }}</dt>
+                <dd :class="{mono:st.status==='crit'}">{{ st.value }}</dd>
+              </template>
+              <template v-if="diag.result.upstream">
+                <dt>上游原话</dt>
+                <dd class="mono" style="font-size:11.5px;background:var(--surface-2);padding:6px 8px;border-radius:6px">{{ diag.result.upstream }}</dd>
+              </template>
+            </dl>
+            <div class="chart-empty" v-else>选一个渠道，点「开始诊断」。</div>
+            <div class="hint" style="margin-top:10px">
+              诊断过程与原始报文一并留档，可随时回看：<a href="#" @click.prevent="go('benchmark')">体检历史 →</a>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>请求流水</h2>
+          <div class="sub">最近 {{ allLogs.length }} 条 · 保留 30 天 · 已脱敏（不含任何凭证）</div>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:end;margin-bottom:12px">
+            <div class="field" style="margin:0"><label for="fc">渠道</label>
+              <select id="fc" v-model="logFilter.channel">
+                <option value="all">全部</option>
+                <option v-for="c in overview.channels" :key="c.kind" :value="c.kind">{{ c.display_name }}</option>
+              </select></div>
+            <div class="field" style="margin:0"><label for="fs">状态</label>
+              <select id="fs" v-model="logFilter.status">
+                <option value="all">全部</option><option value="error">仅失败</option><option value="rotated">仅换号</option>
+              </select></div>
+            <div class="field" style="margin:0"><label for="fr">时间范围</label>
+              <select id="fr" v-model="logFilter.range">
+                <option value="1h">最近 1 小时</option><option value="today">今天</option><option value="7d">最近 7 天</option>
+              </select></div>
+          </div>
+          <table v-if="filteredLogs.length">
+            <thead><tr>
+              <th>时间</th><th>渠道</th><th>模型</th><th>账号</th><th>状态</th>
+              <th class="num">TTFT</th><th class="num">总耗时</th><th>说明</th>
+            </tr></thead>
+            <tbody>
+              <tr v-for="(r,i) in filteredLogs" :key="'lg'+i">
+                <td class="mono">{{ fmtTime(r.time) }}</td>
+                <td><span class="ch" :class="channelClass(r.channel)"><span class="k"></span>{{ channelName(r.channel) }}</span></td>
+                <td class="mono">{{ r.channel }}/{{ r.model }}</td>
+                <td class="mono">{{ shortUid(r.account) }}</td>
+                <td><span class="pill" :class="logPill(r)"><span class="i">{{ logIcon(r) }}</span><span class="swatch"></span>{{ logText(r) }}</span></td>
+                <td class="num">{{ r.ttft_ms ? (r.ttft_ms/1000).toFixed(1)+'s' : '—' }}</td>
+                <td class="num">{{ (r.duration_ms/1000).toFixed(1) }}s</td>
+                <td><span v-if="r.err_kind" class="mono">{{ r.err_kind }}</span><span v-if="r.err_kind && r.note"> · </span>{{ r.note || (r.err_kind?'':'—') }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="chart-empty" v-else>没有符合条件的请求。</div>
+          <div class="hint" style="margin-top:10px">
+            失败行永远带 <span class="mono">kind</span> 与上游原话摘要 —— 这是「零静默失败」红线的落地：任何失败都能在这一页看到原因。
+          </div>
+        </div>
+      </template>
+
+      <!-- ================= 设置 ================= -->
+      <template v-if="view==='settings'">
+        <div class="grid g2">
+          <div class="card">
+            <h2>服务</h2>
+            <div class="sub">客户端连接的地址</div>
+            <div class="field"><label for="eff">当前实际监听</label>
+              <input id="eff" class="mono" :value="listenEffective || '（未透出）'" readonly>
+              <span class="hint" v-if="listenPinned">
+                本次启动由启动参数指定（安装包启动脚本就是这种情形），下面的监听地址/端口不生效 ——
+                要改端口请改应用/启动参数后重启。
+              </span>
+              <span class="hint" v-else>
+                没有启动参数覆盖，下面两项改动<b>重启后生效</b>。
+              </span></div>
+            <div class="field"><label for="host">监听地址（设置值）</label><input id="host" v-model="form.listen_host"></div>
+            <div class="field"><label for="port">端口（设置值）</label><input id="port" type="number" v-model.number="form.listen_port">
+              <span class="hint">与 wild-work（5013）错开，便于并存迁移</span></div>
+            <div class="field"><label for="base">对外基址（客户端填写用）</label>
+              <div class="copy-row">
+                <input id="base" v-model="form.base_url" :placeholder="detectedBase">
+                <button class="btn sm" @click="copyClientBase">复制</button>
+                <button class="btn sm" v-if="!form.base_url && detectedBase" @click="useDetectedBase">用探测值</button>
+              </div>
+              <span class="hint">
+                客户端里填 <span class="mono">{{ clientBase }}</span> —— 按你当前访问的地址与监听端口推断；
+                面板挂在应用网关下时，客户端仍应直连这个地址。
+              </span></div>
+          </div>
+
+          <div class="card">
+            <h2>鉴权</h2>
+            <div class="sub">数据接口与管理接口分权</div>
+            <div class="field"><label for="k1">网关 API Key</label>
+              <div class="copy-row">
+                <input id="k1" class="mono" :value="keyShown" readonly>
+                <button class="btn sm" @click="copyKey">{{ keyPlain ? '复制明文' : '复制' }}</button>
+              </div>
+              <div class="btn-row">
+                <button class="btn sm" v-if="!keyPlain" @click="revealKey">显示明文</button>
+                <button class="btn sm" v-else @click="hideKey">隐藏</button>
+                <button class="btn sm danger" @click="rotateKey" :disabled="busy">重新生成</button>
+              </div>
+              <span class="hint">
+                默认只显示掩码；明文要显式点「显示明文」才回显。Key 存放在服务器上的
+                <span class="mono">{{ keyPath || 'config.json' }}</span>（0600），面板与日志都不自动记录它。
+                「重新生成」会让旧 Key 立刻失效，客户端要同步更换。
+              </span></div>
+          </div>
+
+          <div class="card">
+            <h2>管理员密码</h2>
+            <div class="sub">控制台登录用；与渠道授权是两回事</div>
+            <div class="field"><label for="pw-cur">当前密码</label>
+              <input id="pw-cur" type="password" v-model="pwForm.current" autocomplete="current-password"></div>
+            <div class="field"><label for="pw-new">新密码</label>
+              <input id="pw-new" type="password" v-model="pwForm.next" autocomplete="new-password">
+              <span class="hint">{{ pwStrengthOf(pwForm.next) }}</span></div>
+            <div class="field"><label for="pw-new2">确认新密码</label>
+              <input id="pw-new2" type="password" v-model="pwForm.confirm" autocomplete="new-password"
+                @keyup.enter="changePassword"></div>
+            <div class="btn-row">
+              <button class="btn primary" @click="changePassword" :disabled="busy">修改密码</button>
+            </div>
+            <div class="hint">
+              改完会注销<b>其它设备</b>上的登录（当前这个浏览器不用重登）；强度只提示不拦截。
+              忘记密码是唯一需要命令行的操作：<span class="mono">poolgate admin reset-password</span> ——
+              面板不提供「忘记密码也能改」，那样等于把唯一的门钥匙挂在门上。
+            </div>
+          </div>
+
+          <div class="card">
+            <h2>路由与冷却</h2>
+            <div class="sub">错误分档处置 —— 上游故障不牵连账号</div>
+            <div class="field"><label for="sticky">粘性路由：同一会话连续请求数</label>
+              <input id="sticky" type="number" v-model.number="form.sticky_requests">
+              <span class="hint">越大越像同一台设备，风控概率越低；过大则单个号压力集中</span></div>
+            <div class="field"><label for="rot">最大换号次数</label>
+              <input id="rot" type="number" v-model.number="form.max_retry"></div>
+            <table style="margin-top:6px">
+              <thead><tr><th>错误类型</th><th>处置</th><th class="num">冷却</th></tr></thead>
+              <tbody>
+                <tr v-for="p in policyRows" :key="p.kind">
+                  <td v-html="p.label"></td><td v-html="p.disposition"></td><td class="num">{{ p.cooldown }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="card">
+            <h2>健康探测</h2>
+            <div class="sub">判据固定，不可配置为「只看状态码」</div>
+            <div class="field"><label for="iv">定时体检间隔</label>
+              <select id="iv" v-model.number="form.probe_interval_hours">
+                <option :value="3">3 小时</option><option :value="6">6 小时</option><option :value="12">12 小时</option>
+              </select></div>
+            <div class="field"><label for="sm">每渠道抽样模型数</label>
+              <input id="sm" type="number" v-model.number="form.probe_samples"></div>
+            <div class="field"><label for="to">单模型超时（秒）</label>
+              <input id="to" type="number" v-model.number="form.probe_timeout_sec"></div>
+
+            <div class="field">
+              <label class="switch" for="ohm">
+                <input id="ohm" type="checkbox" v-model="form.only_healthy_models">
+                <span>只下发可用模型</span>
+              </label>
+              <span class="hint">
+                开启后 <span class="mono">/v1/models</span> 不再返回<b>体检明确失败</b>的模型，客户端选模型时不会看到已经挂死的那些。
+                <span v-if="failedModelCount">当前有 <b>{{ failedModelCount }}</b> 个模型会被隐藏。</span>
+                <span v-else>当前没有探测失败的模型。</span>
+                <br>未体检的模型<b>照常返回</b>：「不知道」不等于「不可用」，把它们一起藏掉会让刚装完、还没跑过体检的机器下发一个空列表。
+                这个开关只影响下发列表，直连调用仍会尝试（失败照常带原因回传）。
+              </span>
+            </div>
+
+            <div class="banner" style="margin:0">
+              <span class="ico">✓</span>
+              <div><b>判据（只读）</b>
+                <p>收到首个 <span class="mono">content</span> / <span class="mono">reasoning</span> 增量或 <span class="mono">[DONE]</span> 才算通过；
+                  空流、错误信封、超时一律判失败并记录上游原话。</p></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2>签到与保活</h2>
+            <div class="sub">按渠道能力自动启停</div>
+            <div class="field"><label for="ci">签到时间</label>
+              <input id="ci" :value="form.checkin_times.join(', ')"
+                @input="form.checkin_times = $event.target.value.split(',').map(s=>s.trim()).filter(Boolean)"></div>
+            <div class="field"><label for="ka">保活间隔（小时）</label>
+              <input id="ka" type="number" v-model.number="form.keepalive_hours">
+              <span class="hint">无签到活动的渠道（如千问办公）自动跳过，并在账号页标注「无活动」</span></div>
+            <table>
+              <thead><tr><th>渠道</th><th>签到能力</th><th>上次结果</th></tr></thead>
+              <tbody>
+                <tr v-for="c in overview.channels" :key="'ck'+c.kind">
+                  <td><span class="ch" :class="channelClass(c.kind,c.status)"><span class="k"></span>{{ c.display_name }}</span></td>
+                  <td :class="{muted:!c.checkin_cap}">{{ c.checkin_cap ? (c.kind==='qodercn'?'每日 +100 Credits':'支持') : '无活动' }}</td>
+                  <td>
+                    <span v-if="!c.checkin_cap" class="muted">—</span>
+                    <span v-else-if="channelCheckin(c.kind)" class="pill" :class="checkinPill(channelCheckin(c.kind))">
+                      <span class="i">{{ channelCheckin(c.kind).ok?'✓':'!' }}</span><span class="swatch"></span>{{ checkinText(channelCheckin(c.kind)) }}</span>
+                    <span v-else class="muted">未签到</span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="card">
+            <h2>渠道开关</h2>
+            <div class="sub">摘除/恢复渠道是分钟级操作，不需要改代码</div>
+            <table>
+              <thead><tr><th>渠道</th><th>状态</th><th class="num">下发模型</th><th>操作</th></tr></thead>
+              <tbody>
+                <tr v-for="c in channels" :key="'sw'+c.kind">
+                  <td><span class="ch" :class="channelClass(c.kind,c.status)"><span class="k"></span>{{ c.display_name }}</span></td>
+                  <td><span class="pill" :class="statusPill(c)"><span class="i">{{ statusIcon(c) }}</span><span class="swatch"></span>{{ statusText(c) }}</span></td>
+                  <td class="num">{{ c.downstream ? modelCountOf(c.kind) : 0 }}</td>
+                  <td>
+                    <button class="btn sm" v-if="c.implemented" @click="toggleChannel(c)" :disabled="busy">
+                      {{ c.downstream ? '暂停' : '启用' }}</button>
+                    <span v-else class="muted">未实现</span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="card">
+            <h2>数据与备份</h2>
+            <div class="sub">升级不丢数据；导出默认剔除凭证</div>
+            <dl class="kv">
+              <dt>配置目录</dt><dd class="mono">{{ paths.config_dir || '—' }}</dd>
+              <dt>凭证目录</dt><dd class="mono">{{ paths.creds_dir || '—' }} · 0600</dd>
+              <dt>流水保留</dt><dd>{{ form.log_retention_days }} 天 · 上限 {{ form.log_retention_max_mb }} MB</dd>
+              <dt>上次备份</dt><dd>{{ form.last_backup_at ? fmtTime(form.last_backup_at) : '从未' }}</dd>
+            </dl>
+            <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+              <button class="btn" @click="backup">导出配置（不含凭证）</button>
+              <button class="btn" @click="migrate">从 wild-work 导入账号</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2>危险操作</h2>
+            <div class="sub">均需二次确认</div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn danger" @click="ask('清空请求流水','会删除全部请求流水（统计随之归零），账号与配置不受影响。',clearLogs)">清空请求流水</button>
+              <button class="btn danger" @click="ask('重置全部配置','会把设置恢复为出厂值（含渠道开关与冷却策略）。账号与凭证不受影响。',resetSettings)">重置全部配置</button>
+              <button class="btn danger" @click="ask('移除全部账号','会删除所有渠道的账号凭证文件，需要重新授权才能恢复。此操作不可撤销。',removeAllAccounts)">移除全部账号</button>
+            </div>
+            <div class="hint" style="margin-top:10px">确认弹窗会写明后果与影响范围，不做「只有一个确定按钮」的表单。</div>
+          </div>
+        </div>
+      </template>
+    </main>
+  </div>
+
+  <div class="modal-bg" v-if="confirmBox" @click.self="confirmBox=null">
+    <div class="modal">
+      <h3>{{ confirmBox.title }}</h3>
+      <p>{{ confirmBox.body }}</p>
+      <div class="row">
+        <button class="btn" @click="confirmBox=null">取消</button>
+        <button class="btn danger" @click="confirmBox.action();confirmBox=null">确认执行</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" v-if="toastMsg">{{ toastMsg }}</div>
+</div>
+
+<script src="./poolgate.js"></script>
+<script>
+const {createApp,ref,reactive,computed,onMounted,watch,nextTick} = Vue;
+createApp({
+  setup(){
+    // ---------- 基础状态 ----------
+    const initialized=ref(false), authed=ref(false), version=ref('');
+    const pw=ref(''), pw2=ref(''), err=ref(''), showPw=ref(false), remember=ref(true);
+    // lastErr：最近一次请求的落点（状态码/kind/方法/路径），由 api() 填。
+    // errDetail：登录/设置失败时给用户看的**真实**细节（原型里那行曾经是写死的假字符串，
+    // 无论真实原因是什么都显示 kind=AuthFailed —— 那是在骗人）。
+    const lastErr=ref(null), errDetail=ref('');
+    const listenHint=ref('0.0.0.0:5014');
+    const authView=ref('signin');
+    // authFlowOpen：加号/重新登录的覆盖层。与「未登录」无关 —— 登录后在账号页
+    // 点「添加账号」也要能进来（之前这几块被关在 v-if="!authed" 里，点了没反应）。
+    const authFlowOpen=ref(false);
+    const view=ref('overview');
+    const busy=ref(false), probing=ref(false), modelsLoading=ref(false);
+    const toastMsg=ref(''), confirmBox=ref(null);
+    let toastTimer=null;
+
+    const overview=ref({channels:[],error_stats:{},today:{},daily:[],channel_ttft:{},pending:[]});
+    const accounts=ref([]), channels=ref([]), modelRows=ref([]);
+    const history=ref([]), lastRun=ref(null), lastResults=ref([]);
+    const allLogs=ref([]);
+    const paths=ref({}), form=reactive({
+      listen_host:'0.0.0.0',listen_port:5014,base_url:'',sticky_requests:50,max_retry:3,
+      probe_interval_hours:6,probe_samples:3,probe_timeout_sec:60,only_healthy_models:false,
+      checkin_times:['09:00','21:00'],
+      keepalive_hours:22,checkin_enabled:true,keepalive_enabled:true,
+      log_retention_days:30,log_retention_max_mb:200,last_backup_at:''
+    });
+    // 网关 API Key：默认只从服务端拿掩码；明文必须用户点「显示明文」才请求（keyPlain）。
+    // 明文一旦拿到就只留在内存里，刷新页面即消失 —— 不落 localStorage。
+    const keyMasked=ref(''), keyPlain=ref(''), keyPath=ref('');
+    // 对外基址的探测值：服务端按「管理员当前是怎么访问过来的 + 监听端口」推断。
+    // 客户端要填的地址不该让用户自己拼字符串（拼错一位就是连不上但不报错）。
+    const detectedBase=ref('');
+    // listenEffective 是进程真实绑定的地址（服务端透出），与设置里的值可能不同。
+    const listenEffective=ref('');
+    const modelQ=ref(''), modelChannel=ref('all'), modelState=ref('all');
+    const logFilter=reactive({channel:'all',status:'all',range:'today'});
+    const diag=reactive({channel:'',result:null});
+    const auth=ref({channel:'',channelName:'',url:'',expires:'',status:'idle',message:'',kind:'',upstream:'',
+      account:null,modelCount:0,balance:null,balanceError:'',callbackBase:''});
+    let authTimer=null, authLeft=0;
+
+    const navItems=[
+      {k:'overview',label:'总览'},{k:'accounts',label:'账号'},{k:'models',label:'模型与费率'},
+      {k:'benchmark',label:'测速与体检'},{k:'logs',label:'日志'},{k:'settings',label:'设置'}
+    ];
+    const titles={overview:'总览',accounts:'账号',models:'模型与费率',
+      benchmark:'测速与体检',logs:'日志与诊断',settings:'设置'};
+
+    // ---------- 接口封装 ----------
+    // 页面可能被挂在反向代理前缀下（飞牛应用网关是 /app/poolgate）。网关会剥掉前缀
+    // 再转发给本进程，所以浏览器侧必须把前缀加回来，否则请求会落到网关根路径上（404）。
+    // 从自身脚本的 URL 反推所在目录，不写死前缀。
+    const base=(()=>{
+      const s=document.querySelector('script[src$="poolgate.js"]');
+      if(!s)return '';
+      const p=new URL(s.src,location.href).pathname.replace(/\/[^/]*$/,'');
+      return p==='/'?'':p;
+    })();
+    // 登录/首次设置这两个接口自己会用 401 表示「密码不对」——那是业务失败，
+    // 不是「会话过期」。把它们和「我在别处被登出了」分开，否则：
+    //   ① 密码错时面板显示的是「未登录」（丢掉服务端的「密码错误，还可尝试 4 次」）；
+    //   ② 更糟的是用户体验成「登录坏了」——用户实测就是这么反馈的。
+    const isAuthEntry=(path,opt)=>path==='/api/setup'||(path==='/api/session'&&opt&&opt.method==='POST');
+
+    const detailOf=e=>e?`${e.method} ${e.path} → ${e.status}`+(e.kind?` · kind=${e.kind}`:''):'';
+    const api=async(path,opt)=>{
+      const r=await fetch(base+path,opt||{});
+      const txt=await r.text();
+      let data={};
+      try{data=txt?JSON.parse(txt):{};}catch(e){data={};}
+      if(!r.ok&&!data.error)data={error:{message:'HTTP '+r.status,kind:''}};
+      // 响应状态与 kind 一起记下来，供登录/设置页显示**真实**的失败细节
+      // （原型里那行 "POST /api/session → 401 …" 以前是写死的假字符串）。
+      lastErr.value={status:r.status,kind:(data.error&&data.error.kind)||'',path,method:(opt&&opt.method)||'GET'};
+      if(r.status===401&&!isAuthEntry(path,opt)){
+        // 真的被登出了：清掉前端登录态并抛出，由调用方 toast 出来。
+        authed.value=false;
+        throw new Error((data.error&&data.error.message)||'登录状态已失效，请重新登录');
+      }
+      return data;
+    };
+    const post=async(path,body)=>{
+      const r=await api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+      if(r.error)throw new Error(r.error.message||'请求失败');
+      return r;
+    };
+    const toast=m=>{toastMsg.value=m;clearTimeout(toastTimer);toastTimer=setTimeout(()=>toastMsg.value='',2600);};
+    const fail=e=>toast('✗ '+(e.message||e));
+
+    // ---------- 密码强度（只提示，不拦截） ----------
+    // strengthOf 是密码强度的唯一实现：首次设置（带进度条）与设置页改密码（只要一行字）共用，
+    // 免得两处判据慢慢长歪（改密页说「强」、首次设置说「中」这种事很伤信任）。
+    const strengthOf=p=>{
+      let u=false,l=false,d=false,s=false;
+      for(const c of p){
+        if(c>='A'&&c<='Z')u=true; else if(c>='a'&&c<='z')l=true;
+        else if(c>='0'&&c<='9')d=true; else s=true;
+      }
+      if(!p)return{level:0,word:'',note:''};
+      if(p.length<8)return{level:1,word:'弱',note:'建议至少 8 位（不影响保存）'};
+      if(p.length<12)return{level:2,word:'中',note:'建议 12 位以上，并混合大小写与符号'};
+      if(u&&l&&(d||s))return{level:4,word:'强',note:'已满足 ≥12 位且含大小写与符号'};
+      if(u||l)return{level:3,word:'中',note:'建议再混入符号或数字'};
+      return{level:2,word:'弱',note:'建议混合大小写与符号'};
+    };
+    const pwStrength=computed(()=>strengthOf(pw.value));
+    // 改密码卡片只要一行文字（进度条是首次设置的仪式感，改密不需要）。
+    const pwStrengthOf=p=>{
+      const s=strengthOf(p);
+      return s.word?`强度：${s.word} · ${s.note}`:'';
+    };
+
+    // ---------- 派生数据 ----------
+    const title=computed(()=>titles[view.value]||'');
+    const subtitle=computed(()=>{
+      if(view.value==='overview'){
+        const t=today.value;
+        return `数据每 5 秒刷新 · 今日 ${fmtNum(t.requests)} 次请求`;
+      }
+      if(view.value==='accounts')return `按渠道分组 · ${totalHealthy.value} 个可用 · ${pausedAccountCount.value} 个暂停`;
+      if(view.value==='models'){
+        // 分开说「人工剔除」与「健康隐藏」：两者来源不同、恢复方法也不同
+        // （前者点开关，后者跑体检或关掉设置里的开关）。混成一句「因健康度剔除」
+        // 会把人工操作说成探测结论 —— 面板不能这么说话。
+        const tot=modelRows.value.length;
+        const manual=modelRows.value.filter(m=>m.excluded).length;
+        const hidden=modelRows.value.filter(m=>m.hidden_by_health&&!m.excluded).length;
+        const send=tot-manual-hidden;
+        let s=`${tot} 个模型 · ${send} 个会下发`;
+        if(manual)s+=` · ${manual} 个人工剔除`;
+        if(hidden)s+=` · ${hidden} 个按健康度隐藏`;
+        return s;
+      }
+      if(view.value==='benchmark'){
+        if(!lastRun.value)return '还没跑过体检';
+        return `上次体检 ${fmtTime(lastRun.value.started_at)} · ${lastRun.value.passed}/${lastRun.value.total} 通过`;
+      }
+      if(view.value==='logs')return `最近 ${allLogs.value.length} 条请求 · 保留 30 天 · 已脱敏（不含任何凭证）`;
+      // 别说「改动即时生效」：监听地址/端口这类要重启才生效，笼统的承诺
+      // 会让用户以为改完就行（原型 06-settings.html 的副标题也是这句）。
+      return '保存即写入配置 · 监听地址需重启生效 · 其余即时生效';
+    });
+    // failedModelCount：开了「只下发可用模型」后会被隐藏的模型数。
+    // 用「探测失败且没被人工剔除」算 —— 人工剔除的本来就不下发，不算这个开关的功劳。
+    const failedModelCount=computed(()=>modelRows.value.filter(m=>m.healthy==='error'&&!m.excluded).length);
+    // hiddenByHealthCount：此刻真的正在被健康度隐藏的模型数（开关关着就是 0）。
+    const hiddenByHealthCount=computed(()=>modelRows.value.filter(m=>m.hidden_by_health).length);
+
+    // clientBase 是「客户端该填的地址」：用户填了用用户填的，没填就用探测值。
+    const clientBase=computed(()=>form.base_url||detectedBase.value||'');
+    // keyShown：默认掩码，点过「显示明文」后显示明文。
+    const keyShown=computed(()=>keyPlain.value||keyMasked.value||'pg-••••••••••••••••');
+    // listenPinned：监听地址由启动参数显式给定（安装包就是这种情形）→
+    // 设置里那两项不生效。由服务端透出，不靠前端猜（猜错就是「静默失败」）。
+    const listenPinned=ref(false);
+
+    // activeChannels 是「状态为启用」的渠道（配置层面）。
+    const activeChannels=computed(()=>(overview.value.channels||[]).filter(c=>c.downstream));
+    // usableChannels 是「真的有号可用」的渠道（运行层面）。
+    //
+    // 「可用渠道」必须按后者算：只按状态算的话，全新安装 0 个账号也会显示
+    // 「6 / 6 保留」，用户以为六个渠道都能用 —— 这正是面板不许撒的谎。
+    const usableChannels=computed(()=>activeChannels.value.filter(c=>c.healthy_accounts>0));
+    const noAccountChannels=computed(()=>activeChannels.value.filter(c=>c.total_accounts===0));
+    const totalHealthy=computed(()=>activeChannels.value.reduce((s,c)=>s+c.healthy_accounts,0));
+    const pausedAccountCount=computed(()=>(overview.value.channels||[]).filter(c=>!c.downstream).reduce((s,c)=>s+c.total_accounts,0));
+    const today=computed(()=>Object.assign({requests:0,failed:0,ttft_ms:0,p95_ms:0,yesterday:0,
+      upstream_failed:0,account_failed:0,rotations:0,rotated_ok:0},overview.value.today||{}));
+    const daily=computed(()=>overview.value.daily||[]);
+    const pending=computed(()=>overview.value.pending||[]);
+    const pendingCrit=computed(()=>pending.value.filter(p=>p.severity==='crit'));
+    const failRate=computed(()=>{
+      const t=today.value;
+      if(!t.requests)return '0.00%';
+      return (t.failed/t.requests*100).toFixed(2)+'%';
+    });
+    const upstreamShare=computed(()=>{
+      const t=today.value, tot=t.upstream_failed+t.account_failed;
+      if(!tot)return '0';
+      return Math.round(t.upstream_failed/tot*100);
+    });
+    const allProbedOK=computed(()=>{
+      const withProbe=activeChannels.value.filter(c=>c.total_models);
+      if(!withProbe.length)return false;
+      return withProbe.every(c=>c.healthy_models>=c.total_models);
+    });
+    const dailyHeight=computed(()=>d=>{
+      const max=Math.max(1,...daily.value.map(x=>x.requests));
+      return Math.max(3,Math.round(d.requests/max*100));
+    });
+    const ttftBars=computed(()=>{
+      const st=overview.value.channel_ttft||{};
+      const rows=Object.entries(st).map(([channel,v])=>({
+        channel,label:channelName(channel),
+        value:(v.median_ttft_ms/1000).toFixed(1)+'s',n:v.samples,ms:v.median_ttft_ms
+      })).sort((a,b)=>a.ms-b.ms);
+      const max=Math.max(1,...rows.map(r=>r.ms));
+      for(const r of rows){
+        r.pct=Math.max(4,Math.round(r.ms/max*100));
+        r.color=r.ms<=1500?'var(--r3)':(r.ms<=3000?'var(--r5)':'var(--r7)');
+      }
+      return rows;
+    });
+    const activeGroups=computed(()=>{
+      return activeChannels.value.map(c=>{
+        const list=accounts.value.filter(a=>a.kind===c.kind);
+        const bad=(c.total_models||0)-(c.healthy_models||0);
+        return {
+          kind:c.kind,name:c.display_name,status:c.status,accounts:list,
+          degraded:bad>0?bad:0,
+          note:c.checkin_cap
+            ? `签到可领每日额度 · 签到时间 ${(form.checkin_times||[]).join(' / ')}`
+            : '无签到活动'
+        };
+      });
+    });
+    const pausedGroups=computed(()=>{
+      return (overview.value.channels||[]).filter(c=>!c.downstream).map(c=>({
+        kind:c.kind,name:c.display_name,status:c.status,reason:c.reason,
+        accounts:accounts.value.filter(a=>a.kind===c.kind),
+        credits:accounts.value.filter(a=>a.kind===c.kind).reduce((s,a)=>s+(a.credits_known?a.credits:0),0)||0,
+        recover:c.reason_kind==='upstream'?'等上游逆向社区跟进':'充值后手动恢复'
+      }));
+    });
+    const catalogChannels=computed(()=>{
+      const seen={};
+      for(const m of modelRows.value)seen[m.channel]=m.channel_name||m.channel;
+      return Object.keys(seen).sort().map(k=>({kind:k,name:seen[k]}));
+    });
+    const filteredModels=computed(()=>modelRows.value.filter(m=>{
+      if(modelChannel.value!=='all'&&m.channel!==modelChannel.value)return false;
+      if(modelQ.value&&!m.id.toLowerCase().includes(modelQ.value.toLowerCase()))return false;
+      if(modelState.value==='ok'&&m.healthy!=='ok')return false;
+      if(modelState.value==='error'&&m.healthy!=='error')return false;
+      if(modelState.value==='excluded'&&!m.excluded)return false;
+      return true;
+    }));
+    const modelGroups=computed(()=>{
+      const byKind={};
+      for(const m of filteredModels.value){
+        (byKind[m.channel]=byKind[m.channel]||{kind:m.channel,name:m.channel_name||m.channel,models:[]}).models.push(m);
+      }
+      return Object.values(byKind).map(g=>{
+        // 与副标题同一套算法：人工剔除与健康隐藏分开说，「会下发」才是真的会下发。
+        const tot=modelRows.value.filter(m=>m.channel===g.kind).length;
+        const manual=modelRows.value.filter(m=>m.channel===g.kind&&m.excluded).length;
+        const hidden=modelRows.value.filter(m=>m.channel===g.kind&&m.hidden_by_health&&!m.excluded).length;
+        g.hint=`${tot} 个模型 · ${tot-manual-hidden} 个会下发`+
+          (manual?` · ${manual} 个人工剔除`:'')+(hidden?` · ${hidden} 个按健康度隐藏`:'');
+        return g;
+      });
+    });
+    const errorKinds=computed(()=>{
+      const stats=overview.value.error_stats||{};
+      const max=Math.max(1,...Object.values(stats));
+      const labels={UpstreamFault:'上游故障 UpstreamFault',Transport:'传输失败 Transport',
+        ContentBlocked:'内容拦截 ContentBlocked',SoftRate:'限流 SoftRate',
+        HardCredit:'额度不足 HardCredit',SessionDead:'会话失效 SessionDead',
+        ModelUnavailable:'模型不可用 ModelUnavailable',Parse:'解析失败 Parse'};
+      return Object.entries(stats).map(([name,count])=>({
+        name,label:labels[name]||name,count,pct:Math.round(count/max*100),
+        channels:channelListForError(name)
+      })).sort((a,b)=>b.count-a.count);
+    });
+    const filteredLogs=computed(()=>{
+      let list=allLogs.value;
+      if(logFilter.channel!=='all')list=list.filter(r=>r.channel===logFilter.channel);
+      if(logFilter.status==='error')list=list.filter(r=>r.status==='error');
+      if(logFilter.status==='rotated')list=list.filter(r=>(r.note||'').includes('换号'));
+      return list.slice().reverse().slice(0,500);
+    });
+    const historyDesc=computed(()=>history.value.slice().reverse());
+    const failedResults=computed(()=>lastResults.value.filter(r=>!r.ok));
+    const authLabel=computed(()=>({idle:'待发起',waiting:'等待浏览器完成授权…',ok:'授权成功，账号已入池',
+      error:'授权失败',timeout:'授权超时'}[auth.value.status]||auth.value.status));
+    const authCountdown=computed(()=>{
+      const s=Math.max(0,authLeft);
+      return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');
+    });
+    const authMethod=computed(()=>{
+      const m={
+        qodercn:'设备码（扫码或浏览器授权）',qodercom:'设备码（扫码或浏览器授权）',
+        workbuddy:'state 轮询（扫码或浏览器授权）',workbuddyai:'state 轮询（扫码或浏览器授权）',
+        traework:'授权码回调',qwenwork:'授权码 + 本机回调（PKCE）'
+      }[auth.value.channel]||'浏览器授权';
+      // 回调形态不同，叫法必须跟着变：回调到面板地址时还说「本机回调」是在误导用户
+      // （他会以为只能在本机浏览器完成）。
+      if(auth.value.channel==='traework'){
+        return callbackViaPanel.value ? m+'（回调到面板地址）' : m+'（本机回调）';
+      }
+      return m;
+    });
+    // 本机回调类流程（TraeWork / 千问办公）把授权码送回 127.0.0.1:<随机端口>：
+    // 只有浏览器与 PoolGate 在同一台机器上时才收得到。人在 PC 上、面板在 NAS 上时，
+    // 授权页跳回 127.0.0.1 落到的**是那台 PC**，面板永远等不到授权码 ——
+    // 表现就是「点了授权，浏览器报无法访问，面板一直转圈最后超时」。
+    // 这是最容易让人以为「点了没反应」的一处，必须提前说清楚，别让人白等五分钟。
+    // 回调形态分三类：
+    //   · 回调锁死在本机（千问办公：redirect_uri 必须命中上游预注册清单）→ 扫码没用，只能本机浏览器或手工回填
+    //   · 回调用面板自己的地址（TraeWork：auth_callback_url 由我们传）→ 手机/别的电脑都能完成
+    //   · 上游轮询（设备码流 / state 流）→ 另一台设备完成即可，扫码是最省事的
+    const callbackLockedLocal=computed(()=>auth.value.channel==='qwenwork');
+    const callbackViaPanel=computed(()=>auth.value.channel==='traework'&&!!auth.value.callbackBase);
+    const browserHost=location.hostname||'';
+    const browserIsLocal=['127.0.0.1','localhost','::1','[::1]'].includes(browserHost);
+
+    // 真二维码：内容是这次授权的地址。手机扫码 → 在手机上登录 → 面板轮询到结果。
+    // 库缺失或地址过长时返回空串，界面落到占位图 + 「打开授权页」按钮（不假装有码）。
+    const qrUsable=computed(()=>!!auth.value.url&&!callbackLockedLocal.value);
+    const authQr=computed(()=>{
+      if(!qrUsable.value)return '';
+      try{
+        const qr=qrcode(0,'M'); // 0 = 按内容自动选版本
+        qr.addData(auth.value.url);
+        qr.make();
+        return qr.createSvgTag({cellSize:1,margin:2,scalable:true});
+      }catch(e){return '';}
+    });
+    const qrTip=computed(()=>callbackLockedLocal.value
+      ? '该渠道的回调地址被上游锁死在本机，扫码无效 —— 请用下面的「打开授权页」或「手工回填」'
+      : '手机扫码完成授权（桌面不用跳转）');
+    const qrScanHint=computed(()=>callbackLockedLocal.value?'等待浏览器完成授权':'等待扫码完成授权');
+
+    // 手工回填回调地址（浏览器跳回本机打不开时的兜底）
+    const cbRaw=ref('');
+    const submitCallback=async()=>{
+      if(busy.value)return;
+      if(!cbRaw.value.trim())return toast('先粘贴回调地址或授权码');
+      busy.value=true;
+      try{
+        await post('/api/login/callback',{raw:cbRaw.value.trim()});
+        cbRaw.value='';
+        toast('已提交，面板会在下一次轮询时兑换');
+      }catch(e){fail(e);}
+      finally{busy.value=false;}
+    };
+    const policyRows=[
+      {kind:'hard',label:'余额/权益不足',disposition:'冷却该号',cooldown:'12h'},
+      {kind:'rate',label:'限流 429',disposition:'冷却该号',cooldown:'60s'},
+      {kind:'sess',label:'会话失效',disposition:'禁用 + 提示重登',cooldown:'—'},
+      {kind:'block',label:'内容拦截 / 超长',disposition:'不冷却，透传原文',cooldown:'—'},
+      {kind:'up',label:'<b>上游故障</b>',disposition:'<b>渠道级告警，不计账号错误</b>',cooldown:'5m'}
+    ];
+
+    // ---------- 展示工具 ----------
+    const channelName=k=>{
+      const c=(overview.value.channels||[]).find(x=>x.kind===k);
+      return c?c.display_name:k;
+    };
+    // channelClass 给出渠道身份色槽（固定顺序，不循环）。
+    //
+    // 六个渠道必须有槽：之前只映射了首发三家，后接入的三家返回空串，
+    // 于是它们的身份点渲染成一个没有背景色的空方块（看起来像「有的有有的没有」）。
+    // 暂停渠道给灰点（k-off，与原型一致），不是「不给类」—— 不给类同样是空方块。
+    const channelClass=(k,status)=>{
+      if(status&&status!=='active')return 'k-off';
+      return {qodercn:'k1',workbuddy:'k2',traework:'k3',
+        qwenwork:'k4',qodercom:'k5',workbuddyai:'k6'}[k]||'k-off';
+    };
+    const statusPill=c=>{
+      if(c.status==='active')return 'good';
+      if(c.status==='maintenance')return 'warn';
+      return 'pause';
+    };
+    const statusIcon=c=>{
+      if(c.status==='active')return '✓';
+      if(c.status==='maintenance')return '!';
+      return '–';
+    };
+    const statusText=c=>{
+      if(c.status==='active')return '可用';
+      if(c.status==='maintenance')return '维护中';
+      return '暂停';
+    };
+    const sevLabel=s=>({crit:'故障',warn:'降级',pause:'额度'}[s]||s);
+    // reasonText 把错误分类翻成人话 + 下一步动作。
+    //
+    // 账号行直接把 pool 里的 reason（如 "SessionDead"）贴出来过 —— 用户看到的是
+    // 一个英文枚举，不知道该干什么。禁用原因必须自带「接下来做什么」。
+    const reasonText=r=>{
+      const map={
+        SessionDead:'会话失效 —— 该账号的上游凭证已过期或被拒，点「重新登录」重新授权',
+        AuthFailed:'认证失败 —— 该账号的上游凭证不被接受，点「重新登录」重新授权',
+        HardCredit:'额度/权益不足 —— 充值或换号后点「启用」',
+        SoftRate:'被上游限流 —— 冷却结束后自动恢复',
+        ModelUnavailable:'该账号无权使用某些模型 —— 已按模型剔除',
+        Transport:'连不上上游 —— 网络或代理问题',
+        UpstreamFault:'上游故障 —— 不是账号的问题，换号或等上游恢复',
+        '手动停用':'你手动停用了这个账号'
+      };
+      return map[r]||r;
+    };
+    const accountPill=a=>a.disabled?'crit':(a.cooling?'serious':'good');
+    const accountIcon=a=>a.disabled?'×':(a.cooling?'≈':'✓');
+    const accountText=a=>a.disabled?'禁用':(a.cooling?'冷却中':'正常');
+    const checkinPill=c=>c.no_activity?'plain':(c.ok?'good':'warn');
+    const checkinText=c=>{
+      if(c.no_activity)return '无活动';
+      if(c.ok)return (c.reward?c.reward+' ':'')+fmtTime(c.at);
+      return c.message||'未完成';
+    };
+    const logPill=r=>r.status==='ok'?'good':((r.note||'').includes('换号')?'warn':'crit');
+    const logIcon=r=>r.status==='ok'?'✓':((r.note||'').includes('换号')?'!':'×');
+    const logText=r=>{
+      if(r.status==='ok')return '200';
+      if((r.note||'').includes('换号'))return '换号后成功';
+      return r.err_kind||'失败';
+    };
+    const srcLabel=s=>({upstream:'上游',local:'本地',unknown:'未知'}[s]||'未知');
+    const humanCtx=n=>n>=1000000?((n/1000000).toFixed(n%1000000?1:0)+'M'):(n>=1000?(Math.round(n/1000)+'K'):String(n));
+    const capsText=m=>{
+      const out=[];
+      if(m.tools!=='no')out.push('工具');
+      if(m.reasoning!=='no')out.push('推理');
+      if(m.images==='yes')out.push('图片');
+      return out.length?out.join(' · '):'—';
+    };
+    const shortUid=u=>!u?'—':(u.length<=12?u:u.slice(0,6)+'…'+u.slice(-4));
+    const fmtNum=n=>(n==null?0:n).toLocaleString('en-US');
+    const fmtTime=t=>{
+      if(!t)return '—';
+      const d=new Date(t);
+      if(isNaN(d.getTime()))return String(t);
+      const same=d.toDateString()===new Date().toDateString();
+      return same?d.toLocaleTimeString('zh-CN',{hour12:false})
+        :d.toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false});
+    };
+    const fmtDate=t=>{
+      if(!t)return '未知';
+      const d=new Date(t);
+      return isNaN(d.getTime())?'未知':d.toLocaleDateString('zh-CN');
+    };
+    const barPct=ms=>ms?Math.max(4,Math.min(100,Math.round(ms/6000*100))):100;
+    const barColor=ms=>ms<=800?'var(--r3)':(ms<=1500?'var(--r4)':(ms<=3000?'var(--r5)':'var(--r7)'));
+    const channelCheckin=kind=>{
+      for(const a of accounts.value)if(a.kind===kind&&a.checkin)return a.checkin;
+      return null;
+    };
+    const modelCountOf=kind=>modelRows.value.filter(m=>m.channel===kind&&m.downstream).length;
+    const channelCredits=kind=>{
+      const list=accounts.value.filter(a=>a.kind===kind);
+      if(!list.length)return '—';
+      const known=list.filter(a=>a.credits_known);
+      if(!known.length)return '未知';
+      return known.reduce((s,a)=>s+a.credits,0);
+    };
+    const channelListForError=name=>{
+      const chs=[...new Set(allLogs.value.filter(r=>r.err_kind===name).map(r=>channelName(r.channel)))];
+      return chs.length?chs.join('、'):'—';
+    };
+    const historyFailSummary=h=>{
+      const bad=(h.results||[]).filter(r=>!r.ok);
+      if(!bad.length)return '—';
+      return bad.slice(0,3).map(r=>`${r.channel}/${r.model} ${r.kind||'失败'}`).join('；')+(bad.length>3?` 等 ${bad.length} 条`:'');
+    };
+    const ask=(title,body,action)=>{confirmBox.value={title,body,action};};
+
+    // ---------- 加载 ----------
+    const loadOverview=async()=>{overview.value=await api('/api/overview');};
+    const loadAccounts=async()=>{accounts.value=(await api('/api/accounts')).accounts||[];};
+    const loadChannels=async()=>{channels.value=(await api('/api/channels')).channels||[];};
+    const loadModels=async()=>{
+      // 目录要真实向上游拉取（实测 5–6 秒），期间必须有加载态：
+      // 否则会先显示「0 个模型」，看起来像装坏了。
+      modelsLoading.value=true;
+      try{modelRows.value=(await api('/api/model/catalog')).models||[];}
+      finally{modelsLoading.value=false;}
+    };
+    const loadHistory=async()=>{
+      history.value=(await api('/api/probe/history')).runs||[];
+      const last=history.value[history.value.length-1]||null;
+      lastRun.value=last;
+      lastResults.value=last?(last.results||[]):[];
+    };
+    const loadLogs=async()=>{allLogs.value=(await api('/api/logs')).requests||[];};
+    const loadSettings=async()=>{
+      const r=await api('/api/settings');
+      if(r.settings){
+        silent=true;Object.assign(form,r.settings);await nextTick();silent=false;
+        savedOnlyHealthy=!!form.only_healthy_models; // 服务端值 = 已保存值
+      }
+      if(r.paths)paths.value=r.paths;
+      if(r.detected&&r.detected.base_url)detectedBase.value=r.detected.base_url;
+      if(r.listen_effective)listenEffective.value=r.listen_effective;
+      listenPinned.value=!!r.listen_pinned;
+    };
+    const loadKey=async()=>{
+      const r=await api('/api/apikey');
+      keyMasked.value=r.masked||'pg-••••••••••••••••';
+      if(r.path)keyPath.value=r.path;
+    };
+    const loadAll=async()=>{
+      try{
+        await Promise.all([loadOverview(),loadAccounts(),loadChannels(),loadModels(),loadHistory(),loadLogs(),loadSettings(),loadKey()]);
+        if(!diag.channel&&overview.value.channels.length)diag.channel=overview.value.channels[0].kind;
+      }catch(e){fail(e);}
+    };
+    const go=k=>{
+      // 离开设置页就收起 Key 明文：凭证不该跟着用户在整个面板里飘着。
+      // 不静默处理 —— 收起时给一句话，免得用户以为「刚才显示出来的怎么没了」。
+      if(k!=='settings'&&keyPlain.value){keyPlain.value='';toast('Key 明文已收起（离开设置页自动隐藏）');}
+      view.value=k;
+    };
+
+    // ---------- 操作 ----------
+    const act=async(fn,okMsg)=>{
+      if(busy.value)return;
+      busy.value=true;
+      try{await fn();await loadAll();if(okMsg)toast(okMsg);}
+      catch(e){fail(e);}
+      finally{busy.value=false;}
+    };
+    const checkinOne=a=>act(()=>post('/api/account/checkin',{kind:a.kind,uid:a.uid}),'签到已提交');
+    const refreshOne=a=>act(()=>post('/api/account/refresh',{kind:a.kind,uid:a.uid}),'余额已刷新');
+    const toggleAccount=a=>act(()=>post('/api/account/enable',{kind:a.kind,uid:a.uid,disabled:!a.disabled}),
+      a.disabled?'账号已启用':'账号已禁用');
+    const checkinAll=()=>act(()=>post('/api/account/checkin_all'),'全部签到已执行');
+    const refreshAll=()=>act(()=>post('/api/account/refresh_all'),'余额已全部刷新');
+    const askRemoveAccount=a=>ask('删除账号',
+      `会删除 ${channelName(a.kind)}/${a.nickname||a.uid} 的凭证文件并从池中移除，需要重新授权才能恢复。此操作不可撤销。`,
+      ()=>act(()=>post('/api/account/remove',{kind:a.kind,uid:a.uid}),'账号已删除'));
+    const toggleModel=m=>act(()=>post('/api/model/toggle',{id:m.id,downstream:!m.downstream}),
+      m.downstream?'已剔除下发':'已恢复下发');
+    const toggleChannel=c=>{
+      const next=c.downstream?'paused':'active', verb=c.downstream?'暂停':'启用';
+      ask(verb+'渠道 '+c.display_name,
+        c.downstream?'暂停后不再向客户端下发该渠道的模型（账号与凭证保留）。'
+          :'启用后该渠道的模型会重新出现在 /v1/models。',
+        ()=>act(()=>post('/api/channel/toggle',{kind:c.kind,status:next}),'渠道已'+verb));
+    };
+    const probe=async mode=>{
+      if(probing.value)return;
+      probing.value=true;
+      try{
+        const r=await post('/api/probe',{mode});
+        lastRun.value=r;lastResults.value=r.results||[];
+        // 体检会改健康结论，而模型页的「健康」列与「已按健康度隐藏」标注都来自
+        // 模型目录接口 —— 不重拉的话，用户跑完体检回到模型页看到的还是上一轮结论。
+        await Promise.all([loadHistory(),loadOverview(),loadModels()]);
+        toast(`体检完成：${r.passed}/${r.total} 通过`);
+      }catch(e){fail(e);}
+      finally{probing.value=false;}
+    };
+    const runDiagnose=async()=>{
+      if(!diag.channel)return toast('先选一个渠道');
+      busy.value=true;diag.result=null;
+      try{diag.result=await post('/api/diagnose',{channel:diag.channel});}
+      catch(e){fail(e);}
+      finally{busy.value=false;}
+    };
+    const exportLogs=()=>{window.open(base+'/api/logs/export','_blank');};
+    const clearLogs=()=>act(()=>post('/api/logs/clear'),'请求流水已清空');
+    // savedOnlyHealthy 记住「上次真正保存过的」开关值，用来判断这次保存是否改动了它。
+    // 必须在服务端确认保存之后再重拉目录：挂在自己的 change 上会先于保存触发，
+    // 服务端那时读到的还是旧值，拉回来的仍是过期结论（试过，白改）。
+    let savedOnlyHealthy=false;
+    const saveSettings=async()=>{
+      try{
+        await post('/api/settings',form);
+        toast('设置已保存');
+        if(form.only_healthy_models!==savedOnlyHealthy){
+          savedOnlyHealthy=form.only_healthy_models;
+          // 模型页的「已按健康度隐藏」标注是服务端按开关算的，重拉一次才跟上。
+          // 是一次真实的目录拉取，只在开关真变了的时候发生。
+          loadModels().catch(()=>{});
+        }
+      }catch(e){fail(e);}
+    };
+    // 管理员密码：与设置表单分开（不进 form，就不会被自动保存带着到处走，
+    // 更不会把明文密码写进设置文件）。
+    const pwForm=reactive({current:'',next:'',confirm:''});
+    const changePassword=async()=>{
+      if(busy.value)return;
+      if(!pwForm.current)return toast('先填当前密码');
+      if(!pwForm.next)return toast('新密码不能为空');
+      if(pwForm.next!==pwForm.confirm)return toast('两次输入的新密码不一致');
+      busy.value=true;
+      try{
+        const r=await post('/api/admin/password',{current:pwForm.current,next:pwForm.next,confirm:pwForm.confirm});
+        pwForm.current='';pwForm.next='';pwForm.confirm='';
+        toast(r.sessions_revoked ? `密码已修改，其它 ${r.sessions_revoked} 个登录已注销` : '密码已修改');
+      }catch(e){fail(e);}
+      finally{busy.value=false;}
+    };
+    const resetSettings=()=>act(()=>post('/api/danger/reset'),'配置已重置');
+    const removeAllAccounts=()=>act(()=>post('/api/danger/remove_accounts'),'全部账号已移除');
+    const backup=()=>{window.open(base+'/api/backup','_blank');toast('已开始导出（不含凭证）');};
+    const migrate=()=>act(()=>post('/api/migrate',{}),'已从 wild-work 导入账号');
+
+    // ---------- 渠道授权 ----------
+    const startAddAccount=()=>{
+      // 加号是「选渠道 → 授权 → 绑号」三步：先让用户挑，别替他决定。
+      const canAuth=channels.value.filter(x=>x.panel_auth);
+      if(!canAuth.length)return toast('没有可面板授权的渠道；请用「从 wild-work 导入账号」');
+      authFlowOpen.value=true;
+      authView.value='pick';
+    };
+    const startRelogin=a=>{startAuth(a.kind);};
+    const stopAuthPoll=()=>{if(authTimer){clearInterval(authTimer);authTimer=null;}};
+    const startAuth=async kind=>{
+      stopAuthPoll();
+      auth.value={channel:kind,channelName:channelName(kind),url:'',expires:'',status:'idle',
+        message:'',kind:'',upstream:'',account:null,modelCount:0};
+      authFlowOpen.value=true;
+      authView.value='oauth';
+      try{
+        const r=await api('/api/login/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:kind})});
+        if(r.error){
+          auth.value.status='error';auth.value.kind=(r.error.kind||'');
+          auth.value.message=r.error.message;auth.value.upstream=r.error.upstream||'';
+          return;
+        }
+        auth.value.url=r.auth_url||'';auth.value.expires=r.expires_at||'';auth.value.callbackBase=r.callback_base||'';auth.value.status='waiting';
+        authLeft=r.expires_at?Math.max(0,Math.round((new Date(r.expires_at)-Date.now())/1000)):300;
+        // 能出二维码就不抢着开浏览器：用户本该拿手机扫这个码（桌面不用跳转）。
+        // 只有「这个渠道出不了码」或「码没生成出来（库没加载/地址过长）」时才自动打开授权页。
+        // awit 一下再判断：authQr 依赖刚写入的 auth.url，等 Vue 重算完再决定。
+        await nextTick();
+        if(!authQr.value)window.open(r.auth_url,'_blank');
+        authTimer=setInterval(pollAuth,2000);
+      }catch(e){auth.value.status='error';auth.value.message=e.message;}
+    };
+    const pollAuth=async()=>{
+      try{
+        if(authLeft>0)authLeft--;
+        const r=await api('/api/login/poll');
+        if(r.error){
+          stopAuthPoll();
+          auth.value.status=(r.error.message||'').includes('超时')?'timeout':'error';
+          auth.value.kind=r.error.kind||'';auth.value.message=r.error.message;
+          auth.value.upstream=r.error.upstream||'';
+          return;
+        }
+        if(r.status==='ok'){
+          stopAuthPoll();auth.value.status='ok';
+          auth.value.account=r.account||null;
+          // 余额由服务端在授权成功时就地问过上游：取到了就显示数字，
+          // 没取到就把原因原样带出来（不让「未知」变成没解释的空白）。
+          auth.value.balance=r.balance||null;
+          auth.value.balanceError=r.balance_error||'';
+          await loadAll();
+          auth.value.modelCount=modelRows.value.filter(m=>m.channel===auth.value.channel).length;
+          authView.value='done';
+        }else{auth.value.status='waiting';}
+      }catch(e){stopAuthPoll();auth.value.status='error';auth.value.message=e.message;}
+    };
+    const cancelAuth=async()=>{
+      stopAuthPoll();
+      try{await api('/api/login/cancel',{method:'POST'});}catch(e){}
+      closeAuthFlow();
+    };
+    // closeAuthFlow 关掉覆盖层：登录后回到面板，未登录则回到登录页。
+    //
+    // 同时**取消服务端那次授权**：授权会话有 5 分钟有效期且全局只允许一次，
+    // 面板关掉但不取消的话，用户再点「授权」只会得到「已有渠道授权在进行中，
+    // 请先在浏览器完成或点取消」—— 而那个「取消」按钮当年只在拿到授权地址时才显示，
+    // 于是人被卡满 5 分钟（实测踩到，用户报的就是「点击千问的时候不对」）。
+    const closeAuthFlow=()=>{
+      if(authView.value==='oauth'){api('/api/login/cancel',{method:'POST'}).catch(()=>{});}
+      stopAuthPoll();
+      authFlowOpen.value=false;
+      authView.value='signin';
+    };
+    const openAuth=()=>{if(auth.value.url)window.open(auth.value.url,'_blank');};
+    // copyText：面板多半是 http 直连（不是 localhost），此时 navigator.clipboard
+    // 按浏览器规范根本不存在 —— 只写 clipboard 的话「复制」按钮在真机上点了没反应。
+    // 所以留 execCommand 兜底，把「复制不了」变成一个能用的路径。
+    const copyText=async(text,okMsg)=>{
+      if(!text)return toast('没有可复制的内容');
+      try{await navigator.clipboard.writeText(text);toast(okMsg);return;}
+      catch(e){/* 落到兜底分支 */}
+      try{
+        const ta=document.createElement('textarea');
+        ta.value=text;
+        ta.setAttribute('readonly','');
+        ta.style.cssText='position:fixed;top:0;left:0;opacity:0';
+        document.body.appendChild(ta);
+        ta.select();
+        const ok=document.execCommand('copy');
+        document.body.removeChild(ta);
+        toast(ok?okMsg:'复制失败，请手动选中复制');
+      }catch(e2){toast('复制失败，请手动选中复制');}
+    };
+    const copyAuth=()=>copyText(auth.value.url,'链接已复制');
+    // ---------- 设置屏：对外基址与 API Key ----------
+    const copyClientBase=()=>copyText(clientBase.value,'已复制：'+clientBase.value);
+    const useDetectedBase=()=>{form.base_url=detectedBase.value;toast('已填入探测到的地址');};
+    const copyKey=()=>{
+      // 掩码复制过去不能用 —— 与其让人以为复制成功了，不如直接说清楚。
+      if(!keyPlain.value)return toast('先点「显示明文」，掩码复制过去用不了');
+      copyText(keyPlain.value,'Key 已复制');
+    };
+    const revealKey=async()=>{
+      if(busy.value)return;
+      busy.value=true;
+      try{
+        const r=await post('/api/apikey/reveal');
+        keyPlain.value=r.key||'';
+        if(!keyPlain.value)toast('服务端没有返回 Key');
+      }catch(e){fail(e);}
+      finally{busy.value=false;}
+    };
+    const hideKey=()=>{keyPlain.value='';};
+    const rotateKey=()=>ask('重新生成 API Key',
+      '新 Key 立即生效，旧 Key 立刻失效 —— 已经填了旧 Key 的客户端（Studio / Claude Code / Codex）会连不上，需要改成新 Key。',
+      ()=>act(async()=>{
+        const r=await post('/api/apikey/rotate');
+        keyPlain.value=r.key||'';
+      },'新 Key 已生成，请立刻复制（离开设置页即自动收起）'));
+
+    // ---------- 登录 / 登出 ----------
+    const doSetup=async()=>{
+      err.value='';errDetail.value='';
+      if(pw.value!==pw2.value){err.value='两次输入的密码不一致';return;}
+      if(!pw.value){err.value='密码不能为空';return;}
+      busy.value=true;
+      try{
+        const r=await api('/api/setup',{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({password:pw.value,confirm:pw2.value})});
+        if(r.ok||r.token){authed.value=true;await loadAll();}
+        else{err.value=(r.error&&r.error.message)||'设置失败';errDetail.value=detailOf(lastErr.value);}
+      }catch(e){err.value=e.message;errDetail.value=detailOf(lastErr.value);}
+      finally{busy.value=false;}
+    };
+    const doLogin=async()=>{
+      err.value='';errDetail.value='';
+      busy.value=true;
+      try{
+        const r=await api('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({password:pw.value,remember:remember.value})});
+        if(r.ok){authed.value=true;await loadAll();}
+        else{err.value=(r.error&&r.error.message)||'密码错误';errDetail.value=detailOf(lastErr.value);}
+      }catch(e){err.value=e.message;errDetail.value=detailOf(lastErr.value);}
+      finally{busy.value=false;}
+    };
+    const logout=async()=>{
+      try{await api('/api/session',{method:'DELETE'});}catch(e){}
+      authed.value=false;pw.value='';view.value='overview';
+      // 登出时把看过的 Key 明文从内存里抹掉：留在页面上等于给了下一个
+      // 用这台机器的人一把钥匙（掩码值下轮登录会重新拉）。
+      keyPlain.value='';keyMasked.value='';
+    };
+
+    // 设置表单自动保存：只在用户真改动时写回。
+    // silent 在回读服务器值时置位 —— 否则「读→存→读→存」会自激循环。
+    let saveTimer=null, silent=false;
+    watch(form,()=>{
+      if(!authed.value||silent)return;
+      clearTimeout(saveTimer);
+      saveTimer=setTimeout(()=>{saveSettings();},900);
+    },{deep:true});
+
+
+    // 总览每 5 秒刷新（原型 01-overview.html 标称「数据每 5 秒刷新」）。
+    let tick=null;
+    const startTick=()=>{
+      if(tick)return;
+      tick=setInterval(async()=>{
+        if(!authed.value||view.value!=='overview'||busy.value)return;
+        try{await loadOverview();}catch(e){}
+      },5000);
+    };
+
+    onMounted(async()=>{
+      if(window.pgToggleTheme){/* 原型脚本负责主题按钮文案 */}
+      try{
+        const b=await api('/api/bootstrap');
+        initialized.value=b.initialized;version.value=b.version;
+        if(b.base_path)listenHint.value=(form.listen_host||'0.0.0.0')+':'+(form.listen_port||5014);
+        if(initialized.value){
+          const s=await api('/api/session');
+          authed.value=s.ok||false;
+          if(authed.value){await loadAll();startTick();}
+        }
+      }catch(e){}
+    });
+
+    return{initialized,authed,version,pw,pw2,err,showPw,remember,listenHint,authView,
+      view,busy,probing,modelsLoading,toastMsg,confirmBox,
+      overview,accounts,channels,modelRows,history,lastRun,lastResults,allLogs,paths,form,
+      modelQ,modelChannel,modelState,logFilter,diag,auth,
+      navItems,title,subtitle,activeChannels,usableChannels,noAccountChannels,totalHealthy,pausedAccountCount,today,daily,pending,pendingCrit,
+      failRate,upstreamShare,allProbedOK,dailyHeight,ttftBars,activeGroups,pausedGroups,
+      catalogChannels,filteredModels,modelGroups,errorKinds,filteredLogs,historyDesc,failedResults,
+      authLabel,authCountdown,authMethod,policyRows,pwStrength,
+      callbackLockedLocal,callbackViaPanel,qrUsable,authQr,qrTip,qrScanHint,cbRaw,submitCallback,
+      channelName,channelClass,statusPill,statusIcon,statusText,sevLabel,
+      accountPill,accountIcon,accountText,checkinPill,checkinText,logPill,logIcon,logText,
+      srcLabel,humanCtx,capsText,shortUid,fmtNum,fmtTime,fmtDate,barPct,barColor,
+      channelCheckin,modelCountOf,channelCredits,historyFailSummary,ask,
+      go,loadModels,checkinOne,refreshOne,toggleAccount,checkinAll,refreshAll,askRemoveAccount,
+      toggleModel,toggleChannel,probe,runDiagnose,exportLogs,clearLogs,saveSettings,resetSettings,
+      pwForm,changePassword,pwStrengthOf,lastErr,errDetail,browserHost,browserIsLocal,
+      removeAllAccounts,backup,migrate,startAddAccount,startRelogin,startAuth,cancelAuth,closeAuthFlow,openAuth,copyAuth,
+      // keyPlain 必须一起透出：模板用它决定按钮文案（显示明文/隐藏、复制/复制明文）。
+      // 只透出 keyShown 的话按钮永远停在「未显示明文」那一态 —— 值变了、按钮不变。
+      detectedBase,clientBase,keyShown,keyPlain,keyPath,copyClientBase,useDetectedBase,copyKey,revealKey,hideKey,rotateKey,
+      listenEffective,listenPinned,failedModelCount,hiddenByHealthCount,
+      reasonText,
+      authFlowOpen,
+      doSetup,doLogin,logout};
+  }
+}).mount('#app');
+</script>
+</body>
+</html>

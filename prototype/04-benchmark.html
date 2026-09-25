@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PoolGate · 测速与体检</title>
+<link rel="stylesheet" href="assets/poolgate.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="side">
+    <div class="brand"><span class="mark">PG</span><b>PoolGate<small>AI 账号池网关</small></b></div>
+    <nav class="nav">
+      <a href="01-overview.html"><span class="dot"></span>总览</a>
+      <a href="02-accounts.html"><span class="dot"></span>账号</a>
+      <a href="03-models.html"><span class="dot"></span>模型与费率</a>
+      <a class="on" href="04-benchmark.html"><span class="dot"></span>测速与体检</a>
+      <a href="05-logs.html"><span class="dot"></span>日志</a>
+      <a href="06-settings.html"><span class="dot"></span>设置</a>
+      <a href="07-login.html"><span class="dot"></span>登录</a>
+      <div class="sep">原型</div>
+      <a href="index.html"><span class="dot"></span>全部原型</a>
+    </nav>
+  </aside>
+
+  <main class="main">
+    <div class="top">
+      <div>
+        <h1>测速与体检</h1>
+        <p>上次体检 15:08（2 分钟前）· 下次自动 21:08</p>
+      </div>
+      <div class="actions">
+        <button class="btn" id="themeBtn" onclick="pgToggleTheme()">☾ 暗色</button>
+        <button class="btn">抽样体检（快）</button>
+        <button class="btn primary">全量测速（57 模型）</button>
+      </div>
+    </div>
+
+    <div class="banner good">
+      <span class="ico">✓</span>
+      <div>
+        <b>体检通过 —— 判据是「收到首个内容」，不是 HTTP 状态码</b>
+        <p>3 个可用渠道各抽 3 个代表模型真实请求：<b>9/9 收到内容</b>。空流、错误信封、超时一律判失败并记录上游原话。</p>
+      </div>
+    </div>
+
+    <!-- 抽样体检 -->
+    <div class="card" style="margin-bottom:14px">
+      <h2>抽样体检结果</h2>
+      <div class="sub">每渠道取代表模型（含默认模型）· 15:08 · 耗时 6.2s</div>
+      <div class="bars">
+        <div class="bar-row" data-tip="<b>QoderCN / auto</b><br>首字 4.6s · 收到内容 ✓">
+          <span class="name"><span class="ch k1"><span class="k"></span>auto</span></span>
+          <span class="bar-track"><span class="bar-fill" style="width:88%;background:var(--r7)"></span></span>
+          <span class="v">4.6s</span>
+        </div>
+        <div class="bar-row" data-tip="<b>QoderCN / qwen3.7-max</b><br>首字 0.6s · 收到内容 ✓">
+          <span class="name"><span class="ch k1"><span class="k"></span>qwen3.7-max</span></span>
+          <span class="bar-track"><span class="bar-fill" style="width:12%;background:var(--r3)"></span></span>
+          <span class="v">0.6s</span>
+        </div>
+        <div class="bar-row" data-tip="<b>WorkBuddyCN / auto</b><br>首字 2.4s · 收到内容 ✓">
+          <span class="name"><span class="ch k2"><span class="k"></span>auto</span></span>
+          <span class="bar-track"><span class="bar-fill" style="width:46%;background:var(--r5)"></span></span>
+          <span class="v">2.4s</span>
+        </div>
+        <div class="bar-row" data-tip="<b>WorkBuddyCN / glm-5.2</b><br>首字 1.8s · 收到内容 ✓">
+          <span class="name"><span class="ch k2"><span class="k"></span>glm-5.2</span></span>
+          <span class="bar-track"><span class="bar-fill" style="width:35%;background:var(--r4)"></span></span>
+          <span class="v">1.8s</span>
+        </div>
+        <div class="bar-row" data-tip="<b>TraeWork / qwen3.8-max</b><br>首字 2.0s · 收到内容 ✓">
+          <span class="name"><span class="ch k3"><span class="k"></span>qwen3.8-max</span></span>
+          <span class="bar-track"><span class="bar-fill" style="width:38%;background:var(--r5)"></span></span>
+          <span class="v">2.0s</span>
+        </div>
+        <div class="bar-row" data-tip="<b>TraeWork / DeepSeek-V4-Pro</b><br>首字 1.1s · 收到内容 ✓">
+          <span class="name"><span class="ch k3"><span class="k"></span>DeepSeek-V4-Pro</span></span>
+          <span class="bar-track"><span class="bar-fill" style="width:21%;background:var(--r3)"></span></span>
+          <span class="v">1.1s</span>
+        </div>
+      </div>
+      <div class="legend">
+        <span><i style="background:var(--r3)"></i>≤0.8s</span>
+        <span><i style="background:var(--r4)"></i>0.8–1.5s</span>
+        <span><i style="background:var(--r5)"></i>1.5–3s</span>
+        <span><i style="background:var(--r7)"></i>&gt;3s</span>
+      </div>
+    </div>
+
+    <!-- 全量测速 -->
+    <div class="card" style="margin-bottom:14px">
+      <h2>全量测速</h2>
+      <div class="sub">上次 11:47 · 90 个模型（含暂停渠道）· <b>结果 28 个失败</b></div>
+      <table>
+        <thead>
+          <tr><th>渠道</th><th class="num">通过</th><th class="num">失败</th><th>失败原因分类</th><th class="num">中位 TTFT</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><span class="ch k1"><span class="k"></span>QoderCN</span></td><td class="num">14</td><td class="num">0</td><td class="muted">—</td><td class="num">1.4s</td></tr>
+          <tr><td><span class="ch k2"><span class="k"></span>WorkBuddyCN</span></td><td class="num">16</td><td class="num">0</td><td class="muted">—</td><td class="num">2.4s</td></tr>
+          <tr><td><span class="ch k3"><span class="k"></span>TraeWork</span></td><td class="num">27</td><td class="num">1</td>
+              <td>1 × 超时（<span class="mono">deepseek-v4.1-flash</span>）</td><td class="num">4.2s</td></tr>
+          <tr><td><span class="ch"><span class="k" style="background:var(--ink-3)"></span>WorkBuddyAI</span></td><td class="num">0</td><td class="num">27</td>
+              <td>27 × 额度耗尽（429）</td><td class="num">—</td></tr>
+          <tr><td><span class="ch"><span class="k" style="background:var(--ink-3)"></span>QoderCOM</span></td><td class="num">2</td><td class="num">0</td>
+              <td><span class="pill warn"><span class="i">!</span><span class="swatch"></span>旧判据假绿</span> 实际需挂 120s 才回 code 112</td><td class="num">—</td></tr>
+          <tr><td><span class="ch"><span class="k" style="background:var(--ink-3)"></span>千问办公</span></td><td class="num">3</td><td class="num">0</td>
+              <td><span class="pill warn"><span class="i">!</span><span class="swatch"></span>旧判据假绿</span> 实际是 200 信封 503</td><td class="num">—</td></tr>
+        </tbody>
+      </table>
+      <div class="banner warn" style="margin:12px 0 0">
+        <span class="ico">!</span>
+        <div>
+          <b>这份旧结果本身就是反例</b>
+          <p>它是「只看 HTTP 200」时代的产物：千问办公与 QoderCOM 的「通过」全是假的。新版判据下二者都应记为 error —— 沉淀进体检历史，作为判据可审计的例子。</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- 历史 -->
+    <div class="card">
+      <h2>体检历史</h2>
+      <div class="sub">每条保留结论与原始报文摘要，可回看「当时为什么判它坏」</div>
+      <table>
+        <thead><tr><th>时间</th><th>类型</th><th>结论</th><th>失败明细</th><th class="num">耗时</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">09-24 15:08</td><td>抽样体检</td>
+              <td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>9/9 通过</span></td><td class="muted">—</td><td class="num">6.2s</td></tr>
+          <tr><td class="mono">09-24 14:54</td><td>全量测速</td>
+              <td><span class="pill warn"><span class="i">!</span><span class="swatch"></span>56/57 通过</span></td>
+              <td><span class="mono">traework/deepseek-v4.1-flash</span> 超时 &gt;230s</td><td class="num">241s</td></tr>
+          <tr><td class="mono">09-24 11:47</td><td>全量测速（旧判据）</td>
+              <td><span class="pill crit"><span class="i">×</span><span class="swatch"></span>判据失效</span></td>
+              <td>千问办公 3 个、QoderCOM 2 个假绿</td><td class="num">38s</td></tr>
+          <tr><td class="mono">09-21 17:10</td><td>上游复核</td>
+              <td><span class="pill crit"><span class="i">×</span><span class="swatch"></span>千问办公上游闸门</span></td>
+              <td>手搓 COSY 直连：签名/档位通过，返回信封 503</td><td class="num">—</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </main>
+</div>
+<script src="assets/poolgate.js"></script>
+</body>
+</html>

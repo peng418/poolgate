@@ -1,0 +1,98 @@
+#!/bin/bash
+# poolgate fnOS service control script —— 5014 版
+# 移植自 wild-work 的实测模板（同一 fnOS 框架约定）：
+#   1. 监听 0.0.0.0:5014（IPv4+IPv6 双栈，Go 0.0.0.0 = 通配）
+#   2. 页内弹窗统一网关：wwbridge 在 ${TRIM_APPDEST}/app.sock 建 unix socket，
+#      把 /app/poolgate 前缀请求转到 127.0.0.1:5014
+#   3. 数据目录：TRIM_PKGVAR（config.json / 日志）、TRIM_PKGETC/creds（凭证 600）
+
+APP_BIN="$TRIM_APPDEST/bin/poolgate"
+BRIDGE_BIN="$TRIM_APPDEST/bin/wwbridge"
+SOCK_FILE="$TRIM_APPDEST/app.sock"
+PID_FILE="$TRIM_PKGVAR/poolgate.pid"
+BRIDGE_PID_FILE="$TRIM_PKGVAR/wwbridge.pid"
+LOG_FILE="$TRIM_PKGVAR/poolgate.log"
+PORT="${TRIM_SERVICE_PORT:-5014}"
+GATEWAY_PREFIX="/app/poolgate"
+
+is_running() {
+    if [ -f "$PID_FILE" ]; then
+        pid=$(cat "$PID_FILE" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+start_bridge() {
+    [ -x "$BRIDGE_BIN" ] || return 0
+    stop_bridge
+    LAN_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -o 'src [0-9.]*' | awk '{print $2}')
+    nohup "$BRIDGE_BIN" "$SOCK_FILE" "$GATEWAY_PREFIX" "127.0.0.1:$PORT" "$LAN_IP" >> "$LOG_FILE" 2>&1 &
+    echo $! > "$BRIDGE_PID_FILE"
+}
+
+stop_bridge() {
+    if [ -f "$BRIDGE_PID_FILE" ]; then
+        bpid=$(cat "$BRIDGE_PID_FILE" 2>/dev/null)
+        [ -n "$bpid" ] && kill "$bpid" 2>/dev/null
+        rm -f "$BRIDGE_PID_FILE"
+    fi
+    pkill -f "$BRIDGE_BIN" 2>/dev/null
+    rm -f "$SOCK_FILE" 2>/dev/null
+}
+
+case "$1" in
+    start)
+        if is_running; then
+            exit 0
+        fi
+        mkdir -p "$TRIM_PKGVAR" "$TRIM_PKGETC/creds" "$TRIM_PKGHOME" "$TRIM_PKGTMP"
+        export POOLGATE_DATA="$TRIM_PKGVAR"
+        export POOLGATE_CONF="$TRIM_PKGETC"
+        export HOME="$TRIM_PKGHOME"
+        cd "$TRIM_PKGVAR" || exit 1
+        nohup "$APP_BIN" -addr "0.0.0.0:$PORT" -conf "$TRIM_PKGETC" -data "$TRIM_PKGVAR" >> "$LOG_FILE" 2>&1 &
+        echo $! > "$PID_FILE"
+        for i in 1 2 3 4 5; do
+            sleep 1
+            if ! is_running; then
+                { echo "poolgate exited during startup, see $LOG_FILE"; } > "$TRIM_TEMP_LOGFILE" 2>/dev/null || true
+                exit 1
+            fi
+        done
+        start_bridge
+        exit 0
+        ;;
+    stop)
+        stop_bridge
+        if [ -f "$PID_FILE" ]; then
+            pid=$(cat "$PID_FILE" 2>/dev/null)
+            if [ -n "$pid" ]; then
+                kill "$pid" 2>/dev/null
+                for i in 1 2 3 4 5 6 7 8 9 10; do
+                    kill -0 "$pid" 2>/dev/null || break
+                    sleep 1
+                done
+                kill -9 "$pid" 2>/dev/null
+            fi
+            rm -f "$PID_FILE"
+        fi
+        pkill -f "$APP_BIN" 2>/dev/null
+        exit 0
+        ;;
+    status)
+        if is_running; then
+            exit 0
+        fi
+        if pgrep -f "$APP_BIN" > /dev/null 2>&1; then
+            exit 0
+        fi
+        exit 3
+        ;;
+    *)
+        { echo "Usage: $0 {start|stop|status}"; } > "$TRIM_TEMP_LOGFILE" 2>/dev/null || true
+        exit 1
+        ;;
+esac

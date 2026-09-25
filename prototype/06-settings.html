@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PoolGate · 设置</title>
+<link rel="stylesheet" href="assets/poolgate.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="side">
+    <div class="brand"><span class="mark">PG</span><b>PoolGate<small>AI 账号池网关</small></b></div>
+    <nav class="nav">
+      <a href="01-overview.html"><span class="dot"></span>总览</a>
+      <a href="02-accounts.html"><span class="dot"></span>账号</a>
+      <a href="03-models.html"><span class="dot"></span>模型与费率</a>
+      <a href="04-benchmark.html"><span class="dot"></span>测速与体检</a>
+      <a href="05-logs.html"><span class="dot"></span>日志</a>
+      <a class="on" href="06-settings.html"><span class="dot"></span>设置</a>
+      <a href="07-login.html"><span class="dot"></span>登录</a>
+      <div class="sep">原型</div>
+      <a href="index.html"><span class="dot"></span>全部原型</a>
+    </nav>
+  </aside>
+
+  <main class="main">
+    <div class="top">
+      <div>
+        <h1>设置</h1>
+        <p>改动即时生效 · 全部可回滚</p>
+      </div>
+      <div class="actions">
+        <button class="btn" id="themeBtn" onclick="pgToggleTheme()">☾ 暗色</button>
+        <button class="btn">保存</button>
+      </div>
+    </div>
+
+    <div class="grid g2">
+      <div class="card">
+        <h2>服务</h2>
+        <div class="sub">客户端连接的地址</div>
+        <div class="field"><label for="host">监听地址</label><input id="host" value="0.0.0.0"></div>
+        <div class="field"><label for="port">端口</label><input id="port" value="5014">
+          <span class="hint">与 wild-work（5013）错开，便于并存迁移</span></div>
+        <div class="field"><label for="base">对外基址（客户端填写用）</label>
+          <input id="base" value="http://192.0.2.10:5014/v1"></div>
+      </div>
+
+      <div class="card">
+        <h2>鉴权</h2>
+        <div class="sub">数据接口与管理接口分权</div>
+        <div class="field"><label for="k1">数据 API Key（客户端用）</label><input id="k1" value="pg-sk-••••••••••••3f9c"></div>
+        <div class="field"><label for="k2">管理 Key（面板用）</label><input id="k2" value="pg-adm-•••••••••••a71e"></div>
+        <div style="display:flex;gap:8px">
+          <button class="btn">重新生成数据 Key</button>
+          <button class="btn danger">吊销全部 Key</button>
+        </div>
+        <div class="hint" style="margin-top:8px">吊销会立即断开所有客户端；凭证与 Key 均不落日志。</div>
+      </div>
+
+      <div class="card">
+        <h2>路由与冷却</h2>
+        <div class="sub">错误分档处置 —— 上游故障不牵连账号</div>
+        <div class="field"><label for="sticky">粘性路由：同一会话连续请求数</label><input id="sticky" value="50">
+          <span class="hint">越大越像同一台设备，风控概率越低；过大则单个号压力集中</span></div>
+        <div class="field"><label for="rot">最大换号次数</label><input id="rot" value="3"></div>
+        <table style="margin-top:6px">
+          <thead><tr><th>错误类型</th><th>处置</th><th class="num">冷却</th></tr></thead>
+          <tbody>
+            <tr><td>余额/权益不足</td><td>冷却该号</td><td class="num">12h</td></tr>
+            <tr><td>限流 429</td><td>冷却该号</td><td class="num">60s</td></tr>
+            <tr><td>会话失效</td><td>禁用 + 提示重登</td><td class="num">—</td></tr>
+            <tr><td>内容拦截 / 超长</td><td>不冷却，透传原文</td><td class="num">—</td></tr>
+            <tr><td><b>上游故障</b></td><td><b>渠道级告警，不计账号错误</b></td><td class="num">5m</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>健康探测</h2>
+        <div class="sub">判据固定，不可配置为「只看状态码」</div>
+        <div class="field"><label for="iv">定时体检间隔</label><select id="iv"><option>6 小时</option><option>3 小时</option><option>12 小时</option></select></div>
+        <div class="field"><label for="sm">每渠道抽样模型数</label><input id="sm" value="3"></div>
+        <div class="field"><label for="to">单模型超时</label><input id="to" value="30 秒"></div>
+        <div class="banner" style="margin:0">
+          <span class="ico">✓</span>
+          <div><b>判据（只读）</b>
+            <p>收到首个 <span class="mono">content</span> / <span class="mono">reasoning</span> 增量或 <span class="mono">[DONE]</span> 才算通过；
+               空流、错误信封、超时一律判失败并记录上游原话。</p></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>签到与保活</h2>
+        <div class="sub">按渠道能力自动启停</div>
+        <div class="field"><label for="ci">签到时间</label><input id="ci" value="09:00, 21:00"></div>
+        <div class="field"><label for="ka">保活间隔</label><input id="ka" value="22 小时">
+          <span class="hint">无签到活动的渠道（如千问办公）自动跳过，并在账号页标注「无活动」</span></div>
+        <table>
+          <thead><tr><th>渠道</th><th>签到能力</th><th>上次结果</th></tr></thead>
+          <tbody>
+            <tr><td><span class="ch k1"><span class="k"></span>QoderCN</span></td><td>每日 +100 Credits</td><td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>14:13 成功</span></td></tr>
+            <tr><td><span class="ch k2"><span class="k"></span>WorkBuddyCN</span></td><td>支持</td><td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>14:13 成功</span></td></tr>
+            <tr><td><span class="ch k3"><span class="k"></span>TraeWork</span></td><td>支持</td><td><span class="pill warn"><span class="i">!</span><span class="swatch"></span>上游回「今天已签到」</span></td></tr>
+            <tr><td><span class="ch"><span class="k" style="background:var(--ink-3)"></span>千问办公</span></td><td class="muted">无活动</td><td class="muted">—</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>渠道开关</h2>
+        <div class="sub">摘除/恢复渠道是分钟级操作，不需要改代码</div>
+        <table>
+          <thead><tr><th>渠道</th><th>状态</th><th>下发模型</th><th>操作</th></tr></thead>
+          <tbody>
+            <tr><td><span class="ch k1"><span class="k"></span>QoderCN</span></td>
+                <td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>启用</span></td><td class="num">14</td>
+                <td><button class="btn sm">暂停</button></td></tr>
+            <tr><td><span class="ch k2"><span class="k"></span>WorkBuddyCN</span></td>
+                <td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>启用</span></td><td class="num">16</td>
+                <td><button class="btn sm">暂停</button></td></tr>
+            <tr><td><span class="ch k3"><span class="k"></span>TraeWork</span></td>
+                <td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>启用</span></td><td class="num">26</td>
+                <td><button class="btn sm">暂停</button></td></tr>
+            <tr><td><span class="ch"><span class="k" style="background:var(--ink-3)"></span>千问办公</span></td>
+                <td><span class="pill crit"><span class="i">×</span><span class="swatch"></span>暂停 · 上游</span></td><td class="num">0</td>
+                <td><button class="btn sm">强制启用</button></td></tr>
+            <tr><td><span class="ch"><span class="k" style="background:var(--ink-3)"></span>QoderCOM</span></td>
+                <td><span class="pill pause"><span class="i">–</span><span class="swatch"></span>暂停 · 无额度</span></td><td class="num">0</td>
+                <td><button class="btn sm">恢复</button></td></tr>
+            <tr><td><span class="ch"><span class="k" style="background:var(--ink-3)"></span>WorkBuddyAI</span></td>
+                <td><span class="pill pause"><span class="i">–</span><span class="swatch"></span>暂停 · 额度耗尽</span></td><td class="num">0</td>
+                <td><button class="btn sm">恢复</button></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>数据与备份</h2>
+        <div class="sub">升级不丢数据；导出默认剔除凭证</div>
+        <dl class="kv">
+          <dt>配置目录</dt><dd class="mono">/vol6/@appdata/poolgate/</dd>
+          <dt>凭证目录</dt><dd class="mono">/vol6/@appconf/poolgate/creds/ · 0600</dd>
+          <dt>流水保留</dt><dd>30 天 · 上限 200 MB</dd>
+          <dt>上次备份</dt><dd>09-24 03:00 · 自动</dd>
+        </dl>
+        <div style="display:flex;gap:8px;margin-top:12px">
+          <button class="btn">导出配置（不含凭证）</button>
+          <button class="btn">导出含凭证包（加密）</button>
+          <button class="btn">从 wild-work 导入账号</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>危险操作</h2>
+        <div class="sub">均需二次确认</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn danger">清空请求流水</button>
+          <button class="btn danger">重置全部配置</button>
+          <button class="btn danger">移除全部账号</button>
+        </div>
+        <div class="hint" style="margin-top:10px">确认弹窗会写明后果与影响范围，不做「只有一个确定按钮」的表单。</div>
+      </div>
+    </div>
+  </main>
+</div>
+<script src="assets/poolgate.js"></script>
+</body>
+</html>

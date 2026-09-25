@@ -1,0 +1,14 @@
+{
+    ".url": {
+        "poolgate.main": {
+            "title": "PoolGate",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "",
+            "gatewayPrefix": "/app/poolgate",
+            "gatewaySocket": "app.sock",
+            "url": "/app/poolgate",
+            "allUsers": true
+        }
+    }
+}

@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PoolGate · 总览</title>
+<link rel="stylesheet" href="assets/poolgate.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="side">
+    <div class="brand"><span class="mark">PG</span><b>PoolGate<small>AI 账号池网关</small></b></div>
+    <nav class="nav">
+      <a class="on" href="01-overview.html"><span class="dot"></span>总览</a>
+      <a href="02-accounts.html"><span class="dot"></span>账号</a>
+      <a href="03-models.html"><span class="dot"></span>模型与费率</a>
+      <a href="04-benchmark.html"><span class="dot"></span>测速与体检</a>
+      <a href="05-logs.html"><span class="dot"></span>日志</a>
+      <a href="06-settings.html"><span class="dot"></span>设置</a>
+      <a href="07-login.html"><span class="dot"></span>登录</a>
+      <div class="sep">原型</div>
+      <a href="index.html"><span class="dot"></span>全部原型</a>
+    </nav>
+  </aside>
+
+  <main class="main">
+    <div class="top">
+      <div>
+        <h1>总览</h1>
+        <p>2026-09-24 15:10 · 数据每 5 秒刷新</p>
+      </div>
+      <div class="actions">
+        <button class="btn" id="themeBtn" onclick="pgToggleTheme()">☾ 暗色</button>
+        <button class="btn">一键诊断</button>
+        <button class="btn primary">全量体检</button>
+      </div>
+    </div>
+
+    <!-- 上游故障必须显性化：面板不允许「全绿但不可用」 -->
+    <div class="banner crit">
+      <span class="ico">×</span>
+      <div>
+        <b>千问办公（qwenwork）已被上游闸门拦截 —— 渠道暂停中</b>
+        <p>上游返回 <span class="mono">503 Model catalog unavailable</span>；经手搓 COSY 直连复核，签名与档位校验均通过，属上游改版（Issue #31）。该渠道 3 个模型已停止下发。<a href="05-logs.html">查看诊断详情 →</a></p>
+      </div>
+    </div>
+
+    <div class="grid g4" style="margin-bottom:14px">
+      <div class="card stat">
+        <div class="label">可用渠道</div>
+        <div class="val">3<span class="unit">/ 3 保留</span></div>
+        <div class="note"><span class="pill good"><span class="i">✓</span><span class="swatch"></span>全部通过体检</span></div>
+      </div>
+      <div class="card stat">
+        <div class="label">账号</div>
+        <div class="val">3<span class="unit">可用</span></div>
+        <div class="note">另有 3 个暂停渠道账号（0 额度 / 上游故障）</div>
+      </div>
+      <div class="card stat">
+        <div class="label">今日请求</div>
+        <div class="val">1,284</div>
+        <div class="note">失败 11 · <span class="mono">0.86%</span>（全部为上游故障类）</div>
+      </div>
+      <div class="card stat">
+        <div class="label">中位首字延迟 TTFT</div>
+        <div class="val">1.4<span class="unit">s</span></div>
+        <div class="note">P95 <span class="mono">5.6s</span> · 较昨日 <span style="color:var(--good-text)">↓ 0.2s</span></div>
+      </div>
+    </div>
+
+    <div class="grid g2" style="margin-bottom:14px">
+      <div class="card">
+        <h2>渠道健康</h2>
+        <div class="sub">判据：真实抽样请求「收到首个内容」才算通过（不看 HTTP 状态码）</div>
+        <table>
+          <thead><tr><th>渠道</th><th>状态</th><th class="num">账号</th><th class="num">余额</th><th class="num">上次体检</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><span class="ch k1"><span class="k"></span>QoderCN</span></td>
+              <td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>可用</span></td>
+              <td class="num">1</td><td class="num">477</td><td class="num">2 分钟前</td>
+            </tr>
+            <tr>
+              <td><span class="ch k2"><span class="k"></span>WorkBuddyCN</span></td>
+              <td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>可用</span></td>
+              <td class="num">1</td><td class="num">2024</td><td class="num">2 分钟前</td>
+            </tr>
+            <tr>
+              <td><span class="ch k3"><span class="k"></span>TraeWork</span></td>
+              <td><span class="pill warn"><span class="i">!</span><span class="swatch"></span>降级 · 1 个模型挂死</span></td>
+              <td class="num">1</td><td class="num">2034</td><td class="num">2 分钟前</td>
+            </tr>
+            <tr>
+              <td><span class="ch"><span class="k" style="background:var(--ink-3)"></span>千问办公</span></td>
+              <td><span class="pill crit"><span class="i">×</span><span class="swatch"></span>故障 · 上游</span></td>
+              <td class="num">1</td><td class="num">316</td><td class="num">2 分钟前</td>
+            </tr>
+            <tr>
+              <td><span class="ch"><span class="k" style="background:var(--ink-3)"></span>QoderCOM</span></td>
+              <td><span class="pill pause"><span class="i">–</span><span class="swatch"></span>暂停 · 无额度</span></td>
+              <td class="num">1</td><td class="num">0</td><td class="num">2 分钟前</td>
+            </tr>
+            <tr>
+              <td><span class="ch"><span class="k" style="background:var(--ink-3)"></span>WorkBuddyAI</span></td>
+              <td><span class="pill pause"><span class="i">–</span><span class="swatch"></span>暂停 · 额度耗尽</span></td>
+              <td class="num">1</td><td class="num">0</td><td class="num">2 分钟前</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>渠道首字延迟（TTFT 中位）</h2>
+        <div class="sub">条形按量值取单色阶；右键渠道可屏蔽</div>
+        <div class="bars">
+          <div class="bar-row" data-tip="<b>1.1s</b><br>QoderCN · 14 个模型 · n=612">
+            <span class="name">QoderCN</span>
+            <span class="bar-track"><span class="bar-fill" style="width:22%;background:var(--r3)"></span></span>
+            <span class="v">1.1s</span>
+          </div>
+          <div class="bar-row" data-tip="<b>2.4s</b><br>WorkBuddyCN · 16 个模型 · n=402">
+            <span class="name">WorkBuddyCN</span>
+            <span class="bar-track"><span class="bar-fill" style="width:48%;background:var(--r5)"></span></span>
+            <span class="v">2.4s</span>
+          </div>
+          <div class="bar-row" data-tip="<b>4.2s</b><br>TraeWork · 26/27 个模型可用 · n=270">
+            <span class="name">TraeWork</span>
+            <span class="bar-track"><span class="bar-fill" style="width:84%;background:var(--r7)"></span></span>
+            <span class="v">4.2s</span>
+          </div>
+        </div>
+        <div class="legend">
+          <span><i style="background:var(--r3)"></i>≤1.5s</span>
+          <span><i style="background:var(--r5)"></i>1.5–3s</span>
+          <span><i style="background:var(--r7)"></i>&gt;3s</span>
+        </div>
+        <details class="tbl">
+          <summary>表格视图</summary>
+          <table>
+            <thead><tr><th>渠道</th><th class="num">TTFT 中位</th><th class="num">样本</th></tr></thead>
+            <tbody>
+              <tr><td>QoderCN</td><td class="num">1.1s</td><td class="num">612</td></tr>
+              <tr><td>WorkBuddyCN</td><td class="num">2.4s</td><td class="num">402</td></tr>
+              <tr><td>TraeWork</td><td class="num">4.2s</td><td class="num">270</td></tr>
+            </tbody>
+          </table>
+        </details>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
+      <h2>近 7 日请求量</h2>
+      <div class="sub">单系列（请求数）· 悬停看当日明细</div>
+      <div class="cols">
+        <div class="col" data-tip="<b>1,040</b> 请求<br>失败 6 · TTFT 1.6s"><div class="bar" style="height:74px"></div><span class="lab">09-18</span></div>
+        <div class="col" data-tip="<b>1,182</b> 请求<br>失败 4 · TTFT 1.5s"><div class="bar" style="height:84px"></div><span class="lab">09-19</span></div>
+        <div class="col" data-tip="<b>968</b> 请求<br>失败 3 · TTFT 1.5s"><div class="bar" style="height:68px"></div><span class="lab">09-20</span></div>
+        <div class="col" data-tip="<b>1,401</b> 请求<br>失败 9 · TTFT 1.7s"><div class="bar" style="height:100px"></div><span class="lab">09-21</span></div>
+        <div class="col" data-tip="<b>1,330</b> 请求<br>失败 7 · TTFT 1.6s"><div class="bar" style="height:95px"></div><span class="lab">09-22</span></div>
+        <div class="col" data-tip="<b>1,196</b> 请求<br>失败 5 · TTFT 1.5s"><div class="bar" style="height:85px"></div><span class="lab">09-23</span></div>
+        <div class="col" data-tip="<b>1,284</b> 请求<br>失败 11 · TTFT 1.4s"><div class="bar" style="height:92px"></div><span class="lab">09-24</span></div>
+      </div>
+      <div class="baseline"></div>
+      <details class="tbl">
+        <summary>表格视图</summary>
+        <table>
+          <thead><tr><th>日期</th><th class="num">请求</th><th class="num">失败</th><th class="num">TTFT 中位</th></tr></thead>
+          <tbody>
+            <tr><td>09-18</td><td class="num">1,040</td><td class="num">6</td><td class="num">1.6s</td></tr>
+            <tr><td>09-19</td><td class="num">1,182</td><td class="num">4</td><td class="num">1.5s</td></tr>
+            <tr><td>09-20</td><td class="num">968</td><td class="num">3</td><td class="num">1.5s</td></tr>
+            <tr><td>09-21</td><td class="num">1,401</td><td class="num">9</td><td class="num">1.7s</td></tr>
+            <tr><td>09-22</td><td class="num">1,330</td><td class="num">7</td><td class="num">1.6s</td></tr>
+            <tr><td>09-23</td><td class="num">1,196</td><td class="num">5</td><td class="num">1.5s</td></tr>
+            <tr><td>09-24</td><td class="num">1,284</td><td class="num">11</td><td class="num">1.4s</td></tr>
+          </tbody>
+        </table>
+      </details>
+    </div>
+
+    <div class="card">
+      <h2>待处理</h2>
+      <div class="sub">按严重度排序，每条都能点进上下文</div>
+      <table>
+        <tbody>
+          <tr><td style="width:30px"><span class="pill crit"><span class="i">×</span><span class="swatch"></span>故障</span></td>
+              <td>千问办公上游闸门（503 Model catalog unavailable）</td>
+              <td class="muted">渠道已暂停 · 上游改版课题 · 检测于 09-21</td></tr>
+          <tr><td><span class="pill warn"><span class="i">!</span><span class="swatch"></span>降级</span></td>
+              <td>TraeWork <span class="mono">deepseek-v4.1-flash</span> 连续 5/5 挂死（&gt;230s）</td>
+              <td class="muted">已从下发列表剔除 · 建议长期观察</td></tr>
+          <tr><td><span class="pill pause"><span class="i">–</span><span class="swatch"></span>额度</span></td>
+              <td>QoderCOM / WorkBuddyAI 账号余额为 0</td>
+              <td class="muted">渠道暂停中 · 充值后可一键恢复</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </main>
+</div>
+<script src="assets/poolgate.js"></script>
+</body>
+</html>

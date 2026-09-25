@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PoolGate · 日志与诊断</title>
+<link rel="stylesheet" href="assets/poolgate.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="side">
+    <div class="brand"><span class="mark">PG</span><b>PoolGate<small>AI 账号池网关</small></b></div>
+    <nav class="nav">
+      <a href="01-overview.html"><span class="dot"></span>总览</a>
+      <a href="02-accounts.html"><span class="dot"></span>账号</a>
+      <a href="03-models.html"><span class="dot"></span>模型与费率</a>
+      <a href="04-benchmark.html"><span class="dot"></span>测速与体检</a>
+      <a class="on" href="05-logs.html"><span class="dot"></span>日志</a>
+      <a href="06-settings.html"><span class="dot"></span>设置</a>
+      <a href="07-login.html"><span class="dot"></span>登录</a>
+      <div class="sep">原型</div>
+      <a href="index.html"><span class="dot"></span>全部原型</a>
+    </nav>
+  </aside>
+
+  <main class="main">
+    <div class="top">
+      <div>
+        <h1>日志与诊断</h1>
+        <p>最近 500 条请求 · 保留 30 天 · 已脱敏（不含任何凭证）</p>
+      </div>
+      <div class="actions">
+        <button class="btn" id="themeBtn" onclick="pgToggleTheme()">☾ 暗色</button>
+        <button class="btn">导出 CSV</button>
+      </div>
+    </div>
+
+    <!-- 错误分类聚合 -->
+    <div class="grid g4" style="margin-bottom:14px">
+      <div class="card stat">
+        <div class="label">今日请求</div>
+        <div class="val">1,284</div>
+        <div class="note">成功 1,273 · 失败 11</div>
+      </div>
+      <div class="card stat">
+        <div class="label">失败率</div>
+        <div class="val">0.86<span class="unit">%</span></div>
+        <div class="note">昨日 0.42%</div>
+      </div>
+      <div class="card stat">
+        <div class="label">失败构成</div>
+        <div class="val">100<span class="unit">% 上游类</span></div>
+        <div class="note">账号类故障 <span class="mono">0</span> 次</div>
+      </div>
+      <div class="card stat">
+        <div class="label">自动换号</div>
+        <div class="val">7<span class="unit">次</span></div>
+        <div class="note">其中 5 次换号后成功</div>
+      </div>
+    </div>
+
+    <div class="grid g2" style="margin-bottom:14px">
+      <div class="card">
+        <h2>错误分类</h2>
+        <div class="sub">上游五花八门的错误归一成有限枚举 —— 这是路由与面板共用的字段</div>
+        <div class="bars">
+          <div class="bar-row" data-tip="<b>6</b> 次 · 千问办公<br>503 Model catalog unavailable">
+            <span class="name">上游故障 UpstreamFault</span>
+            <span class="bar-track"><span class="bar-fill" style="width:100%;background:var(--r5)"></span></span>
+            <span class="v">6</span>
+          </div>
+          <div class="bar-row" data-tip="<b>3</b> 次 · TraeWork<br>连接超时 &gt;20s">
+            <span class="name">传输失败 Transport</span>
+            <span class="bar-track"><span class="bar-fill" style="width:50%;background:var(--r5)"></span></span>
+            <span class="v">3</span>
+          </div>
+          <div class="bar-row" data-tip="<b>2</b> 次 · QoderCN<br>内容被上游拦截">
+            <span class="name">内容拦截 ContentBlocked</span>
+            <span class="bar-track"><span class="bar-fill" style="width:33%;background:var(--r5)"></span></span>
+            <span class="v">2</span>
+          </div>
+        </div>
+        <div class="hint" style="margin-top:10px">
+          注意：<b>上游故障不计入账号错误</b>。旧实现会把千问办公的 503 当成账号故障累积，最终把好号也冷却掉。
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>一键诊断 · qwenwork/pro</h2>
+        <div class="sub">30 秒内回答「是本地配置问题还是上游问题」</div>
+        <dl class="kv">
+          <dt>结论</dt><dd><span class="pill crit"><span class="i">×</span><span class="swatch"></span>上游故障（非本地问题）</span></dd>
+          <dt>凭证状态</dt><dd>有效 · token 刷新成功</dd>
+          <dt>模型目录</dt><dd>可获取（3 个模型）</dd>
+          <dt>签名校验</dt><dd>通过（错误档位可正确得到 403，说明签名被接受）</dd>
+          <dt>推理端点</dt><dd class="mono">503 Model catalog unavailable</dd>
+          <dt>上游原话</dt>
+          <dd class="mono" style="font-size:11.5px;background:var(--surface-2);padding:6px 8px;border-radius:6px">
+            {"code":"503","message":"Model catalog unavailable"}
+          </dd>
+          <dt>建议动作</dt><dd>保持渠道暂停；等上游逆向社区跟进（上游 Issue #31）</dd>
+        </dl>
+        <div class="hint" style="margin-top:10px">
+          诊断过程与原始报文一并留档，可随时回看：<a href="04-benchmark.html">体检历史 →</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- 请求流水 -->
+    <div class="card">
+      <h2>请求流水</h2>
+      <div class="sub">可按渠道 / 状态 / 时间过滤；点任意行看完整上下文</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:end;margin-bottom:12px">
+        <div class="field" style="margin:0"><label for="fc">渠道</label>
+          <select id="fc"><option>全部</option><option>QoderCN</option><option>WorkBuddyCN</option><option>TraeWork</option><option>千问办公</option></select></div>
+        <div class="field" style="margin:0"><label for="fs">状态</label>
+          <select id="fs"><option>全部</option><option>仅失败</option><option>仅换号</option></select></div>
+        <div class="field" style="margin:0"><label for="fr">时间范围</label>
+          <select id="fr"><option>最近 1 小时</option><option>今天</option><option>最近 7 天</option></select></div>
+        <button class="btn">应用</button>
+      </div>
+      <table>
+        <thead>
+          <tr><th>时间</th><th>渠道</th><th>模型</th><th>账号</th><th>状态</th><th class="num">TTFT</th><th class="num">总耗时</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="mono">15:10:22</td><td><span class="ch k1"><span class="k"></span>QoderCN</span></td>
+            <td class="mono">qodercn/auto</td><td class="mono">aliyun…925</td>
+            <td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>200</span></td>
+            <td class="num">4.6s</td><td class="num">11.2s</td><td class="muted">—</td>
+          </tr>
+          <tr>
+            <td class="mono">15:09:58</td><td><span class="ch k2"><span class="k"></span>WorkBuddyCN</span></td>
+            <td class="mono">workbuddy/auto</td><td class="mono">demo-workbuddy</td>
+            <td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>200</span></td>
+            <td class="num">2.4s</td><td class="num">7.8s</td><td class="muted">—</td>
+          </tr>
+          <tr>
+            <td class="mono">15:09:31</td><td><span class="ch"><span class="k" style="background:var(--ink-3)"></span>千问办公</span></td>
+            <td class="mono">qwenwork/pro</td><td class="mono">demo-qwen</td>
+            <td><span class="pill crit"><span class="i">×</span><span class="swatch"></span>502</span></td>
+            <td class="num">—</td><td class="num">0.4s</td>
+            <td><span class="mono">UpstreamFault</span> · 503 Model catalog unavailable</td>
+          </tr>
+          <tr>
+            <td class="mono">15:08:47</td><td><span class="ch k3"><span class="k"></span>TraeWork</span></td>
+            <td class="mono">traework/qwen3.8-max</td><td class="mono">用户…137</td>
+            <td><span class="pill warn"><span class="i">!</span><span class="swatch"></span>换号后成功</span></td>
+            <td class="num">2.0s</td><td class="num">8.1s</td>
+            <td><span class="mono">Transport</span> · 首次连接超时，换号重试成功</td>
+          </tr>
+          <tr>
+            <td class="mono">15:07:12</td><td><span class="ch k1"><span class="k"></span>QoderCN</span></td>
+            <td class="mono">qodercn/qwen3.7-max</td><td class="mono">aliyun…925</td>
+            <td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>200</span></td>
+            <td class="num">0.6s</td><td class="num">3.3s</td><td class="muted">—</td>
+          </tr>
+          <tr>
+            <td class="mono">15:06:40</td><td><span class="ch k2"><span class="k"></span>WorkBuddyCN</span></td>
+            <td class="mono">workbuddy/glm-5.2</td><td class="mono">demo-workbuddy</td>
+            <td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>200</span></td>
+            <td class="num">1.8s</td><td class="num">5.1s</td><td class="muted">—</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="hint" style="margin-top:10px">
+        失败行永远带 <span class="mono">kind</span> 与上游原话摘要 —— 这是「零静默失败」红线的落地：任何失败都能在这一页看到原因。
+      </div>
+    </div>
+  </main>
+</div>
+<script src="assets/poolgate.js"></script>
+</body>
+</html>

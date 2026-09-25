@@ -1,0 +1,14 @@
+# 构建产物：本地生成，不入库（FPK 从 Releases 下载）
+src/build/
+fpk/dist/
+fpk/.build/
+
+# 打包用的二进制载荷：体积大且可复现，来源见 fpk/README.md
+fpk/payload/poolgate
+fpk/tpl/wwbridge
+
+# 审计脚本的 dev 构建缓存（audit-vue.mjs 会按需下载）
+tools/.cache/
+
+*.log
+.DS_Store

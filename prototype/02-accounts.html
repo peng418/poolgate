@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PoolGate · 账号</title>
+<link rel="stylesheet" href="assets/poolgate.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="side">
+    <div class="brand"><span class="mark">PG</span><b>PoolGate<small>AI 账号池网关</small></b></div>
+    <nav class="nav">
+      <a href="01-overview.html"><span class="dot"></span>总览</a>
+      <a class="on" href="02-accounts.html"><span class="dot"></span>账号</a>
+      <a href="03-models.html"><span class="dot"></span>模型与费率</a>
+      <a href="04-benchmark.html"><span class="dot"></span>测速与体检</a>
+      <a href="05-logs.html"><span class="dot"></span>日志</a>
+      <a href="06-settings.html"><span class="dot"></span>设置</a>
+      <a href="07-login.html"><span class="dot"></span>登录</a>
+      <div class="sep">原型</div>
+      <a href="index.html"><span class="dot"></span>全部原型</a>
+    </nav>
+  </aside>
+
+  <main class="main">
+    <div class="top">
+      <div>
+        <h1>账号</h1>
+        <p>按渠道分组 · 3 个可用 · 3 个暂停</p>
+      </div>
+      <div class="actions">
+        <button class="btn" id="themeBtn" onclick="pgToggleTheme()">☾ 暗色</button>
+        <button class="btn">全部签到</button>
+        <button class="btn">刷新余额</button>
+        <button class="btn primary">＋ 添加账号</button>
+      </div>
+    </div>
+
+    <!-- ================= 可用渠道 ================= -->
+    <div class="card" style="margin-bottom:14px">
+      <h2><span class="ch k1"><span class="k"></span>QoderCN</span></h2>
+      <div class="sub">签到可领每日 +100 Credits · 签到时间 09:00 / 21:00</div>
+      <table>
+        <thead><tr><th>账号</th><th>状态</th><th class="num">余额</th><th>签到</th><th class="num">近 20 次成功率</th><th>操作</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><b>demo-qoder</b><div class="hint mono">a1b2c3d4…e5f6</div></td>
+            <td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>正常</span></td>
+            <td class="num">477</td>
+            <td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>已签到 14:13</span></td>
+            <td class="num">100%</td>
+            <td><button class="btn sm">签到</button> <button class="btn sm">重新登录</button> <button class="btn sm danger">禁用</button></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
+      <h2><span class="ch k2"><span class="k"></span>WorkBuddyCN</span></h2>
+      <div class="sub">16 个模型全部可用 · 无图片能力</div>
+      <table>
+        <thead><tr><th>账号</th><th>状态</th><th class="num">余额</th><th>签到</th><th class="num">近 20 次成功率</th><th>操作</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><b>demo-workbuddy</b><div class="hint mono">b2c3d4e5…f6a7</div></td>
+            <td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>正常</span></td>
+            <td class="num">2024</td>
+            <td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>已签到 14:13</span></td>
+            <td class="num">98%</td>
+            <td><button class="btn sm">签到</button> <button class="btn sm">重新登录</button> <button class="btn sm danger">禁用</button></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
+      <h2><span class="ch k3"><span class="k"></span>TraeWork</span> <span class="pill warn" style="margin-left:6px"><span class="i">!</span><span class="swatch"></span>降级 · 1 个模型挂死</span></h2>
+      <div class="sub">27 个模型 · 其中 <span class="mono">deepseek-v4.1-flash</span> 连续 5/5 挂死，已从下发列表剔除</div>
+      <table>
+        <thead><tr><th>账号</th><th>状态</th><th class="num">余额</th><th>签到</th><th class="num">近 20 次成功率</th><th>操作</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><b>demo-trae</b><div class="hint mono">1234567890</div></td>
+            <td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>正常</span></td>
+            <td class="num">2034</td>
+            <td><span class="pill warn"><span class="i">!</span><span class="swatch"></span>已签到（上游回「今天已签到」）</span></td>
+            <td class="num">93%</td>
+            <td><button class="btn sm">签到</button> <button class="btn sm">重新登录</button> <button class="btn sm danger">禁用</button></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- ================= 暂停渠道 ================= -->
+    <div class="card">
+      <h2>暂停的渠道</h2>
+      <div class="sub">保留账号与适配器，但不向客户端下发模型；恢复只需改状态</div>
+      <table>
+        <thead><tr><th>渠道 / 账号</th><th>暂停原因</th><th class="num">余额</th><th>恢复条件</th><th>操作</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><b>千问办公</b><div class="hint">demo-qwen · c3d4e5f6…a7b8</div></td>
+            <td><span class="pill crit"><span class="i">×</span><span class="swatch"></span>故障 · 上游</span>
+                <div class="hint mono">503 Model catalog unavailable</div></td>
+            <td class="num">316</td>
+            <td class="hint">上游逆向社区跟进（Issue #31）</td>
+            <td><button class="btn sm">查看诊断</button> <button class="btn sm">重新登录</button></td>
+          </tr>
+          <tr>
+            <td><b>QoderCOM</b><div class="hint">demo-qodercom · e5f6a7b8…c9d0</div></td>
+            <td><span class="pill pause"><span class="i">–</span><span class="swatch"></span>暂停 · 无额度</span>
+                <div class="hint mono">上游 code 112（需订阅）</div></td>
+            <td class="num">0</td>
+            <td class="hint">充值后手动恢复</td>
+            <td><button class="btn sm">充值链接</button> <button class="btn sm">恢复</button></td>
+          </tr>
+          <tr>
+            <td><b>WorkBuddyAI</b><div class="hint">demo@example.com · d4e5f6a7…b8c9</div></td>
+            <td><span class="pill pause"><span class="i">–</span><span class="swatch"></span>暂停 · 额度耗尽</span>
+                <div class="hint mono">429 Credits exhausted</div></td>
+            <td class="num">0</td>
+            <td class="hint">充值后手动恢复</td>
+            <td><button class="btn sm">充值链接</button> <button class="btn sm">恢复</button></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="hint" style="margin-top:14px">
+      说明：凭证以 AES-GCM 加密存放于 <span class="mono">/vol6/@appconf/poolgate/creds/</span>（0600），
+      日志与导出永远不含 token；「重新登录」会在浏览器完成授权后自动回填，无需手工粘贴。
+    </p>
+  </main>
+</div>
+<script src="assets/poolgate.js"></script>
+</body>
+</html>

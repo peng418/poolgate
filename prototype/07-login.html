@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PoolGate · 登录</title>
+<link rel="stylesheet" href="assets/poolgate.css">
+</head>
+<body>
+<div class="auth">
+  <!-- ================= 左侧：这是什么 / 为什么信它 ================= -->
+  <aside class="auth-aside">
+    <div class="auth-brand">
+      <span class="mark" style="width:32px;height:32px;border-radius:8px;background:linear-gradient(140deg,var(--s1),var(--s3));display:grid;place-items:center;color:#fff;font-weight:700;font-size:15px">PG</span>
+      <b style="font-size:16px">PoolGate<small style="display:block;color:var(--ink-3);font-size:11px;font-weight:400">AI 账号池网关</small></b>
+    </div>
+
+    <div>
+      <h1>把多个 AI 订阅账号<br>汇成一个池子，一处管理。</h1>
+      <p class="lead">
+        对外提供 OpenAI / Anthropic 兼容接口，Studio、Claude Code、Codex 直连即用。
+      </p>
+    </div>
+
+    <ul class="auth-points">
+      <li>
+        <span class="n">1</span>
+        <div><b>失败一定看得见</b>
+          <p>上游异常会回传结构化错误并落一条流水，不会出现「不回复也不报错」。</p></div>
+      </li>
+      <li>
+        <span class="n">2</span>
+        <div><b>面板不撒谎</b>
+          <p>只有真的收到内容才算通过；空流与错误信封一律判失败，并附上上游原话。</p></div>
+      </li>
+      <li>
+        <span class="n">3</span>
+        <div><b>渠道可插拔</b>
+          <p>上游改版是常态。摘掉一个渠道是配置级操作，不用改代码。</p></div>
+      </li>
+    </ul>
+
+    <div class="auth-foot">
+      单用户自用 · 不做多租户与计费<br>
+      凭证 AES-GCM 加密落盘（0600），永不进入日志与导出
+    </div>
+  </aside>
+
+  <!-- ================= 右侧：三个视图 ================= -->
+  <main class="auth-main">
+    <div class="auth-card">
+
+      <!-- ---------- 视图 A：登录 ---------- -->
+      <section id="v-signin" class="card">
+        <h2>登录控制台</h2>
+        <div class="sub">管理端入口 · 仅本机或局域网内可访问</div>
+
+        <div id="errBox" class="auth-err" hidden>
+          <span class="ico" style="font-size:14px;line-height:1.3">×</span>
+          <div>
+            <b>登录失败</b>
+            <span id="errMsg">密码错误，还可尝试 4 次</span>
+            <span class="mono">POST /api/session → 401 Unauthorized · kind=AuthFailed</span>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="pw">管理员密码</label>
+          <div class="pw-row">
+            <input id="pw" type="password" value="••••••••••••" autocomplete="current-password">
+            <button class="btn sm" type="button" onclick="pgTogglePw('pw', this)">显示</button>
+          </div>
+        </div>
+
+        <div class="field">
+          <label class="pw-row" style="gap:8px">
+            <input type="checkbox" id="remember" checked style="width:auto">
+            <span>在这台设备上记住我（30 天）</span>
+          </label>
+        </div>
+
+        <button class="btn primary" style="width:100%" onclick="pgFail()">登录</button>
+
+        <p class="auth-alt">
+          忘记密码？用服务器上的 <span class="mono">poolgate admin reset-password</span> 重置
+        </p>
+
+        <div class="banner warn" style="margin:16px 0 0">
+          <span class="ico">!</span>
+          <div><b>连续失败 5 次将锁定 15 分钟</b>
+            <p>失败次数与来源 IP 会落日志；锁定期间本页仍可打开，但登录被拒。</p></div>
+        </div>
+      </section>
+
+      <!-- ---------- 视图 B：首次设置 ---------- -->
+      <section id="v-setup" class="card" hidden>
+        <div class="steps">
+          <span class="step-tab done"><span class="n">✓</span>检查环境</span>
+          <span class="step-line"></span>
+          <span class="step-tab on"><span class="n">2</span>设置密码</span>
+          <span class="step-line"></span>
+          <span class="step-tab"><span class="n">3</span>完成</span>
+        </div>
+
+        <h2>首次设置</h2>
+        <div class="sub">还没有管理员账号 —— 设置一个密码即可开始</div>
+
+        <div class="field">
+          <label for="np">管理员密码</label>
+          <div class="pw-row">
+            <input id="np" type="password" value="PooLGate-2026!" autocomplete="new-password">
+            <button class="btn sm" type="button" onclick="pgTogglePw('np', this)">显示</button>
+          </div>
+          <div class="pw-meter" aria-hidden="true">
+            <i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i>
+          </div>
+          <p class="pw-note">强度：<b>强</b> · 已满足 ≥12 位且含大小写与符号</p>
+        </div>
+
+        <div class="field">
+          <label for="np2">再输一次</label>
+          <input id="np2" type="password" value="PooLGate-2026!" autocomplete="new-password">
+          <span class="hint">两次一致才会启用「创建」按钮</span>
+        </div>
+
+        <div class="field">
+          <label for="listen">面板监听地址</label>
+          <input id="listen" value="0.0.0.0:5014">
+          <span class="hint">与 wild-work（5013）错开，便于并存迁移</span>
+        </div>
+
+        <button class="btn primary" style="width:100%" onclick="pgSetupNext(this)">创建并进入</button>
+
+        <p class="auth-alt">
+          密码以 Argon2id 哈希存放，明文不落盘、不入日志
+        </p>
+      </section>
+
+      <!-- ---------- 视图 C：渠道授权（添加账号的核心一步） ---------- -->
+      <section id="v-oauth" class="card" hidden>
+        <div class="steps">
+          <span class="step-tab done"><span class="n">✓</span>选渠道</span>
+          <span class="step-line"></span>
+          <span class="step-tab on"><span class="n">2</span>授权</span>
+          <span class="step-line"></span>
+          <span class="step-tab"><span class="n">3</span>绑号</span>
+        </div>
+
+        <h2>添加账号 · QoderCN</h2>
+        <div class="sub">在 <b>QoderCN</b> 网页版完成授权，账号会自动回到池子里</div>
+
+        <div class="qr-wrap">
+          <div class="qr-frame" data-tip="示意二维码：真实实现由上游登录接口返回">
+            <!-- 示意二维码（非真实编码，仅占位） -->
+            <svg viewBox="0 0 33 33" role="img" aria-label="登录二维码示意图">
+              <rect width="33" height="33" fill="var(--surface-2)"/>
+              <g fill="var(--ink)">
+                <path d="M2 2h7v7H2z M4 4h3v3H4z"/>
+                <path d="M24 2h7v7h-7z M26 4h3v3h-3z"/>
+                <path d="M2 24h7v7H2z M4 26h3v3H4z"/>
+              </g>
+              <g fill="var(--ink-2)" id="qrDots"></g>
+            </svg>
+          </div>
+          <div class="qr-state">
+            <span class="spin" aria-hidden="true"></span>
+            <span>等待授权 · 已轮询 12s，剩余 <b style="font-variant-numeric:tabular-nums">04:48</b></span>
+          </div>
+        </div>
+
+        <div class="banner" style="margin:12px 0 0">
+          <span class="ico">↗</span>
+          <div><b>没有手机？点这里直接用浏览器登录</b>
+            <p>会在新标签打开 <span class="mono">qoder.com</span>，授权完成后自动回填，不需要手工粘贴 token。</p></div>
+        </div>
+
+        <table class="kv-t" style="margin-top:12px">
+          <tbody>
+            <tr><td>登录方式</td><td>授权码（浏览器回调）</td></tr>
+            <tr><td>回调地址</td><td class="mono">http://192.0.2.10:5014/api/login/qodercn/callback</td></tr>
+            <tr><td>超时</td><td class="num">5 分钟</td></tr>
+          </tbody>
+        </table>
+
+        <div style="display:flex;gap:8px;margin-top:14px">
+          <button class="btn" onclick="pgShow('v-oauth-done')">模拟：授权成功</button>
+          <button class="btn" onclick="pgShow('v-oauth-fail')">模拟：授权失败</button>
+        </div>
+
+        <p class="auth-alt"><a href="#" onclick="pgShow('v-signin');return false">取消，返回登录</a></p>
+      </section>
+
+      <!-- ---------- 视图 D：绑号成功 ---------- -->
+      <section id="v-oauth-done" class="card" hidden>
+        <div class="steps">
+          <span class="step-tab done"><span class="n">✓</span>选渠道</span>
+          <span class="step-line"></span>
+          <span class="step-tab done"><span class="n">✓</span>授权</span>
+          <span class="step-line"></span>
+          <span class="step-tab on"><span class="n">3</span>绑号</span>
+        </div>
+
+        <div class="banner good" style="margin:0 0 14px">
+          <span class="ico">✓</span>
+          <div><b>账号已加入池子</b>
+            <p>凭证已加密落盘，现在就可以被路由选中。</p></div>
+        </div>
+
+        <table class="kv-t">
+          <tbody>
+            <tr><td>渠道</td><td><span class="ch k1"><span class="k"></span>QoderCN</span></td></tr>
+            <tr><td>账号</td><td><b>demo-qoder</b><div class="hint mono">a1b2c3d4…e5f6</div></td></tr>
+            <tr><td class="num">余额</td><td class="num">477 Credits</td></tr>
+            <tr><td>可用模型</td><td class="num">14</td></tr>
+            <tr><td>签到</td><td><span class="pill good"><span class="i">✓</span><span class="swatch"></span>已领取 +100</span></td></tr>
+          </tbody>
+        </table>
+
+        <div class="hint" style="margin-top:12px">
+          下一步会自动跑一次该渠道的健康探测 —— 判据是「真的收到内容」，
+          探测通过前该号不参与路由。
+        </div>
+
+        <div style="display:flex;gap:8px;margin-top:14px">
+          <a class="btn primary" href="02-accounts.html" style="text-decoration:none;display:inline-flex;align-items:center">完成，回到账号页</a>
+          <button class="btn" onclick="pgShow('v-signin')">返回登录</button>
+        </div>
+      </section>
+
+      <!-- ---------- 视图 E：授权失败（对应红线一：零静默失败） ---------- -->
+      <section id="v-oauth-fail" class="card" hidden>
+        <div class="steps">
+          <span class="step-tab done"><span class="n">✓</span>选渠道</span>
+          <span class="step-line"></span>
+          <span class="step-tab on"><span class="n">2</span>授权</span>
+          <span class="step-line"></span>
+          <span class="step-tab"><span class="n">3</span>绑号</span>
+        </div>
+
+        <h2>添加账号 · QoderCN</h2>
+        <div class="sub">授权没有完成 —— 下面是原因，不是「请重试」</div>
+
+        <div class="auth-err">
+          <span class="ico" style="font-size:14px;line-height:1.3">×</span>
+          <div>
+            <b>授权失败 · kind=UpstreamFault</b>
+            <span>上游登录接口返回 503，与本地配置无关。</span>
+            <span class="mono">GET https://qoder.com/api/auth/device → 503 Service Unavailable（上游原话：&quot;login service temporarily unavailable&quot;）</span>
+          </div>
+        </div>
+
+        <table class="kv-t">
+          <tbody>
+            <tr><td>判定</td><td><b>上游故障</b> · 不计入账号错误</td></tr>
+            <tr><td>建议</td><td>稍后重试；若持续，到「设置 → 渠道开关」把该渠道暂停</td></tr>
+            <tr><td>已落日志</td><td class="mono">requests.db · 可过滤 kind=UpstreamFault</td></tr>
+          </tbody>
+        </table>
+
+        <div style="display:flex;gap:8px;margin-top:14px">
+          <button class="btn primary" onclick="pgShow('v-oauth')">重试授权</button>
+          <a class="btn" href="05-logs.html" style="text-decoration:none;display:inline-flex;align-items:center">查看日志</a>
+        </div>
+
+        <p class="auth-alt"><a href="#" onclick="pgShow('v-signin');return false">取消，返回登录</a></p>
+      </section>
+
+      <p class="auth-alt" style="margin-top:18px">
+        原型视图：<a href="#signin" onclick="pgShow('v-signin')">登录</a> ·
+        <a href="#setup" onclick="pgShow('v-setup')">首次设置</a> ·
+        <a href="#oauth" onclick="pgShow('v-oauth')">渠道授权</a> ·
+        <a href="index.html">全部原型</a>
+      </p>
+    </div>
+  </main>
+</div>
+<script src="assets/poolgate.js"></script>
+<script>
+  // 视图切换：#signin / #setup / #oauth，供手工查看与截图
+  var PG_VIEWS = ['v-signin', 'v-setup', 'v-oauth', 'v-oauth-done', 'v-oauth-fail'];
+  window.pgShow = function (id) {
+    PG_VIEWS.forEach(function (v) {
+      var el = document.getElementById(v);
+      if (el) el.hidden = (v !== id);
+    });
+    // 截图脚本用 data-view 标记当前视图
+    document.documentElement.setAttribute('data-view', id);
+  };
+  window.pgTogglePw = function (inputId, btn) {
+    var i = document.getElementById(inputId);
+    if (!i) return;
+    var show = i.type === 'password';
+    i.type = show ? 'text' : 'password';
+    btn.textContent = show ? '隐藏' : '显示';
+  };
+  window.pgFail = function () {
+    var b = document.getElementById('errBox');
+    if (b) { b.hidden = false; }
+  };
+  window.pgSetupNext = function (btn) {
+    var cur = btn.getAttribute('data-step') || '0';
+    if (cur === '0') {
+      btn.setAttribute('data-step', '1');
+      document.querySelector('#v-setup .step-tab.on .n').textContent = '✓';
+      document.querySelector('#v-setup h2').textContent = '正在创建…';
+      btn.textContent = '模拟：创建完成';
+    } else {
+      location.href = '02-accounts.html';
+    }
+  };
+  // 二维码示意点阵：确定性伪随机，避免每次刷新闪烁
+  (function () {
+    var g = document.getElementById('qrDots');
+    if (!g) return;
+    var s = 20260924, out = '';
+    for (var y = 0; y < 33; y++) {
+      for (var x = 0; x < 33; x++) {
+        s = (s * 1103515245 + 12345) & 0x7fffffff;
+        var inCorner = (x < 9 && y < 9) || (x > 23 && y < 9) || (x < 9 && y > 23);
+        if (!inCorner && ((s >> 16) & 1)) out += '<rect x="' + x + '" y="' + y + '" width="1" height="1"/>';
+      }
+    }
+    g.innerHTML = out;
+  })();
+  document.addEventListener('DOMContentLoaded', function () {
+    var apply = function () {
+      var h = (location.hash || '').replace('#', '');
+      var map = { signin: 'v-signin', setup: 'v-setup', oauth: 'v-oauth' };
+      pgShow(map[h] || 'v-signin');
+    };
+    apply();
+    // 同文档内 hash 变化（无重新加载）也要切视图
+    window.addEventListener('hashchange', apply);
+  });
+</script>
+</body>
+</html>

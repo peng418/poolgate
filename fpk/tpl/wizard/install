@@ -1,0 +1,95 @@
+[
+ {
+  "stepTitle": "PoolGate 是什么",
+  "items": [
+   {
+    "type": "tips",
+    "helpText": "PoolGate 是 AI 账号池网关：把 QoderCN / WorkBuddyCN / TraeWork 三个渠道的订阅账号汇成一个池子，对外提供 OpenAI / Anthropic / Codex 三种兼容接口，供 ChatBox、NextChat、沉浸式翻译、Claude Code 等客户端使用。"
+   },
+   {
+    "type": "tips",
+    "helpText": "与 Wild Work 并存、互不影响：Wild Work 用 5013 端口，本应用用 5014，数据与凭证各自独立。"
+   }
+  ]
+ },
+ {
+  "stepTitle": "第一次打开要做什么（重点）",
+  "items": [
+   {
+    "type": "tips",
+    "helpText": "第一步：打开面板时先设置管理员密码（≥8 位，建议 12 位以上）。这个密码只用于登录本控制台，忘记后走命令行重置：poolgate admin reset-password。"
+   },
+   {
+    "type": "tips",
+    "helpText": "第二步：进「渠道授权」页，对要用的渠道点「授权」→ 浏览器完成上游登录 → 面板自动轮询到成功，凭证即刻落盘并进入账号池，不需要重启。"
+   },
+   {
+    "type": "tips",
+    "helpText": "注意：控制台登录（本地管理员密码）与渠道授权（上游账号）是两回事，两套都做过才能用。"
+   },
+   {
+    "type": "tips",
+    "helpText": "升级或从 Wild Work 迁移：poolgate migrate --from /vol6/@appconf/wildwork/auth 可一次性导入旧账号；若提示凭证读不了（跨应用目录默认 0600），需要以管理员身份把这些 json 复制到 PoolGate 的 conf/creds/。"
+   }
+  ]
+ },
+ {
+  "stepTitle": "客户端怎么接",
+  "items": [
+   {
+    "type": "tips",
+    "helpText": "接口地址：http://NAS的IP:5014/v1（IPv6 环境同样可用 http://[NAS的IPv6]:5014/v1）。面板「设置 → 服务」会把推断出的地址直接显示出来并支持一键复制。"
+   },
+   {
+    "type": "tips",
+    "helpText": "模型名要带渠道前缀：qodercn/…、workbuddy/…、traework/…；不带前缀默认走 QoderCN。面板「模型」页列出当前真实可用的模型；若体检发现某些模型挂死，可在设置里打开「只下发可用模型」，客户端就只会看到体检通过的那些。"
+   },
+   {
+    "type": "tips",
+    "helpText": "鉴权用 API Key：面板「设置 → 鉴权」里点「显示明文」即可复制（也可一键「重新生成」）；请求头带 Authorization: Bearer <key>。Key 存放在应用数据目录的 config.json（0600），面板与日志不会自动记录它。"
+   },
+   {
+    "type": "tips",
+    "helpText": "三种入口：OpenAI 客户端用 /v1/chat/completions；Claude 客户端用 /v1/messages；Codex 用 /v1/responses。"
+   }
+  ]
+ },
+ {
+  "stepTitle": "账号池与「不骗人」的故障处理",
+  "items": [
+   {
+    "type": "tips",
+    "helpText": "自动切换：某个账号被限流或异常时按错误类型分档冷却（限流 60 秒、额度耗尽 12 小时），并自动换到下一个健康账号。"
+   },
+   {
+    "type": "tips",
+    "helpText": "上游故障不误杀账号：上游 5xx / 目录不可用只记渠道问题，不计入账号错误，不会把好号冷却掉。"
+   },
+   {
+    "type": "tips",
+    "helpText": "失败一定带原因：任何上游异常都会回给客户端结构化错误（kind + 上游原话），并在面板「日志」页留下错误分类，不会出现「不回复也不报错」。"
+   },
+   {
+    "type": "tips",
+    "helpText": "空流算失败：上游返回 200 但一个字节内容都没有时，客户端会明确收到错误，而不是一个空的成功。"
+   }
+  ]
+ },
+ {
+  "stepTitle": "打开方式与数据位置",
+  "items": [
+   {
+    "type": "tips",
+    "helpText": "打开方式：走飞牛统一网关（/app/poolgate → 应用内 unix socket），在飞牛桌面窗口内弹窗打开，局域网与飞牛远程都能用。"
+   },
+   {
+    "type": "tips",
+    "helpText": "数据：账号凭证在应用配置目录的 creds/（0600，含 refresh_token，不会进日志、不会随导出泄露）；请求流水与配置在应用数据目录。"
+   },
+   {
+    "type": "tips",
+    "helpText": "日志：应用数据目录下的 poolgate.log，面板「日志」页也能看最近的请求流水。"
+   }
+  ]
+ }
+]
