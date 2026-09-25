@@ -206,8 +206,29 @@ func main() {
 			return n, nil
 		},
 	})
+	// 每账号串行 + 最小间隔（防封号）：间隔按渠道可配（设置里的 account_min_interval_sec），
+	// 缺省不限 —— 网页渠道应当设 1–3 秒，见 docs/06。
+	accGate := pool.NewGate(func(kind channel.Kind) time.Duration {
+		if settings == nil {
+			return 0
+		}
+		if m := settings.Get().AccountMinIntervalSec; m != nil {
+			if sec := m[string(kind)]; sec > 0 {
+				return time.Duration(sec) * time.Second
+			}
+		}
+		return 0
+	})
+
+	if settings != nil {
+		if m := settings.Get().AccountMinIntervalSec; len(m) > 0 {
+			log.Printf("poolgate: 每账号最小请求间隔（秒）: %v（防封号用，见 docs/06）", m)
+		}
+	}
+
 	gw := gateway.New(accPool, keys, gateway.Options{
 		BasePath: *basePath, Log: reqLog, Excluded: exclusions, Health: healthyModels,
+		Gate: accGate,
 	})
 
 	// 启动时预热余额：余额只有问过上游才知道，不预热的话刚装完/刚重启的面板

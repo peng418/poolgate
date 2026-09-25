@@ -145,3 +145,20 @@ func TestOnlyHealthyModelsSetting(t *testing.T) {
 		t.Fatal("文件里没写过这个键时应保持默认的 false")
 	}
 }
+
+// 每账号最小间隔（防封号）必须能真的落盘 + 读回：它漏过一次白名单，
+// 症状是「面板保存了、重启后失效」——留个用例钉住。
+func TestSettingsAccountMinIntervalRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	s := NewSettingsStore(dir)
+	if err := s.Update(func(cur *Settings) error {
+		cur.AccountMinIntervalSec = map[string]int{"doubao": 3, "qwen": 2}
+		return nil
+	}); err != nil {
+		t.Fatalf("保存失败: %v", err)
+	}
+	got := NewSettingsStore(dir).Get()
+	if got.AccountMinIntervalSec["doubao"] != 3 || got.AccountMinIntervalSec["qwen"] != 2 {
+		t.Fatalf("重启后配置丢了: %+v", got.AccountMinIntervalSec)
+	}
+}

@@ -26,12 +26,19 @@ type stickyEntry struct {
 	seen uint64 // 最近一次使用序号，用于 LRU 淘汰
 }
 
+// Gate 限制「同一账号的并发与频率」（防封号）。可为 nil（测试或不限）。
+type Gate interface {
+	Acquire(ctx context.Context, kind channel.Kind, uid string) (func(), error)
+}
+
 // Options 路由策略配置。
 type Options struct {
 	// MaxRetry 换号重试上限（不含首次尝试）。0 = 不换号。
 	MaxRetry int
 	// StickyRequests 同一会话粘性复用账号的请求数。
 	StickyRequests int
+	// Gate 每账号串行 + 最小间隔。为 nil 时不限。
+	Gate Gate
 }
 
 // DefaultOptions 默认策略。
@@ -55,6 +62,47 @@ func New(p *pool.Pool, o Options) *Router {
 		o.StickyRequests = 50
 	}
 	return &Router{p: p, opts: o, sticky: map[string]stickyEntry{}}
+}
+
+// chat 是「取闸门 → 打上游 → 把释放挂到流上」的唯一入口。
+//
+// 为什么要包一层：闸门必须在**流读完或客户端断开时**释放，否则那个账号就被永久占住
+// （表现为「这个号以后一直排队超时」，比封号还难查）。
+func (r *Router) chat(ctx context.Context, ch channel.Channel, kind channel.Kind, cred channel.Credential, req channel.ChatRequest) (channel.Stream, error) {
+	release := func() {}
+	if r.opts.Gate != nil {
+		rel, err := r.opts.Gate.Acquire(ctx, kind, cred.UID)
+		if err != nil {
+			return nil, err
+		}
+		release = rel
+	}
+	st, err := ch.Chat(ctx, &cred, req)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	return &releaseOnClose{Stream: st, release: release}, nil
+}
+
+// releaseOnClose 在流关闭或读尽时释放闸门。
+type releaseOnClose struct {
+	channel.Stream
+	once    sync.Once
+	release func()
+}
+
+func (s *releaseOnClose) Next() (channel.ChatCompletionChunk, error) {
+	c, err := s.Stream.Next()
+	if err != nil {
+		s.once.Do(s.release)
+	}
+	return c, err
+}
+
+func (s *releaseOnClose) Close() error {
+	s.once.Do(s.release)
+	return s.Stream.Close()
 }
 
 // Result 是一次成功路由的结果：流 + 实际选中的账号。
@@ -84,7 +132,7 @@ func (r *Router) Route(ctx context.Context, ch channel.Channel, kind channel.Kin
 		preferred = "" // 粘性只作用于首次
 		tried[cred.UID] = true
 
-		stream, err := ch.Chat(ctx, &cred, req)
+		stream, err := r.chat(ctx, ch, kind, cred, req)
 		if err == nil {
 			r.setSticky(session, cred.UID)
 			return &Result{Stream: stream, Cred: cred}, nil
@@ -99,7 +147,7 @@ func (r *Router) Route(ctx context.Context, ch channel.Channel, kind channel.Kin
 		if ok && credentialKind(k) {
 			if nc, rerr := r.p.RefreshNow(ctx, kind, cred); rerr == nil && nc != nil {
 				cred = *nc
-				if stream, err = ch.Chat(ctx, &cred, req); err == nil {
+				if stream, err = r.chat(ctx, ch, kind, cred, req); err == nil {
 					r.setSticky(session, cred.UID)
 					return &Result{Stream: stream, Cred: cred}, nil
 				}

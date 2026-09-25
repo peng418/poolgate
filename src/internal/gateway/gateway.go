@@ -47,6 +47,8 @@ type Options struct {
 	// Excluded 是「因健康度被剔除下发」的模型集合（F4.4）。
 	// 被剔除的模型不出现在 /v1/models，也不参与路由。可为 nil。
 	Excluded Excluder
+	// Gate 每账号串行 + 最小间隔（防封号，见 docs/06）。可为 nil。
+	Gate router.Gate
 	// Health 返回最近一次体检的结论索引，用于「只下发可用模型」（F4.5）。
 	//
 	// 与 Excluded 分开：Excluded 是人工裁定（关掉某个模型），这里跟着体检结论走，
@@ -62,8 +64,10 @@ type Excluder interface {
 
 // New 建立网关服务。
 func New(p *pool.Pool, keys KeyVerifier, o Options) *Server {
+	ro := router.DefaultOptions()
+	ro.Gate = o.Gate
 	return &Server{
-		pool: p, router: router.New(p, router.DefaultOptions()),
+		pool: p, router: router.New(p, ro),
 		keys: keys, log: o.Log, basePath: o.BasePath, excluded: o.Excluded,
 		health: o.Health,
 	}

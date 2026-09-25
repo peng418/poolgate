@@ -48,14 +48,18 @@ type Settings struct {
 	OnlyHealthyModels bool `json:"only_healthy_models"`
 
 	// 签到与保活
-	CheckinTimes      []string                   `json:"checkin_times"`
-	KeepaliveHours    int                        `json:"keepalive_hours"`
-	CheckinEnabled    bool                       `json:"checkin_enabled"`
-	KeepaliveEnabled  bool                       `json:"keepalive_enabled"`
-	ChannelOverrides  map[string]ChannelOverride `json:"channel_overrides"`
-	LogRetentionDays  int                        `json:"log_retention_days"`
-	LogRetentionMaxMB int                        `json:"log_retention_max_mb"`
-	LastBackupAt      string                     `json:"last_backup_at,omitempty"`
+	CheckinTimes     []string                   `json:"checkin_times"`
+	KeepaliveHours   int                        `json:"keepalive_hours"`
+	CheckinEnabled   bool                       `json:"checkin_enabled"`
+	KeepaliveEnabled bool                       `json:"keepalive_enabled"`
+	ChannelOverrides map[string]ChannelOverride `json:"channel_overrides"`
+	// AccountMinIntervalSec 是「同一账号两次请求之间的最小间隔（秒）」，按渠道名索引。
+	// 0/缺省 = 不限。网页渠道（反爬敏感）应当设 1–3 秒 —— 同一账号连续猛打是
+	// 最容易被平台判成异常行为的模式（见 docs/06 防封号设计）。
+	AccountMinIntervalSec map[string]int `json:"account_min_interval_sec"`
+	LogRetentionDays      int            `json:"log_retention_days"`
+	LogRetentionMaxMB     int            `json:"log_retention_max_mb"`
+	LastBackupAt          string         `json:"last_backup_at,omitempty"`
 }
 
 // DefaultSettings 返回出厂设置。数值与原型 06-settings.html 一致。
@@ -138,9 +142,15 @@ func decodeSettings(raw []byte) Settings {
 	apply("checkin_enabled", &out.CheckinEnabled)
 	apply("keepalive_enabled", &out.KeepaliveEnabled)
 	apply("channel_overrides", &out.ChannelOverrides)
+	// 注意：这里是**白名单**，新字段忘了加进来就会被静默丢掉（本项就漏过一次，
+	// 表现为「面板保存了、重启后失效」）。加字段时务必同时加这一行 + settings_test 的用例。
+	apply("account_min_interval_sec", &out.AccountMinIntervalSec)
 	apply("log_retention_days", &out.LogRetentionDays)
 	apply("log_retention_max_mb", &out.LogRetentionMaxMB)
 	apply("last_backup_at", &out.LastBackupAt)
+	if out.AccountMinIntervalSec == nil {
+		out.AccountMinIntervalSec = map[string]int{}
+	}
 	if out.CooldownSeconds == nil {
 		out.CooldownSeconds = map[string]int{}
 	}

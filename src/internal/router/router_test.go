@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"time"
 
 	"poolgate/internal/channel"
 	"poolgate/internal/errs"
@@ -432,5 +433,86 @@ func TestAuthFailureFailsOverToAnotherAccount(t *testing.T) {
 	}
 	if res.Cred.UID != "good" {
 		t.Fatalf("应选到好号，实际 %s", res.Cred.UID)
+	}
+}
+
+// fakeGate 记录闸门的取用与释放次数。
+type fakeGate struct {
+	mu       sync.Mutex
+	acquired int
+	released int
+	err      error
+}
+
+func (g *fakeGate) Acquire(context.Context, channel.Kind, string) (func(), error) {
+	if g.err != nil {
+		return nil, g.err
+	}
+	g.mu.Lock()
+	g.acquired++
+	g.mu.Unlock()
+	return func() {
+		g.mu.Lock()
+		g.released++
+		g.mu.Unlock()
+	}, nil
+}
+
+// 闸门必须在**流读尽或关闭时**释放：漏了会让账号被永久占住（表现为「这个号以后一直排队超时」，
+// 比封号还难查）。这里把两条出口路径都钉住。
+func TestRouterReleasesGate(t *testing.T) {
+	for _, closeEarly := range []bool{true, false} {
+		p := newPool(channel.QoderCN)
+		ch := &fakeChannel{kind: channel.QoderCN, chat: func(*channel.Credential) (channel.Stream, error) {
+			return &emptyStream{}, nil // 一个 chunk 都没有：读一次就 EOF
+		}}
+		gate := &fakeGate{}
+		r := New(p, Options{MaxRetry: 0, StickyRequests: 1, Gate: gate})
+
+		res, err := r.Route(context.Background(), ch, channel.QoderCN, "", channel.ChatRequest{Model: "m"})
+		if err != nil {
+			t.Fatalf("Route 失败: %v", err)
+		}
+		if closeEarly {
+			_ = res.Stream.Close()
+		} else {
+			for {
+				if _, err := res.Stream.Next(); err != nil {
+					break
+				}
+			}
+		}
+		gate.mu.Lock()
+		got := gate.released
+		gate.mu.Unlock()
+		if gate.acquired != 1 || got != 1 {
+			t.Fatalf("closeEarly=%v 时闸门没释放：acquired=%d released=%d", closeEarly, gate.acquired, got)
+		}
+		// 再取一次：说明锁确实被放掉了（没放掉这里会等到 ctx 超时）
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+		rel, err := gate.Acquire(ctx, channel.QoderCN, "A")
+		if err != nil {
+			t.Fatalf("闸门没真正释放: %v", err)
+		}
+		rel()
+	}
+}
+
+// 取闸门失败（例如该账号排队超时）时不该调用上游，也不该把号冷却掉。
+func TestRouterGateAcquireFailureSkipsUpstream(t *testing.T) {
+	p := newPool(channel.QoderCN)
+	called := false
+	ch := &fakeChannel{kind: channel.QoderCN, chat: func(*channel.Credential) (channel.Stream, error) {
+		called = true
+		return &emptyStream{}, nil
+	}}
+	gate := &fakeGate{err: errs.New(errs.SoftRate, "排队超时")}
+	r := New(p, Options{MaxRetry: 0, StickyRequests: 1, Gate: gate})
+	if _, err := r.Route(context.Background(), ch, channel.QoderCN, "", channel.ChatRequest{Model: "m"}); err == nil {
+		t.Fatal("取闸门失败时应返回错误")
+	}
+	if called {
+		t.Fatal("取闸门失败时不该打到上游")
 	}
 }
