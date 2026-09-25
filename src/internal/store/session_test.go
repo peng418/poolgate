@@ -45,7 +45,7 @@ func TestLockAfterMaxFailures(t *testing.T) {
 	var lastRemain int
 	var locked bool
 	for i := 0; i < MaxFailures; i++ {
-		lastRemain, locked = s.RecordFailure("192.168.1.7")
+		lastRemain, locked = s.RecordFailure("192.0.2.7")
 	}
 	if !locked {
 		t.Fatal("达到上限后应锁定")
@@ -53,7 +53,7 @@ func TestLockAfterMaxFailures(t *testing.T) {
 	if lastRemain != 0 {
 		t.Fatalf("锁定后剩余次数应为 0，实际 %d", lastRemain)
 	}
-	remain, locked := s.CheckLock("192.168.1.7")
+	remain, locked := s.CheckLock("192.0.2.7")
 	if !locked {
 		t.Fatal("锁定窗口内 CheckLock 应报告锁定")
 	}
