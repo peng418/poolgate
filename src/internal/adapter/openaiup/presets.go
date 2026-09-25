@@ -63,11 +63,15 @@ func Presets() []Preset {
 			Note:          "豆包模型的官方出口；模型名要用方舟的 endpoint id 或模型名",
 		},
 		{
-			Name: "deepseek", DisplayName: "DeepSeek 官方",
+			// 名字用 deepseek-api 而不是 deepseek：deepseek 已经被「DeepSeek 网页版」
+			// 这个登录式渠道占用了（0.4.9 起）。两者是同一个上游的两条路：
+			// 网页登录态走内置渠道，官方 API（按量付费）走接入源 —— 前缀必须能区分开。
+			Name: "deepseek-api", DisplayName: "DeepSeek 官方 API",
 			BaseURL:       "https://api.deepseek.com/v1",
 			SupportsTools: true,
 			FreeTier:      "无免费额度（按量付费）",
 			RealName:      "注册即用",
+			Note:          "与内置的「DeepSeek 网页版」渠道是两个上游：这条要 API Key，按量付费",
 		},
 		{
 			Name: "moonshot", DisplayName: "Kimi（Moonshot）",

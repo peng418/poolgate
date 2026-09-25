@@ -262,11 +262,12 @@
           </div>
 
           <h2>添加账号 · {{ auth.channel }}</h2>
-          <div class="sub" v-if="qrUsable">用手机扫下面的二维码，在<b>手机上</b>完成 <b>{{ auth.channel }}</b> 授权，账号会自动回到池子里（桌面不用跳转）</div>
+          <div class="sub" v-if="pasteLogin">{{ auth.pasteHint }}</div>
+          <div class="sub" v-else-if="qrUsable">用手机扫下面的二维码，在<b>手机上</b>完成 <b>{{ auth.channel }}</b> 授权，账号会自动回到池子里（桌面不用跳转）</div>
           <div class="sub" v-else>这个渠道<b>没法扫码</b>（它的回调地址被上游锁死在本机）：点下面的「打开授权页」在浏览器里完成，
             或者完成之后用「手工回填」把那串地址粘回来</div>
 
-          <div class="qr-wrap">
+          <div class="qr-wrap" v-if="!pasteLogin">
             <div class="qr-frame" :data-tip="qrTip">
               <!-- 真二维码：内容是这次授权的地址，手机扫完在手机上完成登录，
                    桌面不用跳转（设备码流与 state 轮询流天然支持这种「另一台设备完成」）。 -->
@@ -289,6 +290,21 @@
             </div>
           </div>
 
+          <div class="qr-state" v-else style="margin:12px 0 2px">
+            <span v-if="auth.status==='waiting'" class="spin" aria-hidden="true"></span>
+            <span>{{ auth.status==='waiting' ? qrScanHint + ' · 剩余 ' + authCountdown : authLabel }}</span>
+          </div>
+
+          <div class="banner warn" v-if="pasteLogin">
+            <span class="ico">🔒</span>
+            <div><b>登录要在你自己的浏览器里完成，面板只收一个凭证，不收密码</b>
+              <p>按下面输入框上方的说明拿到凭证后，整段粘进去即可 ——
+                 各渠道要粘的东西不一样（token / Cookie / 请求头里的一行），
+                 面板会把这个渠道的步骤写清楚。</p>
+              <p class="hint">凭证只用来调这个渠道的网页接口；之后若在浏览器里重新登录过，
+                 回来把新凭证再粘一次即可。</p></div>
+          </div>
+
           <div class="banner warn" v-if="callbackLockedLocal && !browserIsLocal && auth.url">
             <span class="ico">!</span>
             <div><b>这个渠道的回调地址被上游锁死在本机（127.0.0.1），扫码对它无效</b>
@@ -305,7 +321,7 @@
                  手机扫码或别的电脑的浏览器都能把授权码送回来。</p></div>
           </div>
 
-          <div class="banner" style="margin:12px 0 0">
+          <div class="banner" style="margin:12px 0 0" v-if="!pasteLogin">
             <span class="ico">↗</span>
             <div><b>{{ qrUsable ? '没有手机 / 扫码不方便？用浏览器打开授权页' : '在浏览器里打开授权页' }}</b>
               <p>{{ qrUsable ? '扫码那条路更省事；这里只是兜底。' : '这个渠道的授权只能在浏览器里完成。' }}
@@ -316,27 +332,28 @@
           <table class="kv-t" style="margin-top:12px">
             <tbody>
               <tr><td>登录方式</td><td>{{ authMethod }}</td></tr>
-              <tr v-if="auth.url"><td>授权地址</td><td class="mono" style="word-break:break-all">{{ auth.url }}</td></tr>
+              <tr v-if="auth.url"><td>{{ pasteLogin ? '登录地址' : '授权地址' }}</td><td class="mono" style="word-break:break-all">{{ auth.url }}</td></tr>
               <tr><td>超时</td><td class="num">5 分钟</td></tr>
             </tbody>
           </table>
 
-          <details class="cb-paste" v-if="auth.url">
-            <summary>浏览器跳回来打不开？把地址栏里的整串地址粘到这里</summary>
+          <details class="cb-paste" :open="pasteLogin">
+            <summary>{{ pasteLogin ? '粘贴凭证（在此输入）' : '浏览器跳回来打不开？把地址栏里的整串地址粘到这里' }}</summary>
             <div class="copy-row" style="margin-top:8px">
-              <input v-model="cbRaw" placeholder="http://127.0.0.1:54321/callback?code=…（只贴 code 也行）"
+              <input v-model="cbRaw" :placeholder="cbPlaceholder"
                 @keyup.enter="submitCallback">
               <button class="btn sm" @click="submitCallback" :disabled="busy">提交</button>
             </div>
-            <span class="hint">
+            <span class="hint" v-if="pasteLogin" style="overflow-wrap:anywhere">{{ pasteHintText }}</span>
+            <span class="hint" v-else>
               授权完成后浏览器会跳到回调地址；如果那个页面打不开（从别的机器操作时很常见），
               把地址栏里的整串内容复制过来即可 —— 面板拿里面的授权码去兑换，不改任何回调地址、不额外开放端口。
             </span>
           </details>
 
           <div style="display:flex;gap:8px;margin-top:14px" class="row">
-            <button class="btn primary" v-if="auth.url" @click="openAuth">打开授权页</button>
-            <button class="btn" v-if="auth.url" @click="copyAuth">复制链接</button>
+            <button class="btn primary" v-if="auth.url" @click="openAuth">{{ pasteLogin ? '打开登录页' : '打开授权页' }}</button>
+            <button class="btn" v-if="auth.url" @click="copyAuth">{{ pasteLogin ? '复制登录地址' : '复制链接' }}</button>
             <!-- 取消按钮不设 v-if：服务端可能正在跑一次授权而面板没拿到地址
                  （授权失败后重试、或页面刷新过），这时用户最需要的就是「取消掉重来」。 -->
             <button class="btn danger" @click="cancelAuth">取消授权</button>
@@ -700,9 +717,11 @@
                 </td>
                 <td><span class="source-type">API Key</span></td>
                 <td>
-                  <span class="pill" :class="p.status==='paused'?'pause':'good'">
+                  <span v-if="p.conflict" class="pill warn"><span class="i">!</span><span class="swatch"></span>未挂载</span>
+                  <span v-else class="pill" :class="p.status==='paused'?'pause':'good'">
                     <span class="i">{{ p.status==='paused'?'‖':'✓' }}</span><span class="swatch"></span>{{ p.status==='paused'?'已暂停':'正常' }}</span>
-                  <div class="hint">{{ toolModeText(p) }}</div>
+                  <div class="hint" v-if="p.conflict">{{ p.conflict_note }}</div>
+                  <div class="hint" v-else>{{ toolModeText(p) }}</div>
                 </td>
                 <td>
                   <div class="hint mono">{{ p.api_key_masked }}</div>
@@ -1403,7 +1422,7 @@ createApp({
     const logFilter=reactive({channel:'all',status:'all',range:'today'});
     const diag=reactive({channel:'',result:null});
     const auth=ref({channel:'',channelName:'',url:'',expires:'',status:'idle',message:'',kind:'',upstream:'',
-      account:null,modelCount:0,balance:null,balanceError:'',callbackBase:''});
+      account:null,modelCount:0,balance:null,balanceError:'',callbackBase:'',pasteHint:''});
     let authTimer=null, authLeft=0;
 
     const navItems=[
@@ -1652,7 +1671,17 @@ createApp({
       const m={
         qodercn:'设备码（扫码或浏览器授权）',qodercom:'设备码（扫码或浏览器授权）',
         workbuddy:'state 轮询（扫码或浏览器授权）',workbuddyai:'state 轮询（扫码或浏览器授权）',
-        traework:'授权码回调',qwenwork:'授权码 + 本机回调（PKCE）'
+        traework:'授权码回调',qwenwork:'授权码 + 本机回调（PKCE）',
+        gemini:'OAuth 授权码（扫码或浏览器授权）',deepseek:'浏览器登录后粘贴 userToken',
+        kimi:'浏览器登录后粘贴 refresh token',
+        chatglm:'浏览器登录后粘贴 chatglm_refresh_token',
+        doubao:'浏览器登录后粘贴整行 Cookie',
+        yuanbao:'浏览器登录后粘贴 x-uskey',
+        chatgpt:'浏览器登录后粘贴 accessToken',anthropic:'OAuth 授权码（浏览器授权）',
+        codebuddy:'浏览器授权（扫码或授权链接）',copilot:'GitHub 设备码（浏览器里输验证码）',
+        kiro:'粘贴刷新令牌（refreshToken）',iflow:'粘贴 iFlow CLI 的 apiKey',
+        lingma:'粘贴 IDE 登录缓存（cache/user、cache/id）',antigravity:'OAuth 授权码（浏览器授权）',
+        windsurf:'粘贴 Windsurf/Devin 客户端的 session token'
       }[auth.value.channel]||'浏览器授权';
       // 回调形态不同，叫法必须跟着变：回调到面板地址时还说「本机回调」是在误导用户
       // （他会以为只能在本机浏览器完成）。
@@ -1670,14 +1699,22 @@ createApp({
     //   · 回调锁死在本机（千问办公：redirect_uri 必须命中上游预注册清单）→ 扫码没用，只能本机浏览器或手工回填
     //   · 回调用面板自己的地址（TraeWork：auth_callback_url 由我们传）→ 手机/别的电脑都能完成
     //   · 上游轮询（设备码流 / state 流）→ 另一台设备完成即可，扫码是最省事的
+    //   · 粘贴式（DeepSeek：登录凭证是浏览器 localStorage 里的 userToken）→
+    //     服务端在 /api/login/start 的响应里带上 paste_hint，面板切到粘贴形态
     const callbackLockedLocal=computed(()=>auth.value.channel==='qwenwork');
     const callbackViaPanel=computed(()=>auth.value.channel==='traework'&&!!auth.value.callbackBase);
+    const pasteLogin=computed(()=>!!auth.value.pasteHint);
+    // 粘贴形态的引导语**来自服务端**（就是各渠道 Hint() 的返回值）：Kimi 要 refresh token、
+    // 豆包要整行 Cookie、通义灵码要 IDE 的缓存文件……文案必须跟着渠道走 ——
+    // 把它硬编码成某一家的说法，别的渠道的用户会去找一个根本不存在的东西（上一版就是这个毛病）。
+    const pasteHintText=computed(()=>auth.value.pasteHint||'在浏览器登录后，把凭证整段粘到下面的输入框里');
     const browserHost=location.hostname||'';
     const browserIsLocal=['127.0.0.1','localhost','::1','[::1]'].includes(browserHost);
 
     // 真二维码：内容是这次授权的地址。手机扫码 → 在手机上登录 → 面板轮询到结果。
     // 库缺失或地址过长时返回空串，界面落到占位图 + 「打开授权页」按钮（不假装有码）。
-    const qrUsable=computed(()=>!!auth.value.url&&!callbackLockedLocal.value);
+    // 粘贴式渠道（DeepSeek）没有「授权地址」这一说 —— 面板不画码、只引导粘贴。
+    const qrUsable=computed(()=>!!auth.value.url&&!callbackLockedLocal.value&&!pasteLogin.value);
     const authQr=computed(()=>{
       if(!qrUsable.value)return '';
       try{
@@ -1687,21 +1724,29 @@ createApp({
         return qr.createSvgTag({cellSize:1,margin:2,scalable:true});
       }catch(e){return '';}
     });
-    const qrTip=computed(()=>callbackLockedLocal.value
+    const qrTip=computed(()=>pasteLogin.value
+      ? '这个渠道不用扫码：登录凭证要从你自己的浏览器里取出来粘到下面'
+      : callbackLockedLocal.value
       ? '该渠道的回调地址被上游锁死在本机，扫码无效 —— 请用下面的「打开授权页」或「手工回填」'
       : '手机扫码完成授权（桌面不用跳转）');
-    const qrScanHint=computed(()=>callbackLockedLocal.value?'等待浏览器完成授权':'等待扫码完成授权');
+    const qrScanHint=computed(()=>pasteLogin.value
+      ? '等你把凭证粘回来'
+      : callbackLockedLocal.value?'等待浏览器完成授权':'等待扫码完成授权');
 
-    // 手工回填回调地址（浏览器跳回本机打不开时的兜底）
+    // 手工回填：粘贴式渠道（DeepSeek 粘 userToken）与回调回填共用同一个输入框，
+    // 只是占位文案随形态变化（回调渠道贴的是地址串，粘贴渠道贴的是凭证串）。
     const cbRaw=ref('');
+    const cbPlaceholder=computed(()=>pasteLogin.value
+      ? '把凭证整段粘到这里（渠道不同，要粘的东西也不同，见上面的说明）'
+      : 'http://127.0.0.1:54321/callback?code=…（只贴 code 也行）');
     const submitCallback=async()=>{
       if(busy.value)return;
-      if(!cbRaw.value.trim())return toast('先粘贴回调地址或授权码');
+      if(!cbRaw.value.trim())return toast(pasteLogin.value?'先把 userToken 粘进来':'先粘贴回调地址或授权码');
       busy.value=true;
       try{
         await post('/api/login/callback',{raw:cbRaw.value.trim()});
         cbRaw.value='';
-        toast('已提交，面板会在下一次轮询时兑换');
+        toast(pasteLogin.value?'已提交，正在验证 userToken…':'已提交，面板会在下一次轮询时兑换');
       }catch(e){fail(e);}
       finally{busy.value=false;}
     };
@@ -2078,13 +2123,15 @@ createApp({
           auth.value.message=r.error.message;auth.value.upstream=r.error.upstream||'';
           return;
         }
-        auth.value.url=r.auth_url||'';auth.value.expires=r.expires_at||'';auth.value.callbackBase=r.callback_base||'';auth.value.status='waiting';
+        auth.value.url=r.auth_url||'';auth.value.expires=r.expires_at||'';auth.value.callbackBase=r.callback_base||'';
+        auth.value.pasteHint=r.paste_hint||'';auth.value.status='waiting';
         authLeft=r.expires_at?Math.max(0,Math.round((new Date(r.expires_at)-Date.now())/1000)):300;
         // 能出二维码就不抢着开浏览器：用户本该拿手机扫这个码（桌面不用跳转）。
         // 只有「这个渠道出不了码」或「码没生成出来（库没加载/地址过长）」时才自动打开授权页。
+        // 粘贴式渠道（DeepSeek 粘 userToken）没有授权地址这回事，直接落到粘贴引导。
         // awit 一下再判断：authQr 依赖刚写入的 auth.url，等 Vue 重算完再决定。
         await nextTick();
-        if(!authQr.value)window.open(r.auth_url,'_blank');
+        if(!authQr.value&&!pasteLogin.value)window.open(r.auth_url,'_blank');
         authTimer=setInterval(pollAuth,2000);
       }catch(e){auth.value.status='error';auth.value.message=e.message;}
     };
@@ -2251,7 +2298,7 @@ createApp({
       failRate,upstreamShare,allProbedOK,dailyHeight,ttftBars,activeGroups,pausedGroups,
       catalogChannels,filteredModels,modelGroups,errorKinds,filteredLogs,historyDesc,failedResults,
       authLabel,authCountdown,authMethod,policyRows,pwStrength,
-      callbackLockedLocal,callbackViaPanel,qrUsable,authQr,qrTip,qrScanHint,cbRaw,submitCallback,
+      callbackLockedLocal,callbackViaPanel,pasteLogin,pasteHintText,qrUsable,authQr,qrTip,qrScanHint,cbRaw,cbPlaceholder,submitCallback,
       channelName,channelClass,statusPill,statusIcon,statusText,sevLabel,
       accountPill,accountIcon,accountText,checkinPill,checkinText,logPill,logIcon,logText,accountSections,catOf,
       srcLabel,humanCtx,capsText,shortUid,fmtNum,fmtTime,fmtDate,barPct,barColor,

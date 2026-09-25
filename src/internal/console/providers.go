@@ -46,6 +46,11 @@ type providerOut struct {
 	AddedAt       string   `json:"added_at,omitempty"`
 	Status        string   `json:"status"`        // active | paused（来自注册表，渠道开关可改）
 	AccountCount  int      `json:"account_count"` // 合成账号数（正常是 1）
+	// Conflict 表示这条来源的名字被内置渠道占用，因而**没有被挂载**（见 boot.MountProvider）。
+	// 必须显式告诉用户：不然他会看到一条「正常」的来源却怎么也调不通，而真正的原因
+	// 是它压根没进注册表。改个名字就好了。
+	Conflict     bool   `json:"conflict,omitempty"`
+	ConflictNote string `json:"conflict_note,omitempty"`
 }
 
 // modeOf 归一化工具调用档位（空值按旧配置推：支持→native，不支持→none）。
@@ -72,6 +77,12 @@ func maskKey(k string) string {
 	return k[:6] + "…" + k[len(k)-4:]
 }
 
+// conflictNote 说明冲突的后果与怎么改（文案要能直接指导操作，不能只说「冲突」）。
+func conflictNote(name string) string {
+	return "这个名字被内置渠道占用了，所以这条来源没有被挂载：内置渠道优先。" +
+		"改成别的名字（比如 " + name + "-api）保存后即可生效。"
+}
+
 // handleProviders 列出全部 API Key 式来源（含预设，供「添加」向导直接用）。
 func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -95,6 +106,8 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request) {
 				SupportsTools: c.SupportsTools, ToolsMode: modeOf(c), Notes: c.Notes,
 				Preset: c.Preset, AddedAt: c.AddedAt,
 				Status: status, AccountCount: n,
+				Conflict:     store.IsReserved(c.Name),
+				ConflictNote: conflictNote(c.Name),
 			})
 		}
 	}

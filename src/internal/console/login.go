@@ -38,6 +38,9 @@ type loginStartResp struct {
 	// CallbackBase 是这次授权给上游的回调基址（TraeWork 用它把 127.0.0.1 换成面板地址）。
 	// 面板如实告诉用户「回调打到哪台机器」——这决定了扫码/别的浏览器能不能完成。
 	CallbackBase string `json:"callback_base,omitempty"`
+	// PasteHint 是给「粘贴式」渠道（实现 CallbackAcceptor）的引导语，如 DeepSeek：
+	// 它的凭证是用户在自己浏览器登录后粘回来的 userToken，面板据此切换引导文案。
+	PasteHint string `json:"paste_hint,omitempty"`
 }
 
 // loginPollResp 是轮询结果：pending / ok 两态，失败直接走结构化错误。
@@ -210,6 +213,22 @@ func (m *loginManager) finish(al *activeLogin) {
 	al.sess.Cancel()
 }
 
+// HintProvider 返回当前授权会话的粘贴引导语（DeepSeek 这类「粘回凭证」的渠道实现它）；
+// 没有进行中的授权或渠道不给引导语时 ok=false。
+func (m *loginManager) HintProvider() (string, bool) {
+	m.mu.Lock()
+	al := m.active
+	m.mu.Unlock()
+	if al == nil {
+		return "", false
+	}
+	hp, ok := al.sess.(interface{ Hint() string })
+	if !ok || hp.Hint() == "" {
+		return "", false
+	}
+	return hp.Hint(), true
+}
+
 // authorizerFor 从注册表取该渠道的授权能力。没注册或没实现都不算错误，
 // 但要能说清楚「为什么这个渠道点不了授权」。
 func authorizerFor(kind channel.Kind) (channel.Authorizer, bool) {
@@ -253,7 +272,14 @@ func (s *Server) handleLoginStart(w http.ResponseWriter, r *http.Request) {
 		writeErrFromErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, loginStartResp{Channel: req.Channel, AuthURL: url, Expires: until.Format(time.RFC3339), CallbackBase: base})
+	// 粘贴式渠道（实现 CallbackAcceptor 且会话暴露引导语，如 DeepSeek 粘 userToken）
+	// 把引导语带给前端：这类渠道的「授权」不是扫码/点授权页，而是用户在自己的浏览器
+	// 登录后把凭证粘回面板 —— 引导语里必须写清楚拿什么、怎么拿。
+	var pasteHint string
+	if hp, ok := s.login.HintProvider(); ok {
+		pasteHint = hp
+	}
+	writeJSON(w, http.StatusOK, loginStartResp{Channel: req.Channel, AuthURL: url, Expires: until.Format(time.RFC3339), CallbackBase: base, PasteHint: pasteHint})
 }
 
 func (s *Server) handleLoginPoll(w http.ResponseWriter, r *http.Request) {

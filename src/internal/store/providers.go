@@ -45,10 +45,55 @@ type ProviderConfig struct {
 	AddedAt   string `json:"added_at,omitempty"`
 }
 
-// builtinKinds 是六个内置登录式渠道的名字 —— key 式来源不能占用，否则会覆盖注册表里的实现。
-var builtinKinds = map[string]bool{
+// seedReservedKinds 是「已被内置登录式渠道占用」的名字的初始集合。
+//
+// 为什么需要它：来源名同时就是 channel.Kind。挂载来源走的是 registry.Register，
+// 而同 Kind 是**覆盖**语义 —— 用户给来源起名 "deepseek"，就会把内置的 DeepSeek 渠道
+// 顶掉，面板上什么都没有变，实际已经换了一个上游。这是最难查的一类故障。
+//
+// 这张表是**种子**，不是全集：装配层启动时会把注册表里全部渠道名登记进来
+// （见 ReserveKinds），所以新增渠道不必记得回来改这里 —— 但漏了也不致命，
+// 因为真正拦住覆盖的是 boot.MountProvider 的那道闸。
+var seedReservedKinds = map[string]bool{
 	"qodercn": true, "qodercom": true, "traework": true,
 	"workbuddy": true, "workbuddyai": true, "qwenwork": true,
+	"qwen": true, "gemini": true, "deepseek": true, "kimi": true,
+	// 网页版/客户端登录式渠道（0.4.9 起陆续接入）：这些名字同样不能被 Key 式来源占用。
+	"chatglm": true, "doubao": true, "yuanbao": true, "codebuddy": true,
+	"copilot": true, "windsurf": true, "kiro": true, "iflow": true,
+	"lingma": true, "cursor": true, "antigravity": true, "chatgpt": true,
+	"anthropic": true,
+}
+
+var (
+	reservedMu sync.RWMutex
+	// reservedKinds 从种子出发，由 ReserveKinds 追加。
+	reservedKinds = func() map[string]bool {
+		m := make(map[string]bool, len(seedReservedKinds))
+		for k := range seedReservedKinds {
+			m[k] = true
+		}
+		return m
+	}()
+)
+
+// ReserveKinds 追加一批保留名（装配层用注册表里的实际渠道名调用）。
+// 幂等；重复调用只增不减 —— 保留集合缩小没有任何正当理由。
+func ReserveKinds(names ...string) {
+	reservedMu.Lock()
+	defer reservedMu.Unlock()
+	for _, n := range names {
+		if n = strings.ToLower(strings.TrimSpace(n)); n != "" {
+			reservedKinds[n] = true
+		}
+	}
+}
+
+// IsReserved 判断名字是否已被内置渠道占用（面板与校验都用它）。
+func IsReserved(name string) bool {
+	reservedMu.RLock()
+	defer reservedMu.RUnlock()
+	return reservedKinds[strings.ToLower(strings.TrimSpace(name))]
 }
 
 // nameRe 限制模型前缀的形状：小写字母数字与 - _，长度 2..32。
@@ -60,8 +105,8 @@ func (c ProviderConfig) Validate() error {
 	if !nameRe.MatchString(c.Name) {
 		return errors.New("名称只能用小写字母/数字/-/_，2–32 个字符，且以字母开头（它就是模型前缀）")
 	}
-	if builtinKinds[c.Name] {
-		return fmt.Errorf("名称 %q 与内置渠道重名，请换一个", c.Name)
+	if IsReserved(c.Name) {
+		return fmt.Errorf("名称 %q 与内置渠道重名，请换一个（内置渠道名会占用同名来源，不能用作前缀）", c.Name)
 	}
 	if !strings.HasPrefix(c.BaseURL, "http://") && !strings.HasPrefix(c.BaseURL, "https://") {
 		return errors.New("base_url 必须以 http:// 或 https:// 开头")

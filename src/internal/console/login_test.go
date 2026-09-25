@@ -488,6 +488,7 @@ type acceptSession struct {
 	url      string
 	raw      string
 	accepted int
+	hint     string
 }
 
 func (a *acceptSession) AuthURL() string { return a.url }
@@ -500,6 +501,7 @@ func (a *acceptSession) AcceptCallback(raw string) error {
 	a.raw = raw
 	return nil
 }
+func (a *acceptSession) Hint() string { return a.hint }
 
 // 手工回填回调地址：面板要把它转给当前这次授权，并且只对实现了该能力的渠道开放。
 func TestLoginCallbackHandoff(t *testing.T) {
@@ -540,5 +542,34 @@ func TestLoginCallbackRejectsUnsupportedChannel(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "不需要手工回填") {
 		t.Fatalf("应说明该渠道不需要回填，实际 %s", w.Body.String())
+	}
+}
+
+// 粘贴式渠道（实现 Hint() 的会话，如 DeepSeek 粘 userToken）：
+// /api/login/start 的响应要带上 paste_hint，面板据此切换成粘贴形态。
+func TestLoginStartExposesPasteHint(t *testing.T) {
+	sess := &acceptSession{url: "https://chat.deepseek.com", hint: "把 userToken 整段粘过来"}
+	ch := &fakeAuthChannel{kind: channel.DeepSeek, sess: &fakeSession{url: "u"}, sessOverride: sess}
+	h, token, _, _ := newLoginTestServer(t, ch)
+
+	w := authed(t, h, http.MethodPost, "/api/login/start", channelLoginReq{Channel: "deepseek"}, token)
+	if w.Code != http.StatusOK {
+		t.Fatalf("start 应 200，实际 %d %s", w.Code, w.Body.String())
+	}
+	var sr loginStartResp
+	json.Unmarshal(w.Body.Bytes(), &sr)
+	if sr.PasteHint != sess.hint {
+		t.Fatalf("应带出粘贴引导语，实际 %q", sr.PasteHint)
+	}
+
+	// 普通渠道（无 Hint 能力）不带这个字段，也不报错。
+	sess2 := &fakeSession{url: "u", pending: 1}
+	ch2 := &fakeAuthChannel{kind: channel.QoderCN, sess: sess2}
+	h2, token2, _, _ := newLoginTestServer(t, ch2)
+	w2 := authed(t, h2, http.MethodPost, "/api/login/start", channelLoginReq{Channel: "qodercn"}, token2)
+	var sr2 loginStartResp
+	json.Unmarshal(w2.Body.Bytes(), &sr2)
+	if sr2.PasteHint != "" {
+		t.Fatalf("普通渠道不应带 paste_hint，实际 %q", sr2.PasteHint)
 	}
 }

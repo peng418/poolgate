@@ -7,6 +7,7 @@ package boot
 
 import (
 	"context"
+	"log"
 	"strings"
 	"time"
 
@@ -31,7 +32,16 @@ func ProviderAdapter(cfg store.ProviderConfig) *openaiup.Adapter {
 //
 // 重复挂载是安全的：registry.Register 覆盖同 Kind，pool.AddFor 覆盖同 UID ——
 // 改配置（换 key / 换 base_url / 改能力位）后立刻生效，不需要重启进程。
+//
+// 唯一拒绝挂载的情况：名字与内置渠道重名。registry.Register 的「同 Kind 覆盖」在这里
+// 会变成**把内置渠道换成这个来源**（例如 0.4.3 时代用户建过一个叫 deepseek 的 API 来源，
+// 0.4.9 之后它就会把内置的 DeepSeek 网页渠道顶掉），面板上看不出任何异常。
+// 所以这里跳过挂载：内置渠道优先，冲突由面板标出来让人自己改名字。
 func MountProvider(cfg store.ProviderConfig, p *pool.Pool) {
+	if store.IsReserved(cfg.Name) {
+		log.Printf("poolgate: 接入源 %q 与内置渠道重名，已跳过挂载（内置渠道优先，请改名）", cfg.Name)
+		return
+	}
 	a := ProviderAdapter(cfg)
 	registry.Register(a, a.Spec())
 	if p != nil {
@@ -41,6 +51,12 @@ func MountProvider(cfg store.ProviderConfig, p *pool.Pool) {
 
 // UnmountProvider 摘除一个来源（删除接入源时调用）。
 func UnmountProvider(name string, p *pool.Pool) {
+	if store.IsReserved(name) {
+		// 从来没挂载过（见 MountProvider），所以也绝不能在这里 Remove ——
+		// 否则删掉一条同名来源会把内置渠道从注册表里摘掉。
+		log.Printf("poolgate: 接入源 %q 与内置渠道重名，未被挂载，无需摘除", name)
+		return
+	}
 	kind := channel.Kind(strings.ToLower(strings.TrimSpace(name)))
 	registry.Remove(kind)
 	if p != nil {

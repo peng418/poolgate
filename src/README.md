@@ -466,6 +466,84 @@ POST https://gateway.qwenwork.cn/api/v1/deviceToken/refresh
 实测：deviceToken 端点仍可用（垃圾 refresh_token → `401 {"errorCode":"INVALID_REFRESH_TOKEN",...}`），
 503 闸门只影响推理端点。协议说明同步写进了 `docs/03-渠道能力矩阵.md` 与适配器包头注释。
 
+### 0.5.0 — 「全部走登录式」：Kimi / 智谱清言 / 豆包 / 腾讯元宝
+
+按用户裁定：**不要 API Key 式接入，所有来源都用登录实现**（0.4.3 的「接入源」保持可用，
+但不再往里加适配器）。这一版把国内几个主流「网页版」平台接成渠道。它们的共同前提是：
+凭证来自**你自己浏览器里的登录态**，粘一次即可；服务端不与登录接口打交道 ——
+**不存密码、不在 NAS 上跑无头浏览器**。
+
+| 渠道 | 用户粘什么 / 怎么授权 | 上游协议 | 工具调用 |
+|---|---|---|---|
+| `kimi` | refresh token（推荐）或 access token | **Connect（gRPC-Web）**：5 字节信封 + JSON 帧流 | toolshim 模拟 |
+| `chatglm` | cookie `chatglm_refresh_token` | SSE；**每请求带自算签名**（时间戳变换 + md5） | toolshim 模拟 |
+| `doubao` | 整行 Cookie（含 `sessionid`） | 带事件名的 SSE；思考靠 `block_type=10040` 开关块 | toolshim 模拟 |
+| `yuanbao` | 请求头里的 `x-uskey`（整段头也行） | SSE；按 `type=think` / `type=text` 分流 | toolshim 模拟 |
+| `chatgpt` | `accessToken`（浏览器里搜 `"accessToken":"…"`） | sentinel 挑战 + 自算 PoW → `/backend-api/conversation` 的 patch 流 | toolshim 模拟 |
+| `anthropic` | **OAuth 授权码**（Claude 订阅登录，浏览器授权后粘回 code） | Messages API（原生协议） | 原生 |
+| `codebuddy` | 浏览器授权（与 WorkBuddy 同一套 state 轮询） | OpenAI 兼容 SSE（后端只接受流式） | 原生 |
+| `copilot` | **GitHub 设备码**（浏览器打开验证页输码） | 标准 OpenAI 协议（需伪装 VS Code 插件头） | 原生 |
+| `kiro` | 刷新令牌（桌面版；企业版三件套） | **AWS Event Stream 二进制帧**（不是 SSE） | 原生 |
+| `iflow` | `~/.iflow/settings.json` 里的 apiKey | OpenAI 兼容 SSE + **每请求 HMAC-SHA256 签名** | 原生 |
+| `lingma` | IDE 登录缓存（`cache/user` + `cache/id`） | 双层嵌套 SSE | 原生 |
+| `antigravity` | **OAuth 授权码**（Google 账号） | `v1internal:streamGenerateContent`（外层包 `response`） | 原生 |
+| `windsurf` | Windsurf/Devin 客户端的 session token | protobuf / Connect 流式帧（只走直连云那条路） | toolshim 模拟 |
+
+四条实现原则（每条都对应一个真会踩到的坑）：
+
+1. **凭证能当场验就当场验**。Kimi（换令牌）、智谱（换令牌）有轻量接口，登录时就验一次，
+   把「已失效的凭证」挡在池子外面；豆包与元宝**没有**这类接口，只做格式检查 ——
+   这个区别写在面板的粘贴引导语里，用户不会以为是登录流程坏了。
+2. **按上游给的字段分流思考**。四家四种形态（Kimi 的 `block.think`、智谱的 item `type=think`、
+   豆包的 `10040` 开关块、元宝的 `type=think`）。取错字段**不会报错**，只会静默地把思考混进正文 ——
+   所以每个渠道都有针对分流的测试。
+3. **二进制帧必须按帧切、并容忍半帧**。Kimi 的 Connect 帧按行读会得到乱码；而且切帧时
+   **必须先处理已切出的帧再压缩缓冲区**（帧的载荷是缓冲区的子切片，顺序反了会被覆盖）——
+   两者都有测试钉住（逐字节喂入）。
+4. **不伪造看不懂的签名**。豆包的 `a_bogus` 是它自家 fetch hook 在浏览器里现算的，
+   纯 HTTP 路径不带它 —— 我们**不去猜**这个算法，而是在 `Spec.Docs` 与错误信息里
+   说清楚「可能被风控要求人工验证码」，并把风控码（710022002 / 710022004）归一成
+   「该去做什么」而不是「上游故障」。
+
+顺带修掉一个静默缺陷：**「接入源」的名字可以与内置渠道重名，挂载时会静默顶掉内置渠道**
+（来源名同时就是 channel.Kind，而同 Kind 是覆盖语义）。现在内置渠道名一律登记为保留名
+（校验时拒绝保存、挂载时跳过并记日志、面板上标出冲突），并有回归测试钉住。
+`deepseek` / `glm` 两个预设也相应改名为 `deepseek-api` / 保持 `glm`，
+避免用户新建来源时撞上内置渠道。
+
+**验证**：每个渠道都有 mock 上游端到端测试（请求形态、增量解析、思考分流、错误归一）；
+其中三种**二进制帧**协议（Kimi 的 Connect、Kiro 的 AWS Event Stream、Windsurf 的 protobuf）
+额外测了逐字节喂入的半帧切分，会自算签名的两个（智谱、iFlow）在测试里按同一算法复算比对，
+ChatGPT 的 PoW 同样复算比对。`internal/boot` 新增回归测试钉住「能力位说实话」
+与「同名来源不能顶掉内置渠道」；面板实测 22 个渠道全部注册、粘贴引导语按渠道正确下发
+（`/api/login/start` 返回的 `paste_hint` 就是面板上显示的那段）；`check.sh`（gofmt + vet + race + build）
+与 `audit-ui`（桌面 + 手机）/ `audit-vue` 全绿。
+
+修掉的两个面板缺陷（都是 UI 审计抓出来的）：① 粘贴登录的说明文案曾**硬编码成 DeepSeek 的
+「userToken」说法**，服务端下发的渠道专属引导语只被当作布尔开关用、没渲染出来 —— 现在文案跟着渠道走
+（Kimi 说 refresh token、豆包说整行 Cookie、通义灵码说 IDE 缓存文件）；② 授权地址很长时
+（Anthropic 的授权 URL 有 700+ 字符）会把授权覆盖层撑破，现在长串可断行。
+
+**没有验证的部分**：本机网络到不了这些上游、也没有可用的真实账号，所以**协议是按公开参考实现
+移植 + mock 验证的**（哪一份参考实现见 `docs/03` §7 的表）；真上游的首次验收需要你用自己的账号走一次
+（第一次对话若失败，错误信息里会带上上游原话）。
+
+### 0.4.9 — DeepSeek（网页版）渠道：粘贴 userToken 登录 + 服务端解 PoW（工具调用走 toolshim）
+
+网页协议没有原生 tools，所以这是**第一个靠 toolshim 模拟工具调用**的新渠道（0.4.4 的模拟层第一次接真渠道）。
+
+| 环节 | 做法 |
+|---|---|
+| 登录 | **粘贴 userToken**：用户在**自己浏览器**登录 DeepSeek，控制台执行 `JSON.parse(localStorage.getItem("userToken")).value` 把结果整段粘回面板（不存密码、不碰登录接口）。不能做扫码的原因：登录接口的 `device_id` 必须来自真实浏览器里的数美 SDK 指纹，服务端复现不了（空值/随机值被判 `RISK_DEVICE_DETECTED`） |
+| 设备 id | 由 userToken **派生**（FNV-1a 双哈希 → RFC4122 v4 UUID）：同账号重登稳定不变、不同账号天然不同（共用会被判异常） |
+| PoW | 每次 completion 前现场解挑战：跑**官方那份 WASM**（wazero 纯 Go，不注册任何 import；分配器按签名探测，不写死导出名），`X-Ds-Pow-Response` = base64(6 字段 JSON) |
+| 对话 | `chat.deepseek.com/api/v0` 的 agent 协议：建会话 → 解 PoW → SSE **p/o/v patch 流**（路径与操作跨帧持久，文本在 `response/fragments[-1].content` 上 APPEND 累积；fragments[].type 分 THINK/RESPONSE） |
+| 工具调用 | **toolshim 模拟**：`Spec.Tools=false + ToolsShim=true`，网关把 tools 翻成提示词、把输出标记解析回结构化 `tool_calls`（对客户端合同不变，面板如实标注「工具调用靠网关模拟」） |
+| 错误 | 上游大量错误是 **HTTP 200 + 信封码**：`biz_code` 5/10/11（禁言/封禁/设备指纹）与信封级 40003（invalid token）都归一成对应 Kind，不走「解析失败」 |
+
+**验证**：真 WASM ABI 自测（`DEEPSEEK_POW_WASM` 指向下载的官方 wasm，解低难度挑战 + 六字段头）；mock 上游端到端（建会话 → 挑战 → 真求解 → patch 流解析成 THINK/正文/finished → 删会话）；面板粘贴流（发起 → 粘 token → 轮询入池，popup 数 = 0）；`check.sh`/`audit-ui`/`audit-vue` 全绿。
+**注意**：账户凭证（userToken）落盘在凭证目录（0600），与其它渠道同样处理。
+
 ### 0.4.8 — Gemini 渠道：官方 OAuth 的登录式接入（原生工具调用）
 
 **这批「登录式」里最优的一条**：不是逆向网页，而是走 **Gemini Code Assist CLI 的官方 OAuth**。

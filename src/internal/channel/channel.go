@@ -32,7 +32,33 @@ const (
 	// 后者是「千问办公」那个白领助手产品。两个上游协议完全不同，别混。
 	Qwen Kind = "qwen"
 	// Gemini（Google）：走 Code Assist CLI 的**官方 OAuth**（登录式，不用 key）。
-	Gemini      Kind = "gemini"
+	Gemini Kind = "gemini"
+	// DeepSeek（网页版）：登录式（粘贴 userToken），工具调用由网关模拟。
+	DeepSeek Kind = "deepseek"
+	// Kimi（网页版）：登录式（粘贴浏览器里的 refresh token），工具调用由网关模拟。
+	// 与「账号池里的 Kimi」是同一件事：它没有 API Key 形态，只有网页登录态这一条路。
+	Kimi Kind = "kimi"
+
+	// ---- 以下为「网页版/客户端登录式」渠道 ----
+	//
+	// 命名前缀的原则：**一个上游一个前缀**，且不与「接入源」里的 API Key 式来源撞名。
+	// 例如智谱清言用 chatglm（域名），把 glm 留给 BigModel 官方 API 那个来源，
+	// 这样模型名 `chatglm/glm-4.7` 与 `glm/glm-4.7` 分别指向「网页登录态」与「API Key」，
+	// 用户在客户端里一眼能分清自己用的是哪一条。
+	ChatGLM     Kind = "chatglm"     // 智谱清言（chatglm.cn 网页版）
+	Doubao      Kind = "doubao"      // 豆包（网页版）
+	Yuanbao     Kind = "yuanbao"     // 腾讯元宝（网页版）
+	CodeBuddy   Kind = "codebuddy"   // 腾讯 CodeBuddy（编程助手，与 WorkBuddy 同族）
+	Copilot     Kind = "copilot"     // GitHub Copilot（订阅登录）
+	Windsurf    Kind = "windsurf"    // Windsurf / Codeium
+	Kiro        Kind = "kiro"        // AWS Kiro
+	IFlow       Kind = "iflow"       // iFlow CLI
+	Lingma      Kind = "lingma"      // 通义灵码
+	Cursor      Kind = "cursor"      // Cursor
+	Antigravity Kind = "antigravity" // Google Antigravity
+	ChatGPT     Kind = "chatgpt"     // ChatGPT（网页版）
+	Anthropic   Kind = "anthropic"   // Anthropic（订阅 OAuth 登录）
+
 	QoderCOM    Kind = "qodercom"    // QoderCOM 国际版（COSY 同框架，仅域名不同）
 	WorkBuddyAI Kind = "workbuddyai" // WorkBuddy 国际版（独立域名与模型表）
 )
