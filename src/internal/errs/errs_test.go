@@ -23,6 +23,28 @@ func TestPassthroughKindsNotBlamed(t *testing.T) {
 	}
 }
 
+// 2026-09-27 事故回归：连接中断不是这个号的错，但换号仍值得试。
+func TestTransportNotBlamedButStillRetryable(t *testing.T) {
+	if Transport.AccountBlamed() {
+		t.Fatal("连接中断不是这个号的错，不得冷却账号")
+	}
+	if Transport.StopRetry() {
+		t.Fatal("连接中断应当允许换号重试（别的号可能通），不该直接甩给客户端")
+	}
+	// 空流（Parse）仍然算这个号的错：gateway 的「空流要冷却」纪律不能丢。
+	if !Parse.AccountBlamed() {
+		t.Fatal("Parse（上游 200 但空流）仍应计入账号错误")
+	}
+	for _, k := range []Kind{UpstreamFault, ContentBlocked, PromptTooLong, NoCandidate} {
+		if !k.StopRetry() {
+			t.Fatalf("%s 换号没意义，应当把真实错误直接交给客户端", k)
+		}
+	}
+	if !SessionDead.AccountBlamed() || SessionDead.StopRetry() {
+		t.Fatal("SessionDead 仍是账号错误且换号有意义（凭证类失败先续期再换号）")
+	}
+}
+
 func TestPolicyMatchesDesignDoc(t *testing.T) {
 	// 与 docs/02-项目设计方案.md §4 的表一一对应。
 	cases := map[Kind]struct {
@@ -38,8 +60,9 @@ func TestPolicyMatchesDesignDoc(t *testing.T) {
 		PromptTooLong:    {passthrough: true},
 		ModelUnavailable: {cd: 10 * time.Minute},
 		UpstreamFault:    {cd: 5 * time.Minute, blameChannel: true},
-		Transport:        {cd: 10 * time.Minute},
-		Parse:            {cd: 10 * time.Minute},
+		// 0.9.8：连接中断不算账号错误 → 不冷却账号，只记在渠道头上（事故回归）。
+		Transport: {blameChannel: true},
+		Parse:     {cd: 10 * time.Minute},
 	}
 	for k, want := range cases {
 		got := PolicyOf(k)

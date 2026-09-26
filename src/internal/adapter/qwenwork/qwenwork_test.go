@@ -362,11 +362,55 @@ func TestSpec(t *testing.T) {
 }
 
 // deviceJWT 造一个能被 parseJWTIdentity 解出昵称的 device_token（测试用，非真实签名）。
+func deviceJWTWithExp(nick string, exp time.Time) string {
+	h, _ := json.Marshal(map[string]string{"alg": "HS256", "typ": "JWT"})
+	p, _ := json.Marshal(map[string]any{"user_id": "u1", "username": nick, "exp": exp.Unix()})
+	enc := base64.RawURLEncoding.EncodeToString
+	return enc(h) + "." + enc(p) + ".sig"
+}
+
 func deviceJWT(nick string) string {
 	h, _ := json.Marshal(map[string]string{"alg": "HS256", "typ": "JWT"})
 	p, _ := json.Marshal(map[string]any{"user_id": "u1", "username": nick})
 	enc := base64.RawURLEncoding.EncodeToString
 	return enc(h) + "." + enc(p) + ".sig"
+}
+
+// 到期时间必须取 device_token 的 **JWT exp**，不是上游的 expires_in。
+// 2026-09-27 事故回归：expires_in(≈10 分钟) 被当到期时间 → 「临期才续期」永远成立 →
+// 每个请求都续一次（一次性 rt 被轮换到断链）。
+func TestRefreshUsesJWTExpiryNotExpiresIn(t *testing.T) {
+	want := time.Now().Add(7 * 24 * time.Hour).Truncate(time.Second)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"device_token":  deviceJWTWithExp("demo-qwen", want),
+			"refresh_token": "rt-rotated",
+			"expires_in":    600 * 1000, // 上游的「多久换一次」提示：10 分钟（毫秒口径）
+		})
+	}))
+	defer srv.Close()
+
+	a := New()
+	a.deviceURL = srv.URL + epDeviceToken
+	c := channel.Credential{UID: "u1", AccessToken: "oauth", RefreshToken: "rt-old", ExpiresAt: time.Now()}
+	nc, err := a.Refresh(context.Background(), &c)
+	if err != nil {
+		t.Fatalf("续期失败：%v", err)
+	}
+	if d := time.Until(nc.ExpiresAt); d < 6*24*time.Hour {
+		t.Fatalf("到期时间应取 JWT exp（≈7 天），实际还剩 %v（是不是又用了 expires_in？）", d)
+	}
+}
+
+// 一次性 refresh token 的渠道必须声明续期节奏（闲置会失效），且节奏不能大到让链放坏。
+func TestSpecDeclaresRefreshCadence(t *testing.T) {
+	sp := New().Spec()
+	if sp.RefreshCadence <= 0 {
+		t.Fatal("千问办公的 refresh token 是一次性轮换的，必须声明 RefreshCadence（闲置会失效）")
+	}
+	if sp.RefreshCadence > 30*time.Minute {
+		t.Fatalf("续期节奏过大（实测闲置 ~31 小时 rt 就失效了）：%v", sp.RefreshCadence)
+	}
 }
 
 // 续期必须走 **deviceToken 换发端点**，而不是 OAuth 的 /oauth2/token。

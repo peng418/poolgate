@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -62,6 +63,28 @@ func TestDisableExcludesAccount(t *testing.T) {
 
 	if _, ok := p.Pick(context.Background(), channel.QoderCN, nil); ok {
 		t.Fatal("禁用账号不应被选中")
+	}
+}
+
+// 0.9.8：503 的结论必须自带处置所需的事实（哪个号、等多久、要不要动手）—— 2026-09-27 事故回归。
+func TestErrNoCandidateExplainsEachAccount(t *testing.T) {
+	p := New()
+	kind := channel.QoderCN
+	add(p, kind, "aaaa1111-2222-3333", 100)
+	add(p, kind, "bbbb3333-4444-5555", 500)
+	p.Cooldown(kind, "aaaa1111-2222-3333", 10*time.Minute, "Transport")
+	p.Disable(kind, "bbbb3333-4444-5555", "SessionDead")
+
+	msg := p.ErrNoCandidate(kind).Error()
+	for _, want := range []string{"无可用账号", "aaaa1111", "冷却至", "到点自恢复", "bbbb3333", "SessionDead", "需重新授权"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("503 结论必须含 %q，实际：%s", want, msg)
+		}
+	}
+
+	// 空池也要说清「池里没账号」，而不是只丢一句「无可用账号」。
+	if m := New().ErrNoCandidate(kind).Error(); !strings.Contains(m, "没有该渠道的账号") {
+		t.Fatalf("空池结论应说明池里没账号，实际：%s", m)
 	}
 }
 

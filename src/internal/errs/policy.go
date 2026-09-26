@@ -33,10 +33,15 @@ var DefaultPolicy = map[Kind]Policy{
 	ModelUnavailable: {Cooldown: 10 * time.Minute, Retry: true},
 	// 上游故障：渠道级降级告警，不计账号错误 —— 千问办公 503 就落在这里。
 	UpstreamFault: {Cooldown: 5 * time.Minute, Retry: true, BlameChannel: true},
-	Transport:     {Cooldown: 10 * time.Minute, Retry: true},
-	Parse:         {Cooldown: 10 * time.Minute, Retry: true},
-	AuthFailed:    {},
-	NoCandidate:   {},
+	// 连接中断：渠道/网络级抖动，**不冷却账号**（Cooldown 0 是刻意的），但保留换号重试 ——
+	// 别的号可能通，都通不了就把真实错误交给客户端。
+	// 2026-09-27 真机事故：这里原本是 10 分钟账号冷却，一次抖动把两个号一起冷却，整渠道 503
+	// 十分钟，而面板体检刚刚还是绿的（见 docs/02 §4 的补充说明）。
+	Transport: {Retry: true, BlameChannel: true},
+	// Parse 仍是账号错误：它代表「上游 200 却一个字都没有」（空流）——那种号该被冷掉。
+	Parse:       {Cooldown: 10 * time.Minute, Retry: true},
+	AuthFailed:  {},
+	NoCandidate: {},
 }
 
 // PolicyOf 取某类错误的处置策略；未知类型按最保守处理（冷却但不禁用）。

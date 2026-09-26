@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -57,6 +58,10 @@ type Pool struct {
 	refresh       RefreshFunc
 	refreshLocks  map[string]*sync.Mutex
 	refreshFailed map[string]time.Time
+	// lastRefresh 是每账号「上次续期成功的时刻」—— 软节奏判定用（见 refresh.go）。
+	lastRefresh map[string]time.Time
+	// cadenceOf 按渠道给出「主动续期的节奏」（装配层从 Spec.RefreshCadence 注入）。
+	cadenceOf func(channel.Kind) time.Duration
 }
 
 // New 建立空池。
@@ -65,6 +70,7 @@ func New() *Pool {
 		byKey:         map[string]*entry{},
 		refreshLocks:  map[string]*sync.Mutex{},
 		refreshFailed: map[string]time.Time{},
+		lastRefresh:   map[string]time.Time{},
 	}
 }
 
@@ -102,6 +108,10 @@ func (p *Pool) Cooldown(kind channel.Kind, uid string, d time.Duration, reason s
 	}
 }
 
+// ReasonManualDisabled 是「管理员手动停用」的原因文案（ReasonNoCandidate 据此换措辞：
+// 手动停用的号不需要重新授权，在面板启用即可）。
+const ReasonManualDisabled = "手动停用"
+
 // Disable 永久禁用（session 死亡），需人工重登恢复。
 func (p *Pool) Disable(kind channel.Kind, uid, reason string) {
 	p.mu.Lock()
@@ -119,7 +129,7 @@ func (p *Pool) SetDisabled(kind channel.Kind, uid string, d bool) {
 	if e, ok := p.byKey[keyOf(kind, uid)]; ok {
 		e.state.Disabled = d
 		if d {
-			e.state.Reason = "手动停用"
+			e.state.Reason = ReasonManualDisabled
 		} else {
 			e.state.Reason = ""
 			e.state.Until = time.Time{}
@@ -244,10 +254,57 @@ func (p *Pool) pickInternal(kind channel.Kind, tried map[string]bool, preferred 
 	return best.state.Cred, true
 }
 
-// ErrNoCandidate 无可用账号时的错误构造。附渠道与原因，保证客户端可见。
+// ErrNoCandidate 无可用账号时的错误构造。附渠道与**逐号运行态**，保证客户端看得懂也看得见。
+//
+// 让结论自带处置所需的事实（2026-09-27 事故：客户端只收到一句「可能全部冷却或禁用」，
+// 分不清「等 10 分钟自恢复」和「要重新授权」，只能来问「是不是被你改坏了」）。
+// 网关 503 与面板体检共用 pool.ReasonNoCandidate —— 两边必须同一句话。
 func (p *Pool) ErrNoCandidate(kind channel.Kind) error {
-	return errs.New(errs.NoCandidate, fmt.Sprintf("渠道 %s 无可用账号（可能全部冷却或禁用）", kind)).
-		WithChannel(string(kind))
+	msg := fmt.Sprintf("渠道 %s 无可用账号（可能全部冷却或禁用）", kind)
+	if s := ReasonNoCandidate(p.States(kind)); s != "" {
+		msg += "：" + s
+	}
+	return errs.New(errs.NoCandidate, msg).WithChannel(string(kind))
+}
+
+// ReasonNoCandidate 把「池里没号可用」写成一句能处置的话。
+//
+// 只报「无可用账号」等于把问题原样丢回给用户：既看不出是**等一会儿**（冷却到点自恢复）
+// 还是**要动手**（已禁用，需重新授权），也看不出是哪个号的锅。所以这里逐个列出运行态，
+// uid 只留前 8 位（够对上面板的账号行）。空池返回「池里没有该渠道的账号」。
+func ReasonNoCandidate(states []channel.AccountState) string {
+	if len(states) == 0 {
+		return "池里没有该渠道的账号"
+	}
+	now := time.Now()
+	parts := make([]string, 0, len(states))
+	for _, st := range states {
+		switch {
+		case st.Disabled:
+			switch st.Reason {
+			case ReasonManualDisabled:
+				// 管理员自己停的：不需要重新授权，启用即可 —— 别把话说反。
+				parts = append(parts, shortUID(st.UID)+" 已禁用（手动停用），在面板启用即可")
+			case "":
+				parts = append(parts, shortUID(st.UID)+" 已禁用（原因未记录），可在面板重新授权或启用")
+			default:
+				parts = append(parts, shortUID(st.UID)+" 已禁用（"+st.Reason+"），需重新授权或手动启用")
+			}
+		case !st.Until.IsZero() && now.Before(st.Until):
+			parts = append(parts, shortUID(st.UID)+" 冷却至 "+st.Until.Local().Format("01-02 15:04")+"（到点自恢复）")
+		default:
+			parts = append(parts, shortUID(st.UID)+" 状态未知")
+		}
+	}
+	return strings.Join(parts, "；")
+}
+
+// shortUID 把 uid 截到前 8 位：面板账号行就是这么显示的，够对上号又不啰嗦。
+func shortUID(uid string) string {
+	if len(uid) > 8 {
+		return uid[:8]
+	}
+	return uid
 }
 
 // List 返回某渠道全部账号状态（按 UID 排序）。

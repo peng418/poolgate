@@ -159,11 +159,13 @@ func (r *Router) Route(ctx context.Context, ch channel.Channel, kind channel.Kin
 		// 失败：按 kind 冷却该号，换号重试。
 		if ok {
 			until, _ := errs.RetryAtOf(err) // 上游给了恢复时间点（如禁言解禁）就以它为准
+			// 非账号错误在这里被忽略（不冷却账号）—— 连接中断、上游故障都不该记在号头上。
 			r.p.NoteErrorAt(kind, cred.UID, k, until)
-			if !k.AccountBlamed() && !errs.CredentialKind(k) {
-				// 上游故障/内容拦截/超长：非账号问题，直接返回错误，不换号白折腾。
+			if k.StopRetry() {
+				// 上游故障/内容拦截/超长/无号可换：换号没意义，直接返回真实错误。
 				return nil, err
 			}
+			// 其余（含 Transport 连接中断）换号再试：别的号可能通，且不冷却任何号。
 		}
 	}
 	// 全部账号失败：返回最后一个真实错误（保证客户端可见，而非吞成 NoCandidate）。

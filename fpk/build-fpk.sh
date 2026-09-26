@@ -82,7 +82,7 @@ M="$PKG/manifest"
   printf 'service_port          = %s\n'   "$PORT"
   printf 'desktop_uidir         = ui\n'
   printf 'desktop_applaunchname = %s.main\n' "$APPNAME"
-  printf 'changelog = 面板体检不再只说「该渠道无可用账号，无法探测」（真机 2026-09-26 教训）：这句话本身没错，但用户看不出是「等一会儿自己恢复」还是「要重新授权」，也看不出是哪个号的锅 —— 那晚千问办公两个号在 23:12 前后同时离开可用集，面板只给了这一句，排查只能靠翻日志和时间戳。现在结论自带处置所需的事实：逐个列出该渠道每个账号的运行态（uid 前 8 位 + 冷却至 MM-DD HH:MM（到点自恢复），或 已禁用（原因），需重新授权或手动启用）；池里没有该渠道账号时也会明说。池侧新增 pool.States / channel.AccountState（只读运行态，不含任何凭证材料）。新增 2 条回归测试。 | FPK %s\n' "$VERSION"
+  printf 'changelog = 修三个真机问题（2026-09-27 凌晨那场 503）：① 上游连接中断不再算「这个号的错」—— 一条「上游连接中断且未收到内容」曾把两个号各冷却 10 分钟，整渠道 503 十分钟，而它 38 秒前的体检还是绿的（体检是快照，不是实时状态）；现在连接中断（Transport）不计账号错误、仍换号重试，「要不要冷却这个号」与「要不要换号」拆成两个判据（AccountBlamed / StopRetry）。② 503 的结论自带处置事实：逐号列出运行态与剩余冷却（谁冷却到几时自恢复、谁被禁用按什么原因），与面板体检共用同一个 pool.ReasonNoCandidate，两边永远同一句话。③ 千问办公的续期不再由请求频率驱动：到期时间改取 device_token 的 JWT exp（上游 expires_in≈10 分钟只是「多久该换一次」的提示，实测比真实寿命短得多），并按渠道声明 Spec.RefreshCadence=10 分钟定期续期 + 后台心跳照顾闲置账号（一次性 refresh token 闲置 ~31 小时实测失效）；续期失败也终于会落一条日志（以前是静默的）。新增 6 条回归测试。 | FPK %s\n' "$VERSION"
 } >> "$M"
 chmod 0644 "$M"
 sed -n '1,20p' "$M" | sed 's/^/  /'

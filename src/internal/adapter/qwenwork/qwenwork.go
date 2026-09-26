@@ -172,7 +172,11 @@ func (a *Adapter) Spec() channel.Spec {
 		Reasoning:   true,
 		SSEOnly:     true, // 上游只有流式（WebSocket 推流），非流式由本地聚合
 		CheckinCap:  false,
-		Docs:        "网页端协议（chat-ws）；桌面网关已被上游闸门拦截",
+		// 一次性 refresh token 的渠道：必须定期续期把链接着（闲置 ~31 小时实测失效），
+		// 但不能每个请求都续（每续一次就轮换一次，2026-09-27 事故）。10 分钟与上游
+		// expires_in 同口径 —— 厂商客户端就是这么换的。
+		RefreshCadence: 10 * time.Minute,
+		Docs:           "网页端协议（chat-ws）；桌面网关已被上游闸门拦截",
 	}
 }
 
@@ -274,17 +278,25 @@ func (a *Adapter) fetchDeviceToken(ctx context.Context, refreshToken string) (st
 		return "", "", time.Time{}, errs.New(errs.Parse, "deviceToken 响应不完整（缺 device_token 或 refresh_token）").
 			WithChannel(string(channel.QwenWork)).WithUpstream(truncate(string(raw), 300))
 	}
-	exp := time.Time{}
-	switch {
-	case out.ExpiresIn > 0:
-		exp = time.Now().Add(time.Duration(out.ExpiresIn) * time.Millisecond)
-	case out.ExpiresAt != "":
-		if t, err := time.Parse(time.RFC3339, out.ExpiresAt); err == nil {
-			exp = t
+	// 到期时间以 device_token 自己的 **JWT exp** 为准。
+	//
+	// 2026-09-27 事故：上游的 expires_in（实测 ≈10 分钟）是「多久该来换一次」的提示，而
+	// device_token 的 JWT exp 在 7 天后。把它当到期时间用 ⇒ pool 的「临期才续期」永远成立
+	// ⇒ **每个请求都去续一次**（这个渠道的 refresh token 是一次性轮换的，越续越容易断链）。
+	// 取不到 JWT exp 时才退回上游提示（见 jwtExpiry）。
+	exp := jwtExpiry(dt)
+	if exp.IsZero() {
+		switch {
+		case out.ExpiresIn > 0:
+			exp = time.Now().Add(time.Duration(out.ExpiresIn) * time.Millisecond)
+		case out.ExpiresAt != "":
+			if t, err := time.Parse(time.RFC3339, out.ExpiresAt); err == nil {
+				exp = t
+			}
 		}
 	}
 	if exp.IsZero() {
-		// 上游没给存活时间：按观测寿命保守取 24 小时（wild-work 同做法）。
+		// 既没 JWT exp 也没存活时间：按观测寿命保守取 24 小时（wild-work 同做法）。
 		exp = time.Now().Add(24 * time.Hour)
 	}
 	return dt, out.RefreshToken, exp, nil

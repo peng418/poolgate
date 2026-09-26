@@ -207,6 +207,29 @@ func TestRouteContentBlockedNoRetry(t *testing.T) {
 	}
 }
 
+// 2026-09-27 事故回归：上游连接中断不是这个号的错 —— 不冷却账号，但换号接着试，
+// 都失败就把真实错误交给客户端（而不是一句 503「无可用账号」）。
+// 事故现场：一条「上游连接中断且未收到内容」把两个号各冷却 10 分钟，整渠道躺了 10 分钟。
+func TestRouteTransportFailureRetriesWithoutCooling(t *testing.T) {
+	kind := channel.Kind("test")
+	p := newPool(kind)
+	r := New(p, Options{MaxRetry: 3, StickyRequests: 1})
+	ch := &fakeChannel{kind: kind, chat: func(*channel.Credential) (channel.Stream, error) {
+		return nil, errs.New(errs.Transport, "上游连接中断且未收到内容")
+	}}
+
+	_, err := r.Route(context.Background(), ch, kind, "", channel.ChatRequest{Model: "m"})
+	if k := kindOf(t, err); k != errs.Transport {
+		t.Fatalf("应把真实错误（Transport）交给客户端，实际 %s", k)
+	}
+	if got := ch.count(); got != 2 {
+		t.Fatalf("两个号都该被试过（换号重试），实际调用 %d 次", got)
+	}
+	if n := p.CountHealthy(kind); n != 2 {
+		t.Fatalf("连接中断不得冷却账号，期望 2 个健康账号，实际 %d", n)
+	}
+}
+
 // 粘性：同一会话认准一个号，即使别的号余额更高也不换 —— 上游会话有上下文，
 // 频繁换号会让对话「失忆」，这正是粘性路由存在的理由。
 func TestRouteStickyReusesAccount(t *testing.T) {

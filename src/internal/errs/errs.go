@@ -39,12 +39,35 @@ func (k Kind) String() string { return string(k) }
 //
 // Muted 反过来：禁言是**这个号**的状态（池里有别的号就该换号），所以算账号错误，
 // 并按上游给的解禁时间冷却它。
+// Transport 同样不算（2026-09-27 真机事故补）：**上游连接中断**是渠道/网络侧的事，记在账号头上
+// 就会误杀好号。事故现场：一条「上游连接中断且未收到内容」把两个号各冷却 10 分钟，于是整个渠道
+// 10 分钟内一律 503「无可用账号」—— 而它 38 秒前的体检还是绿的。
+//
+// Parse 故意**留在账号错误**一侧：它的主要用途是「上游 200 但一个字都没有（空流）」，
+// 那确实该冷却这个号，否则会一直拿这个空号去试（见 gateway 的空流纪律与配套测试）。
 func (k Kind) AccountBlamed() bool {
 	switch k {
-	case UpstreamFault, ContentBlocked, PromptTooLong, NoCandidate, AuthFailed:
+	case UpstreamFault, ContentBlocked, PromptTooLong, NoCandidate, AuthFailed, Transport:
 		return false
 	default:
 		return true
+	}
+}
+
+// StopRetry 报告「换号没意义」：这类错误直接把真实原因交给客户端，不拿别的号再试一遍。
+//
+// 与 AccountBlamed 的分工（2026-09-27 拆开）：前者回答「要不要冷却这个号」，后者回答
+// 「还有必要换号吗」。两者曾共用一个判据（!AccountBlamed），于是 Transport 一旦不再算账号
+// 错误，就会被顺带判成「换号没意义」—— 一次网络抖动直接被甩给用户。拆开之后：连接中断照旧
+// 换号重试（别的号可能通），但谁都不冷却。
+//
+// 单点定义：router.Route 与 health.Runner 的换号纪律共用这一条，别各写一份。
+func (k Kind) StopRetry() bool {
+	switch k {
+	case UpstreamFault, ContentBlocked, PromptTooLong, NoCandidate:
+		return true
+	default:
+		return false
 	}
 }
 

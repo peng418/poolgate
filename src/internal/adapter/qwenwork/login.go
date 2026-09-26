@@ -274,25 +274,58 @@ func (a *Adapter) exchangeToken(ctx context.Context, s *qwSession) (*channel.Cre
 
 // parseJWTIdentity 从 JWT 的 payload 里解出 uid 与显示名。
 // 只做 base64 解码读字段，不验签 —— token 是上游刚发给我们的。
-func parseJWTIdentity(token string) (uid, nickname string) {
+// jwtClaims 解出 JWT 的 payload claims；解不开返回 false（不猜、编造）。
+func jwtClaims(token string) (map[string]any, bool) {
 	if token == "" {
-		return "", ""
+		return nil, false
 	}
 	parts := strings.Split(token, ".")
 	if len(parts) < 2 {
-		return "", ""
+		return nil, false
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
 		// 兼容带 padding 的编码
-		if raw2, err2 := base64.URLEncoding.DecodeString(parts[1]); err2 == nil {
-			raw = raw2
-		} else {
-			return "", ""
+		raw2, err2 := base64.URLEncoding.DecodeString(parts[1])
+		if err2 != nil {
+			return nil, false
 		}
+		raw = raw2
 	}
 	var claims map[string]any
 	if json.Unmarshal(raw, &claims) != nil {
+		return nil, false
+	}
+	return claims, true
+}
+
+// jwtExpiry 从 JWT 的 payload 里取 exp。取不到返回零值。
+//
+// 为什么单独要这个（2026-09-27 真机事故）：上游给的 expires_in 是「多久该来换一次」的节奏提示，
+// 不是令牌的真实寿命。千问办公实测 expires_in ≈ 10 分钟，而 device_token 的 JWT exp 是 7 天后；
+// 把 10 分钟当到期时间 → 「临期才续期」永远成立 → 每个请求都去续一次，
+// 而这个渠道的 refresh token 是一次性轮换的：越续越容易断链。
+func jwtExpiry(token string) time.Time {
+	claims, ok := jwtClaims(token)
+	if !ok {
+		return time.Time{}
+	}
+	switch v := claims["exp"].(type) {
+	case float64:
+		if v > 0 {
+			return time.Unix(int64(v), 0)
+		}
+	case json.Number:
+		if n, err := v.Int64(); err == nil && n > 0 {
+			return time.Unix(n, 0)
+		}
+	}
+	return time.Time{}
+}
+
+func parseJWTIdentity(token string) (uid, nickname string) {
+	claims, ok := jwtClaims(token)
+	if !ok {
 		return "", ""
 	}
 	get := func(k string) string {

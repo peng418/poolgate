@@ -143,6 +143,9 @@ func main() {
 		}
 		nc, err := ch.Refresh(ctx, &c)
 		if err != nil {
+			// 续期失败必须留痕（红线一）：否则「续期链断了」会静默一小时以上才被发现
+			// （2026-09-27 事故里就是这么查了半天：日志里只有成功的续期，失败的什么都没有）。
+			log.Printf("poolgate: 凭证续期失败 %s/%s：%v", kind, c.UID, err)
 			return nil, err
 		}
 		if nc == nil || nc.AccessToken == c.AccessToken {
@@ -162,6 +165,30 @@ func main() {
 		log.Printf("poolgate: 凭证已续期 %s/%s", kind, nc.UID)
 		return nc, nil
 	})
+
+	// 续期节奏：声明了「一次性 refresh token」的渠道（channel.Spec.RefreshCadence）必须定期主动
+	// 续期把链接着 —— 闲置的 rt 会失效（实测 ~31 小时）。节奏由渠道声明，装配层转给池子；
+	// 池子据此决定「该不该续」，请求路径不再凭「上游给的到期提示」每请求都去敲一次。
+	accPool.SetRefreshCadence(func(kind channel.Kind) time.Duration {
+		if spec, ok := registry.GetSpec(kind); ok {
+			return spec.RefreshCadence
+		}
+		return 0
+	})
+
+	// 续期心跳：请求路径只续**被选中**的号，闲置账号没人管（它的 rt 会放坏）。每分钟醒一次，
+	// 真正续不续由池子按渠道节奏判定 —— 没声明节奏的渠道一次都不会续，不给上游白添调用。
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for range t.C {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			if n := accPool.RefreshSweep(ctx); n > 0 {
+				log.Printf("poolgate: 续期心跳：%d 个账号到点，已尝试续期", n)
+			}
+			cancel()
+		}
+	}()
 
 	// 「只下发可用模型」（F4.5）：开关在设置里，结论来自最近一次体检。在这里装一次，
 	// 面板与网关共用同一个函数 —— 面板上标着「已按健康度隐藏」的模型，

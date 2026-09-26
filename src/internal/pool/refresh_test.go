@@ -18,6 +18,86 @@ func expiring(uid string, in time.Duration) channel.Credential {
 	}
 }
 
+// 一次性 refresh token 的渠道靠「渠道声明的节奏」主动续期活着，但绝不能每请求都续。
+// 2026-09-27 事故回归：千问办公 42 秒被续了 4 次，链断了。
+func TestRefreshCadenceKeepsRotatingTokenWarm(t *testing.T) {
+	oldGap := refreshSoftGap
+	refreshSoftGap = time.Millisecond // 测试里把兜底间隔缩短，节奏本身用 30ms
+	defer func() { refreshSoftGap = oldGap }()
+
+	p := New()
+	p.SetRefreshCadence(func(k channel.Kind) time.Duration {
+		if k == channel.QwenWork {
+			return 30 * time.Millisecond
+		}
+		return 0
+	})
+	// 远未到期：老规矩（只认临期）下不会被续。
+	p.AddFor(channel.QwenWork, channel.Credential{UID: "a", AccessToken: "t0",
+		RefreshToken: "rt-a", ExpiresAt: time.Now().Add(48 * time.Hour)})
+	var calls int32
+	p.SetRefresher(func(_ context.Context, kind channel.Kind, c channel.Credential) (*channel.Credential, error) {
+		atomic.AddInt32(&calls, 1)
+		nc := c
+		nc.AccessToken = c.AccessToken + "+"
+		p.AddFor(kind, nc)
+		return &nc, nil
+	})
+
+	if _, ok := p.Pick(context.Background(), channel.QwenWork, nil); !ok {
+		t.Fatal("应选到账号")
+	}
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("首次取号该把链接上（续 1 次），实际 %d", n)
+	}
+	if _, ok := p.Pick(context.Background(), channel.QwenWork, nil); !ok {
+		t.Fatal("应选到账号")
+	}
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("刚续过不该再敲上游（每请求续期是自伤），实际 %d", n)
+	}
+	time.Sleep(40 * time.Millisecond)
+	if _, ok := p.Pick(context.Background(), channel.QwenWork, nil); !ok {
+		t.Fatal("应选到账号")
+	}
+	if n := atomic.LoadInt32(&calls); n != 2 {
+		t.Fatalf("过了渠道节奏应再续一次（否则闲置的 rt 会失效），实际 %d", n)
+	}
+}
+
+// 后台心跳只碰「声明了节奏」的渠道，且到点才续 —— 别给不需要的渠道平白加上游调用。
+func TestRefreshSweepOnlyTouchesCadenceChannels(t *testing.T) {
+	p := New()
+	p.SetRefreshCadence(func(k channel.Kind) time.Duration {
+		if k == channel.QwenWork {
+			return time.Minute
+		}
+		return 0
+	})
+	p.AddFor(channel.QwenWork, channel.Credential{UID: "qw", AccessToken: "t-qw",
+		RefreshToken: "rt-qw", ExpiresAt: time.Now().Add(time.Hour)})
+	p.AddFor(channel.QoderCN, channel.Credential{UID: "qd", AccessToken: "t-qd",
+		RefreshToken: "rt-qd", ExpiresAt: time.Now().Add(time.Hour)})
+	var calls int32
+	p.SetRefresher(func(_ context.Context, kind channel.Kind, c channel.Credential) (*channel.Credential, error) {
+		atomic.AddInt32(&calls, 1)
+		nc := c
+		nc.AccessToken = c.AccessToken + "2"
+		p.AddFor(kind, nc)
+		return &nc, nil
+	})
+
+	if n := p.RefreshSweep(context.Background()); n != 1 {
+		t.Fatalf("心跳应只续声明了节奏的渠道（1 个），实际 %d", n)
+	}
+	if n := p.RefreshSweep(context.Background()); n != 0 {
+		t.Fatalf("节奏未到不该重复续，实际 %d", n)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("续期函数应被调用 1 次，实际 %d", got)
+	}
+}
+
 // 临期凭证在选号时就被换成新的：这是「昨天还能用、今天全是 401」的根治点。
 func TestPickRefreshesExpiringCredential(t *testing.T) {
 	p := New()

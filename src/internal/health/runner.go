@@ -18,6 +18,7 @@ import (
 
 	"poolgate/internal/channel"
 	"poolgate/internal/errs"
+	"poolgate/internal/pool"
 )
 
 // RunKind 区分两种探测，面板的「体检历史」要写明类型（原型 04-benchmark.html）。
@@ -129,8 +130,9 @@ const maxAccountAttempts = 3
 //
 // 账号纪律（与 router.Route 一致，2026-09-26 补）：
 //  1. 结论回写池子：失败按 errs.Kind 分档（NoteError），成功清零（NoteSuccess）；
-//  2. 只有「账号/凭证的问题」才续期与换号 —— 上游故障、超长、内容拦截换号只会白折腾，
-//     还会把一个好号冷却掉（红线 D4）；
+//  2. 续期只给「凭证类」失败（SessionDead/AuthFailed）；换号只看 errs.StopRetry ——
+//     上游故障、超长、内容拦截换号只会白折腾。连接中断（Transport）反过来：换号值得试，
+//     但**不冷却任何账号**（2026-09-27 事故：一次抖动把两个号各冷却 10 分钟 → 整渠道 503）；
 //  3. 凭证类失败（SessionDead/AuthFailed）先强制续期一次再重试，救不回来才换下一个号；
 //  4. 池里的号都试完了才认账「这个渠道现在不可用」，并把**最后一个真实错误**带出去。
 func (r *Runner) ProbeOne(ctx context.Context, t Target) Result {
@@ -152,9 +154,10 @@ func (r *Runner) ProbeOne(ctx context.Context, t Target) Result {
 		}
 		k := failureKind(res, err)
 		until, _ := errs.RetryAtOf(err) // 上游给的恢复时间点（禁言解禁）优先于固定冷却
+		// 非账号错误在这里被忽略（不冷却账号）：连接中断、上游故障都不记在号头上。
 		r.pool.NoteErrorAt(t.Kind, cred.UID, k, until)
-		if !k.AccountBlamed() && !errs.CredentialKind(k) {
-			// 不是这个号的锅：换号没意义，直接给出结论（渠道级故障）。
+		if k.StopRetry() {
+			// 换号没意义（渠道级故障 / 内容问题）：直接给出结论。
 			return res
 		}
 		// 凭证类失败：先试续期再谈换号（「token 到期」唯一体面的处理方式）。
@@ -170,7 +173,7 @@ func (r *Runner) ProbeOne(ctx context.Context, t Target) Result {
 				k = failureKind(res, err)
 				until, _ := errs.RetryAtOf(err)
 				r.pool.NoteErrorAt(t.Kind, nc.UID, k, until)
-				if !k.AccountBlamed() && !errs.CredentialKind(k) {
+				if k.StopRetry() {
 					return res
 				}
 			}
@@ -302,38 +305,10 @@ func (r *Runner) Full(ctx context.Context, entries []Entry) Run {
 
 // noCandidateReason 把「该渠道无可用账号」写成一句能处置的话。
 //
-// 只报「无可用账号」等于把问题原样丢回给用户：既看不出是**等一会儿**（冷却到点自恢复）
-// 还是**要动手**（已禁用，需重新登录），也看不出是哪个号的锅。
-// 所以这里把池里每个号的状态逐个列出来（uid 只留前 8 位，够对上面板账号行）。
+// 逐号运行态的文案本体在 pool.ReasonNoCandidate —— 网关 503 与面板体检必须是**同一句话**：
+// 客户端说「冷却到 00:03 自恢复」而面板说「已禁用」，用户不知道该信哪个（2026-09-27 教训）。
 func noCandidateReason(states []channel.AccountState) string {
-	if len(states) == 0 {
-		return "该渠道无可用账号，无法探测（池里没有该渠道的账号）"
-	}
-	now := time.Now()
-	parts := make([]string, 0, len(states))
-	for _, st := range states {
-		switch {
-		case st.Disabled:
-			if st.Reason != "" {
-				parts = append(parts, shortUID(st.UID)+" 已禁用（"+st.Reason+"），需重新授权或手动启用")
-			} else {
-				parts = append(parts, shortUID(st.UID)+" 已禁用，需重新授权或手动启用")
-			}
-		case !st.Until.IsZero() && now.Before(st.Until):
-			parts = append(parts, shortUID(st.UID)+" 冷却至 "+st.Until.Local().Format("01-02 15:04")+"（到点自恢复）")
-		default:
-			parts = append(parts, shortUID(st.UID)+" 状态未知")
-		}
-	}
-	return "该渠道无可用账号，无法探测（" + strings.Join(parts, "；") + "）"
-}
-
-// shortUID 把 uid 截到前 8 位：面板账号行就是这么显示的，够对上号又不啰嗦。
-func shortUID(uid string) string {
-	if len(uid) > 8 {
-		return uid[:8]
-	}
-	return uid
+	return "该渠道无可用账号，无法探测（" + pool.ReasonNoCandidate(states) + "）"
 }
 
 // plan 把渠道素材展开成探测目标；无可用账号的渠道单独记一条失败，
