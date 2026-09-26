@@ -73,6 +73,11 @@
 /* 图片验证码：图片按原始尺寸显示，不拉伸（拉糊了用户就看不清字符了） */
 .direct-login .captcha-img{display:block;margin:0 0 10px;max-width:100%;height:auto;
   border:1px solid var(--border);border-radius:6px;background:#fff;image-rendering:crisp-edges}
+/* 交互控件（数美人机校验）的挂载点。控件自己会往里插 DOM 并设宽度，
+   这里只保证：有最小高度（不然加载过程中面板会抖）、超宽能横向滚动（窄屏手机上
+   控件按固定像素布局，不给滚动会被裁掉右边的图形，用户就点不全了）。 */
+.direct-login .widget-host{min-height:60px;overflow-x:auto;overflow-y:hidden;
+  display:flex;justify-content:center}
 
 /* 覆盖层自己滚：内容高过视口时不该把整页撑长（否则背后页面能被滑出来）。 */
 .auth-main{padding:22px 18px 40px}
@@ -315,6 +320,27 @@
             <div class="row" style="margin-top:10px;align-items:center;gap:10px">
               <button class="btn primary" @click="submitStep" :disabled="busy">
                 {{ authStep.submit_label || '提交' }}</button>
+            </div>
+          </div>
+
+          <!-- 渠道自带的交互控件（目前是数美「空间点选」人机校验）：
+               把控件**原样挂在这里** —— 用户看到并操作的，就是上游那一屏，
+               题目随机（形如「点击图中最小的蓝色三棱锥」），点一下就过。
+               控件自己渲染、自己跟它的服务器校验，我们只收它给的凭据（rid）再交回服务端。
+
+               为什么不做成「服务端抓一张图给你填」：答案是点击坐标 + 校验发生在
+               数美服务器上、凭据是一次性签发的 —— 静态图没有唯一答案，服务端也造不出
+               合法凭据。挂控件才是原路走一遍真实登录，只是界面换成我们自己的。 -->
+          <div class="direct-login" v-if="authStep && authStep.stage==='widget'">
+            <div class="dl-title">{{ authStep.title || '人机校验' }}</div>
+            <div class="sub" v-if="authStep.hint" style="margin:0 0 10px">{{ authStep.hint }}</div>
+            <div id="shumei-host" class="widget-host"></div>
+            <div class="sub" v-if="widgetMsg" style="margin:8px 0 0">{{ widgetMsg }}</div>
+            <div class="sub" v-if="authStep.message" style="margin:8px 0 0;color:var(--danger,#c0392b)">{{ authStep.message }}</div>
+            <div class="row" style="margin-top:10px;align-items:center;gap:10px">
+              <button class="btn" @click="remountWidget" :disabled="busy||widgetState==='loading'">
+                {{ widgetState==='error' ? '重新加载校验' : '换一题' }}</button>
+              <span class="hint" style="margin:0">校验由上游的人机验证服务提供；点完自动继续。</span>
             </div>
           </div>
 
@@ -1449,6 +1475,19 @@ createApp({
     const stepForm=reactive({});
     // captchaField 是图片验证码输入的保留字段名，与服务端 channel.FieldCaptcha 对齐。
     const captchaField='captcha_code';
+    // widgetResultKey 是「交互控件结果」的保留字段名，与服务端 channel.FieldWidgetResult 对齐。
+    // 值是 JSON 字符串（如 {"region":"CN","rid":"…"}），内容由渠道定义，面板只负责搬运。
+    const widgetResultKey='captcha_result';
+    // widget* 是人机校验控件的挂载状态：
+    //   widgetState: '' | 'loading' | 'ready' | 'error'
+    //   widgetMsg   : 给用户看的一句话（加载中/已通过/为什么失败）
+    //   widgetResult: 控件成功回调给的对象（含 rid）—— 只活在内存里，用完即弃，不写 localStorage
+    const widgetState=ref('');
+    const widgetMsg=ref('');
+    const widgetResult=ref(null);
+    // widgetMountedFor 记录「已经为哪一屏挂过控件」，避免每次重绘都重挂
+    // （重挂会换题，用户刚看清的题就没了）。
+    let widgetMountedFor='';
     let authTimer=null, authLeft=0;
 
     // ---------- 面板入口开关 ----------
@@ -1810,18 +1849,141 @@ createApp({
       }
     };
 
+    // ---------- 交互控件（人机校验）挂载 ----------
+    //
+    // 为什么要挂控件而不是「抓图给用户填」：数美的题是**空间点选**（点击坐标），
+    // 而且校验和凭据签发都在数美服务器上、是一次性的。静态图没有唯一正确答案，
+    // 服务端也造不出合法凭据。把控件原样挂上，走的就是真实登录流程，
+    // 只是界面从 chat.deepseek.com 换成了我们自己的面板。
+    //
+    // 核心层与面板都**不认识数美**：面板只知道「这一步要挂一个名叫 xxx 的控件」，
+    // 参数从服务端给的 widget_config 里读（红线三）。换别的控件只需加一个挂载器。
+
+    // parseWidgetCfg 读出本屏的控件参数（服务端给的是 JSON 对象，防御性地兼容字符串）。
+    const parseWidgetCfg=()=>{
+      const raw=authStep.value&&authStep.value.widget_config;
+      if(!raw)return null;
+      if(typeof raw==='string'){try{return JSON.parse(raw);}catch(e){return null;}}
+      return raw;
+    };
+
+    // loadScriptOnce 按地址加载一次脚本（重复调用复用同一个 <script>）。
+    const loadScriptOnce=src=>new Promise((resolve,reject)=>{
+      if(!src)return reject(new Error('控件脚本地址为空'));
+      const id='wgt-'+src;
+      if(document.getElementById(id))return resolve();
+      const s=document.createElement('script');
+      s.id=id;s.src=src;s.async=true;
+      s.onload=()=>resolve();
+      s.onerror=()=>reject(new Error('人机校验脚本加载失败（检查网络，或广告拦截插件是否把它挡了）'));
+      document.head.appendChild(s);
+    });
+
+    // mountWidget 把当前这一屏要求的控件挂到 #shumei-host 上。
+    //
+    // 数美控件的接口形状（从官方前端 bundle 里读出来的，别按直觉改）：
+    //     initSMCaptcha(config, onInstance)  →  onInstance(实例)
+    //     然后 实例.onReady(cb) / 实例.onSuccess(cb) / 实例.onError(cb)
+    // 注意：第 2 个参数**不是**成功回调，它收到的是控件实例本身 ——
+    // 曾经误当成「拿结果的地方」，结果每次挂载都立刻被判「没通过」，
+    // 而题面明明是对的、用户也还没点。这个坑值得留一行注释。
+    const mountWidget=async()=>{
+      const cfg=parseWidgetCfg();
+      const host=document.getElementById('shumei-host');
+      widgetResult.value=null;
+      if(!cfg||!host){widgetState.value='error';widgetMsg.value='控件参数或挂载点缺失，请刷新页面重试';return;}
+      widgetState.value='loading';
+      widgetMsg.value='正在加载人机校验…';
+      try{
+        await loadScriptOnce(cfg.script);
+        if(typeof window.initSMCaptcha!=='function'){
+          throw new Error('人机校验脚本加载了，但没有暴露 initSMCaptcha（上游可能改了控件）');
+        }
+        host.innerHTML='';
+
+        // ① 取到控件实例
+        const inst=await new Promise((resolve,reject)=>{
+          let settled=false;
+          const done=(fn,v)=>{if(settled)return;settled=true;fn(v);};
+          let ret=null;
+          try{
+            ret=window.initSMCaptcha({
+              organization:cfg.organization,appId:cfg.appId,appendTo:'shumei-host',
+              maskBindClose:false,lang:cfg.lang,mode:cfg.mode
+            },i=>done(resolve,i||ret));
+          }catch(e){done(reject,e);}
+          // 有的版本直接返回实例（两条路都兜住，免得上游小改一下就挂不起来）
+          if(ret&&typeof ret.onSuccess==='function')done(resolve,ret);
+          window.setTimeout(()=>done(reject,new Error('人机校验加载超时，点「换一题」再试')),30000);
+        });
+        if(!inst||typeof inst.onSuccess!=='function'){
+          throw new Error('人机校验控件没有暴露 onSuccess，收不到校验结果');
+        }
+
+        // ② 等用户点选。pass=false 不是「挂载失败」，是这一次没点对 ——
+        //    控件自己会换一题、让用户重试，所以我们**继续等**，只在屏上给一句话，
+        //    而不是把整块拆掉（拆掉会把控件正在显示的新题一起清掉）。
+        const res=await new Promise((resolve,reject)=>{
+          let settled=false;
+          const done=(fn,v)=>{if(settled)return;settled=true;fn(v);};
+          try{
+            if(typeof inst.onReady==='function'){
+              inst.onReady(()=>{if(!settled)widgetMsg.value='请在图中点一下题目要求的图形';});
+            }
+            inst.onSuccess(r=>{
+              if(r&&r.pass)done(resolve,r);
+              else done(reject,new Error('这次没通过，点「换一题」再试'));
+            });
+            if(typeof inst.onError==='function'){
+              inst.onError((type,detail)=>{
+                done(reject,new Error('人机校验出错：'+((detail&&detail.message)||detail||type||'未知原因')));
+              });
+            }
+          }catch(e){done(reject,e);}
+          window.setTimeout(()=>done(reject,new Error('人机校验等太久没通过，点「换一题」再试')),120000);
+        });
+
+        widgetResult.value=res;
+        widgetState.value='ready';
+        widgetMsg.value='校验已通过，正在发送验证码…';
+        // 点完自动继续：用户点这一下就是为了发码，不该再让他多按一次。
+        submitStep();
+      }catch(e){
+        widgetState.value='error';
+        widgetMsg.value=(e&&e.message)?e.message:'人机校验加载失败';
+      }
+    };
+
+    // remountWidget 重新挂一次（换一题 / 加载失败重试）。
+    const remountWidget=()=>{
+      const sig=authStep.value?JSON.stringify(authStep.value):'';
+      widgetMountedFor=sig;
+      mountWidget();
+    };
+
     // submitStep 交「多步 / 验证码」流程里当前这一步的输入。
     //
     // 关键设计：面板**不判断自己在第几步**，也不自己决定下一步显示什么 —— 它只把
     // 用户填的值交上去，拿服务端回的 step（推进后的新屏）重绘。所以「发码 → 填码」
-    // 还是「图验 → 发码 → 填码」，前端代码完全一样。
+    // 还是「人机校验 → 发码 → 填码」，前端代码完全一样。
     const submitStep=async()=>{
       if(busy.value)return;
       const cur=authStep.value||{};
       const filled={};
-      for(const f of (cur.fields||[]))filled[f.name]=String(stepForm[f.name]??'');
-      const missing=(cur.fields||[]).filter(f=>f.required&&!(filled[f.name]||'').trim());
-      if(missing.length)return toast('请先填写：'+missing.map(f=>f.label).join('、'));
+      if(cur.stage==='widget'){
+        // 控件屏没有表单字段：要交的是**控件自己给的凭据**。
+        // 还没点完就不提交（提交了服务端也只会让你重来），给一句人话说明当前状态。
+        const wr=widgetResult.value;
+        if(!wr||!wr.rid){
+          return toast(widgetState.value==='loading'?'人机校验还在加载，稍等一下':'请先点一下图中的图形完成校验');
+        }
+        const cfg=parseWidgetCfg()||{};
+        filled[widgetResultKey]=JSON.stringify({region:cfg.region||'CN',rid:wr.rid});
+      }else{
+        for(const f of (cur.fields||[]))filled[f.name]=String(stepForm[f.name]??'');
+        const missing=(cur.fields||[]).filter(f=>f.required&&!(filled[f.name]||'').trim());
+        if(missing.length)return toast('请先填写：'+missing.map(f=>f.label).join('、'));
+      }
       busy.value=true;
       try{
         const r=await post('/api/login/step',{values:filled});
@@ -1831,11 +1993,15 @@ createApp({
         const st=next.stage||'';
         if(st==='done'||(st==='input'&&next.submit_label==='登录'))pollAuth();
         else if(st==='failed')toast(next.message||'这一步失败了');
+        else if(st==='widget')toast(next.message||'请重新点一次题目');
         else if(st==='input'&&next.title)toast('已提交 · '+next.title);
         else toast('已提交');
       }catch(e){
         // 失败时服务端不推进状态机：这里只提示原因，界面留在原步骤让用户改了重试。
         toast(e&&e.message?e.message:'提交失败');
+        // 控件屏例外：这次凭据多半是过期/用过的（一次性），留在原地也交不出新的，
+        // 所以直接换一题，让用户马上能再来一次，而不是对着一个已经作废的题干瞪眼。
+        if((authStep.value||{}).stage==='widget')remountWidget();
       }finally{
         busy.value=false;
       }
@@ -1847,11 +2013,29 @@ createApp({
     // 验证码输入框里，用户一按回车就把手机号当验证码提交了。
     const applyStep=st=>{
       authStep.value=st&&st.stage?st:null;
-      if(!authStep.value)return;
+      if(!authStep.value){
+        // 离开多步流程：把控件状态一并清干净，别让下一轮看到上一轮的痕迹。
+        widgetMountedFor='';widgetState.value='';widgetMsg.value='';widgetResult.value=null;
+        return;
+      }
       const keep={};
       for(const f of (authStep.value.fields||[]))if(stepForm[f.name]!=null)keep[f.name]=stepForm[f.name];
       for(const k of Object.keys(stepForm))delete stepForm[k];
       for(const k of Object.keys(keep))stepForm[k]=keep[k];
+      if(authStep.value.stage!=='widget'){
+        // 离开控件屏（发码成功 → 验证码屏）：同样的清理，否则残留的 rid 会被
+        // 误当成「已通过校验」，用户看到「校验已通过」却还没发码。
+        widgetMountedFor='';widgetState.value='';widgetMsg.value='';widgetResult.value=null;
+        return;
+      }
+      // 控件屏：进屏就自动挂上（用户看到并操作的就是上游那一屏）。
+      // 必须等 DOM 就绪 —— applyStep 是同步改状态的，此刻 Vue 还没渲染出 #shumei-host。
+      // signature 用整屏 JSON：一旦服务端给的提示变了（如「凭据失效，请重新点一次题目」），
+      // 就重挂换一道新题，而不是让用户对着一道已经作废的题干瞪眼。
+      const sig=JSON.stringify(authStep.value);
+      if(widgetMountedFor===sig)return;
+      widgetMountedFor=sig;
+      nextTick(()=>mountWidget());
     };
 
     const submitCallback=async()=>{
@@ -2453,6 +2637,9 @@ createApp({
       // 账号密码直登（DeepSeek 这类）：表单字段由服务端声明，面板只负责渲染与提交。
       hasDirectLogin,loginFields,loginForm,submitPassword,
       authStep,stepForm,captchaField,submitStep,applyStep,
+      // 交互控件（人机校验）的挂载状态：模板用它显示「正在加载 / 已通过 / 为什么失败」。
+      // 挂载与提交逻辑在内部，不必透出；这三个是模板直接读/点的。
+      widgetState,widgetMsg,remountWidget,
       channelName,channelClass,icoOf,pickChannels,statusPill,statusIcon,statusText,sevLabel,
       accountPill,accountIcon,accountText,checkinPill,checkinText,logPill,logIcon,logText,accountSections,catOf,
       srcLabel,humanCtx,capsText,shortUid,fmtNum,fmtTime,fmtDate,barPct,barColor,

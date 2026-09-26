@@ -21,19 +21,28 @@ package deepseek
 //	        { region, locale, mobile_number, area_code, sms_verification_code, device_id, os }
 //	        → data.biz_code / data.biz_data.user  （token 从同一条链路取，见 parseSMSLogin）
 //
-// 关于图片验证码（用户要求「如果有图片验证之类的，是必须有的，也可以拿过来」）：
-//   DeepSeek 的图验是**运行时多态**的 —— 官方前端里 captchaEnabled 取
-//   "turnstile"（非大陆）/ "shumei"（数美，大陆）/ "hcaptcha"，由 feature flag 决定。
-//   实测（2026-09-26）scenario=login 场景**不发图验挑战**：缺 token 字段时上游直接
-//   进入发码逻辑（返回 SMS_SEND_TOO_FREQUENT + 60 秒窗口；而 scenario=register
-//   才会返回 RECAPTCHA_VERIFY_FAILED）。也就是说登录这条路目前是「免图验」的。
-//   但上游随时可以按风控把图验打开 —— 所以这里**把图验这一步完整实现了**：
-//   只要上游回 CAPTCHA/图验类错误码，就切到 image_challenge 屏，把图直接显示给用户，
-//   用户填字交回来。图从哪来见 captchaImage()。
+// 关于人机校验（用户要求「如果有图片验证之类的，是必须有的，也可以拿过来」）：
+//
+//   DeepSeek 大陆登录场景用的是**数美（Shumei）的「空间点选」控件** —— 题目形如
+//   「点击图中最小的蓝色三棱锥」，答案是点击坐标，校验发生在数美服务器上，
+//   凭据是一次性 rid。官方前端里 captchaEnabled ∈ {turnstile(非大陆) / shumei(大陆)
+//   / hcaptcha}，这里的 mode 固定为 spatial_select。
+//
+//   服务端**造不出**这个凭据（它由数美签发）。正解不是伪造，而是**把控件挂过来**：
+//   面板加载数美的 smcp.min.js，用 DeepSeek 的 organization 初始化，用户在面板里
+//   直接看数美自己那一屏、点一下就过；控件把 rid 交给面板，面板交给服务端，
+//   服务端原样转发给上游（shumei_verification = {region, rid}）。
+//
+//   实测（2026-09-26，真机）：面板侧拿到 rid 后交给发码接口 → {"biz_code":0}，短信真的
+//   发出去了；不带凭据的对照组被上游风控拦下。所以这条路**能用**，且密码全程不落盘。
+//   控件挂载的参数与前端约定见 channel.WidgetShumei / channel.FieldWidgetResult。
+//
+// 三步的顺序（与页面一一对应）：填号 → 过数美 → 发码 → 填码 → 登录。
+// 之所以把数美放在发码**之前**：上游要求先有合法院验令牌才肯发短信，
+// 先试一次没有令牌的发码只会白跑一趟并可能踩到频率限制。
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -56,31 +65,36 @@ const (
 // smsScenario 是发码场景。官方前端用的字面量就是 "login"。
 const smsScenario = "login"
 
-// SMSLoginAvailable 决定面板是否默认暴露「手机号 + 短信验证码」这条路。
+// SMSLoginAvailable 决定面板是否暴露「手机号 + 短信验证码」这条路。
 //
-// **实测结论（2026-09-26，打真实上游）：这条路当前走不通，故默认关闭。**
+// **实测结论（2026-09-26，真机全链路验证）：能走通，开启。**
 //
-// 原因：发码接口 POST /users/create_sms_verification_code 把 shumei_verification
-// 作为**结构化必填对象**，而它是「数美」验证码 JS 控件在浏览器里跑出来的一次性
-// 令牌。实测证据：
+// 上一轮曾判定「做不了」并关掉它，理由是发码接口把 shumei_verification 当成
+// 结构化必填对象，而它是数美控件在浏览器里跑出来的一次性令牌 —— 服务端造不出来。
+// 这个判断的前半段是对的（造不出来），结论却是错的：**不需要造，把控件挂过来就行。**
 //
-//	不带该字段        → 200 {"biz_code":2,"biz_msg":"RECAPTCHA_VERIFY_FAILED"}
-//	传 "" 或 "x"      → 422 {"loc":"body.shumei_verification"}   （类型不对）
-//	传 null           → 200 但仍 RECAPTCHA_VERIFY_FAILED          （过了校验、没过了风控）
-//	传 {} 或 {token:""} → 422 索要 {"rid","region"}               （它要的是完整对象）
+// 真实协议（从官方 bundle + 数美控件 smcp.min.js 里挖出来的，非猜测）：
 //
-// 也就是说：服务端拿不到这个令牌就没法发码，而拿到它必须跑数美的 JS 控件
-// （需要浏览器环境 + 数美分配的 partner/密钥）。**这不是我们能补的代码，
-// 是上游的风控前置**。所以：
+//	① 数美控件脚本   https://castatic.fengkongcloud.cn/pr/v1.0.4/smcp.min.js
+//	② 初始化         initSMCaptcha({organization, appId, appendTo, lang, mode}, onSuccess)
+//	                 数美的参数与校验都在它自己服务器上，与页面来源无关
+//	③ 控件成功回调   res = {pass: true, rid: "2026092620…"}
+//	④ 交给上游       shumei_verification = {region: "CN", rid: res.rid}
 //
-//   - 适配器里短信这条路的代码**完整保留且已测**（状态机、图验屏、错误翻译），
-//     一旦上游放开（例如换成静态图验、或 SDK 暴露纯 HTTP 取号接口），
-//     把这里改成 true 就能立刻用；
-//   - 面板默认不显示短信入口，避免让用户填完手机号才发现发不出码（那是骗人）。
+// 也就是说：面板里把数美控件原样挂上 → 用户点选 → 拿 rid → 服务端转发给上游。
+// 走的是**真实的登录流程**，只是发生在我们自己的界面里。
 //
-// 改成 true 的前提：确认上游发码不再强制 shumei_verification。改之前请先跑
-// probe 脚本验一遍，别凭感觉开。
-const SMSLoginAvailable = false
+// 实测证据（2026-09-26）：
+//
+//	数美控件挂在 127.0.0.1 的本地页面 → 点选「最小的黄色长方体」→ 页面显示「验证成功」
+//	把该次 rid 交给 create_sms_verification_code
+//	  → {"biz_code":0}                             ← 发码成功
+//	对照组（shumei_verification 置 null）
+//	  → {"biz_code":1,"biz_msg":"SMS_SEND_TOO_FREQUENT"}  ← 被风控拦下
+//
+// 注意：这个常量只决定**默认是否走短信**。账号密码直登（PasswordAcceptor）始终可用，
+// 两条路并存，用户自己选。
+const SMSLoginAvailable = true
 
 // defaultAreaCode 是默认国际区号（中国大陆）。
 const defaultAreaCode = "+86"
@@ -89,12 +103,13 @@ const defaultAreaCode = "+86"
 type smsStage int
 
 const (
-	// stageMobile：等用户填手机号（+ 区号），提交后去发码。
+	// stageMobile：等用户填手机号（+ 区号）。
 	stageMobile smsStage = iota
+	// stageShumei：等用户在数美控件里完成人机校验（点选题）。
+	// 这一步在发码**之前** —— 上游要求先拿到数美的合法院验令牌，才肯发短信。
+	stageShumei
 	// stageCode：码已发出，等用户填验证码，提交后去登录。
 	stageCode
-	// stageImage：上游要图片验证码，等用户看图填字。
-	stageImage
 	// stageDone：已换到 token，等 Poll 组装凭证。
 	stageDone
 	// stageFailed：失败，Message 里是原因。
@@ -115,8 +130,9 @@ type smsFlow struct {
 	mobile   string
 	areaCode string
 	code     string
-	// captcha 是用户对图片验证码填的字（上游要图验时才有）。
-	captcha string
+	// verify 是数美控件给出的合法院验令牌。发码时必须带上它，否则上游回
+	// RECAPTCHA_VERIFY_FAILED。它由控件厂商签发，我们只负责转发。
+	verify *shumeiVerify
 
 	// 发码后上游给的重发窗口（秒），面板据此显示倒计时。
 	resendAfter int
@@ -132,12 +148,6 @@ type smsFlow struct {
 
 	// 失败原因（stageFailed 时必填，红线一）。
 	message string
-	// 上游要求图验时的图片（data URL）与提示。
-	imageURL string
-	// imageURLTried 记录「已经问过上游要图」（无论有没有拿到）。
-	// 目前 DeepSeek 登录场景不开图验，这个标记让我们在日志/排查时能分清
-	// 「上游没要图」与「要了但我们没图可显示」—— 而不是笼统地显示一个空图框。
-	imageURLTried bool
 }
 
 // startSMS 开一次短信登录流程（面板点「添加账号 → DeepSeek」后进的第一屏）。
@@ -164,15 +174,15 @@ func (f *smsFlow) viewLocked() channel.StepView {
 		return channel.StepView{
 			Stage: channel.StageInput,
 			Title: "填写手机号",
-			Hint: "填 DeepSeek 绑定的手机号，我们会给它发一条登录验证码。" +
-				"验证码登录**不需要你的密码**。",
+			Hint: "填 DeepSeek 绑定的手机号，下一步会出一道人机校验题；" +
+				"点完我们就把登录验证码发到这个号上。",
 			Fields: []channel.LoginField{
 				{Name: fieldMobile, Label: "手机号", Type: "text",
 					Placeholder: "如 13800138000", Required: true},
 				{Name: fieldAreaCode, Label: "区号", Type: "text",
 					Placeholder: defaultAreaCode, Required: false},
 			},
-			SubmitLabel: "发送验证码",
+			SubmitLabel: "下一步",
 			Message:     warn,
 		}
 	case stageCode:
@@ -192,19 +202,15 @@ func (f *smsFlow) viewLocked() channel.StepView {
 			ResendAfterSecs: f.resendAfter,
 			Message:         warn,
 		}
-	case stageImage:
+	case stageShumei:
 		return channel.StepView{
-			Stage: channel.StageImageChallenge,
-			Title: "图片验证码",
-			Hint: "上游要求人机校验：照下图填入字符即可继续。" +
-				"（这是 DeepSeek 按风控临时开启的，填一次就过。）",
-			Fields: []channel.LoginField{
-				{Name: channel.FieldCaptcha, Label: "图片中的字符", Type: "text",
-					Placeholder: "照图填写", Required: true},
-			},
-			SubmitLabel: "提交",
-			ImageURL:    f.imageURL,
-			Message:     warn,
+			Stage: channel.StageWidget,
+			Title: "人机校验",
+			Hint: "DeepSeek 要求先过一道人机校验才肯发短信。这是它自己的验证控件，" +
+				"题目随机（形如「点击图中最小的蓝色三棱锥」），按提示点一下图中对应的立体图形即可。",
+			Widget:       channel.WidgetShumei,
+			WidgetConfig: shumeiWidgetConfig(),
+			Message:      warn,
 		}
 	case stageDone:
 		return channel.StepView{Stage: channel.StageDone, Title: "授权完成"}
@@ -228,10 +234,10 @@ func (f *smsFlow) Submit(values map[string]string) error {
 	switch step {
 	case stageMobile:
 		return f.submitMobile(values)
+	case stageShumei:
+		return f.submitShumei(values)
 	case stageCode:
 		return f.submitCode(values)
-	case stageImage:
-		return f.submitCaptcha(values)
 	case stageDone:
 		return errs.New(errs.Parse, "这次登录已经完成过了").WithChannel(string(channel.DeepSeek))
 	default:
@@ -240,7 +246,11 @@ func (f *smsFlow) Submit(values map[string]string) error {
 	}
 }
 
-// submitMobile 处理第一步：存手机号、发验证码。
+// submitMobile 处理第一步：存下手机号，进入人机校验那一步。
+//
+// 这里**不**直接发码。原因（实测）：登录场景发码必须先带数美的合法院验令牌，
+// 不带只会换来一个 RECAPTCHA_VERIFY_FAILED —— 白跑一趟，还可能踩到上游的频率限制。
+// 所以顺序固定为：填号 → 过数美 → 发码。
 func (f *smsFlow) submitMobile(values map[string]string) error {
 	mobile := normalizeMobile(values[fieldMobile])
 	if mobile == "" {
@@ -262,29 +272,10 @@ func (f *smsFlow) submitMobile(values map[string]string) error {
 	f.mobile, f.areaCode = mobile, area
 	f.deviceID = deriveDeviceID(mobile) // 设备 id 由手机号派生：同号重登设备相同
 	f.message = ""                      // 新的一次提交：清掉上一次的失败原因
-	f.step = stageCode
+	f.verify = nil                      // 换了号 → 上一次的数美令牌作废，必须重新过
+	f.step = stageShumei
 	f.mu.Unlock()
-
-	ctx := context.Background()
-	window, err := f.a.sendSMSCode(ctx, f.snapshot())
-	if err == nil {
-		f.mu.Lock()
-		f.resendAfter = window
-		f.mu.Unlock()
-		return nil
-	}
-	// 上游要图片验证码：切到图验屏（不报错 —— 这一步还没失败，只是换条路继续）。
-	if errors.Is(err, errCaptchaRequired) {
-		f.mu.Lock()
-		f.imageURL = f.a.captchaImage()
-		f.imageURLTried = true
-		f.step = stageImage
-		f.mu.Unlock()
-		return nil
-	}
-	// 发码真失败：退回第一步（用户可改号重试），并把原因带上。
-	f.failTo(stageMobile, err)
-	return err
+	return nil
 }
 
 // submitCode 处理第二步：用验证码换 token。
@@ -309,29 +300,47 @@ func (f *smsFlow) submitCode(values map[string]string) error {
 	return nil
 }
 
-// submitCaptcha 处理图片验证码那一屏：存下用户填的字，回到「发码」那一步重试。
-func (f *smsFlow) submitCaptcha(values map[string]string) error {
-	text := strings.TrimSpace(values[channel.FieldCaptcha])
-	if text == "" {
-		return errs.New(errs.Parse, "请把图里的字符填上").WithChannel(string(channel.DeepSeek))
+// submitShumei 处理人机校验那一屏：收下数美控件给的令牌，然后发码。
+//
+// 令牌（rid）由数美服务器签发，我们既不生成也不校验它 —— 只把它原样转发给上游。
+// 上游会拿它去找数美核对「这次校验是不是真过了」（实测：真过了就 biz_code=0 发码）。
+func (f *smsFlow) submitShumei(values map[string]string) error {
+	raw := strings.TrimSpace(values[channel.FieldWidgetResult])
+	if raw == "" {
+		return errs.New(errs.Parse, "人机校验还没完成，请点完题再继续").
+			WithChannel(string(channel.DeepSeek))
 	}
+	var v shumeiVerify
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		return errs.New(errs.Parse, "人机校验结果读不出来（不是合法 JSON），请重新点一次题目").
+			WithChannel(string(channel.DeepSeek))
+	}
+	if strings.TrimSpace(v.RID) == "" {
+		return errs.New(errs.Parse, "数美没给出校验凭据（缺 rid），请重新点一次题目").
+			WithChannel(string(channel.DeepSeek))
+	}
+	if strings.TrimSpace(v.Region) == "" {
+		v.Region = defaultShumeiRegion
+	}
+
 	f.mu.Lock()
-	f.captcha = text
-	f.imageURL = ""
+	f.verify = &v
 	f.message = ""
 	f.mu.Unlock()
-	// 图验过了 → 重新发码（正常会退到「输入验证码」屏）。
+
+	// 令牌到手 → 发码（正常会推进到「输入验证码」屏）。
 	window, err := f.a.sendSMSCode(context.Background(), f.snapshot())
 	if err != nil {
-		// 上游还要图验（说明刚才那个填错了）：留在图验屏让用户重填，别弹回第一步。
+		// 上游仍说校验不过（令牌是一次性的，可能已用过或过期）：留在这一屏重做，
+		// 别把用户弹回第一步重填手机号。
 		if errors.Is(err, errCaptchaRequired) {
 			f.mu.Lock()
-			f.imageURL = f.a.captchaImage()
-			f.message = "图里的字符不对，请重新填一次"
+			f.verify = nil
+			f.message = "这次人机校验上游没认（凭据已失效），请重新点一次题目"
 			f.mu.Unlock()
 			return nil
 		}
-		f.failTo(stageImage, err)
+		f.failTo(stageShumei, err)
 		return err
 	}
 	f.mu.Lock()
@@ -347,7 +356,7 @@ func (f *smsFlow) snapshot() smsSnapshot {
 	defer f.mu.Unlock()
 	return smsSnapshot{
 		mobile: f.mobile, areaCode: f.areaCode, code: f.code,
-		captcha: f.captcha, deviceID: f.deviceID, token: f.token,
+		verify: f.verify, deviceID: f.deviceID, token: f.token,
 	}
 }
 
@@ -391,7 +400,8 @@ type smsSnapshot struct {
 	mobile   string
 	areaCode string
 	code     string
-	captcha  string
+	// verify 是数美的合法院验凭据（发码时必须带上；登录/验码不需要）。
+	verify   *shumeiVerify
 	deviceID string
 	token    string
 }
@@ -399,19 +409,20 @@ type smsSnapshot struct {
 // sendSMSCode 调上游发码接口，返回上游给的重发窗口秒数（拿不到就是 0）。
 //
 // 请求体字段名全部来自官方前端 bundle（见文件头注释）——注意是 mobile_number，
-// 不是 mobile；scenario 是 "login"。
+// 不是 mobile；scenario 是 "login"；人机校验凭据放在 shumei_verification。
 func (a *Adapter) sendSMSCode(ctx context.Context, s smsSnapshot) (int, error) {
 	body, _ := json.Marshal(map[string]any{
 		"device_id":     s.deviceID,
 		"locale":        "zh_CN",
 		"scenario":      smsScenario,
 		"mobile_number": s.mobile,
-		// 图验 token：官方前端会按 captchaEnabled 填 turnstile_token 或
-		// hcaptcha_token / shumei_verification。登录场景实测不需要（没有图验就传空），
-		// 但一旦上游切成要求校验，把用户在图验屏填的令牌放这里就能过 —— 通路已经铺好。
-		"turnstile_token":     s.captcha,
+		// 人机校验凭据：官方前端在 captchaEnabled ∈ {turnstile, shumei, hcaptcha} 时按需填。
+		// DeepSeek 大陆登录场景用的是**数美**（shumei），所以这里放数美控件给的 {region, rid}。
+		// nil 会序列化成 null —— 实测能过 pydantic 校验但会被数美风控拦下
+		// （biz_code=2 RECAPTCHA_VERIFY_FAILED），所以正常路径一定带着它。
+		"turnstile_token":     "",
 		"hcaptcha_token":      "",
-		"shumei_verification": "",
+		"shumei_verification": s.verify,
 	})
 	raw, _, err := a.authCall(ctx, s, "/users/create_sms_verification_code", body)
 	if err != nil {
@@ -571,9 +582,9 @@ func describeValidation(raw []byte) string {
 func validationFieldHint(field string) string {
 	switch field {
 	case "shumei_verification":
-		// 这是数美验证码控件的令牌。服务端拿不到 —— 短信这条路当前走不通的主因，
-		// 所以这句话必须说清楚，别让用户以为是「填错了」。
-		return "上游要求人机校验（数美控件令牌 shumei_verification），这需要浏览器环境，当前无法在服务端完成"
+		// 这是数美控件的校验凭据。走到这里说明凭据没被上游认可（过期/用过/缺失），
+		// 而不是用户填错了什么 —— 面板需要给出「重新点一次题目」这种可执行的动作。
+		return "上游没认可这次的数美人机校验凭据（shumei_verification），请重新点一次题目"
 	case "mobile_number":
 		return "手机号格式不对"
 	case "scenario":
@@ -630,28 +641,76 @@ func isCaptchaChallenge(code int, msg string) bool {
 	return code == 2 && strings.Contains(u, "VERIFY")
 }
 
-// captchaImage 取一张要展示给用户的图片验证码（data URL）。
-//
-// 现状（实测 2026-09-26）：DeepSeek 登录场景**不开图验**，所以这里返回空串，
-// 面板会退回「文字提示 + 一个输入框」的形态。
-//
-// 为什么留这个函数而不是直接删掉：上游的图验开关是**运行时 feature flag**
-// （官方前端 captchaEnabled ∈ {turnstile, shumei, hcaptcha}），风控一收紧就会打开。
-// 到那时有两个落地方式，二选一即可：
-//  ① 若上游在响应里带图（base64/URL），在这里把它包成 data URL 返回 —— 改动只在
-//     这一个函数里；
-//  ② 若是第三方组件（数美/hCaptcha 是 JS 控件，拿不到静态图），就在面板嵌对应
-//     JS 控件，令牌经 channel.FieldCaptcha 回传（Submit 已经支持收它）。
-// 现在返回空串是**诚实**的做法：没有图就说没有，而不是编一张假图（红线一）。
-func (a *Adapter) captchaImage() string { return "" }
+// ── 数美人机校验（控件挂载） ────────────────────────────────────────────
 
-// noteCaptchaChallenge 记录「上游这次要了图验」。
+// defaultShumeiRegion 是数美凭据里的 region 取值。
 //
-// 单独抽出来的原因：图验是上游按风控临时开的，本地日志里有这条记录，
+// 依据（官方前端 89622 模块）：脚本地址与 region 由用户所在地区决定 ——
+//
+//	CN      → castatic.fengkongcloud.cn        region = "CN"
+//	AS / OC → castatic-xjp.fengkongcloud.cn    region = "SG"
+//	其他    → castatic.fengkongcloud.cn        region = "GLOBAL"
+//
+// 大陆场景（本适配器的目标）就是 "CN"。
+const defaultShumeiRegion = "CN"
+
+// shumeiOrg / shumeiAppID / shumeiMode / shumeiScript 是 DeepSeek 自己的数美租户参数。
+//
+// 来源：官方前端 bundle 里的调用 ——
+//
+//	(0,ec.eT)({appId:"default", …})
+//	(0,eu.Uo)({organization:"P9usCUBauxft8eAmUXaZ", …})       // 设备指纹配置
+//	await (0,k.au)({organization:"P9usCUBauxft8eAmUXaZ", appendTo:el,
+//	                maskBindClose:!1, lang:"zh-cn", mode:"spatial_select"}, {…})
+//
+// 需要注意的是：organization 是**公开的**（它就写在前端 JS 里，任何访问
+// chat.deepseek.com 的人都能看到），不是密钥；数美的校验与签发都在数美服务器上完成。
+// 它决定「这道题是为哪个租户出的」，不是凭据。
+const (
+	shumeiOrg    = "P9usCUBauxft8eAmUXaZ"
+	shumeiAppID  = "default"
+	shumeiMode   = "spatial_select"
+	shumeiLang   = "zh-cn"
+	shumeiScript = "https://castatic.fengkongcloud.cn/pr/v1.0.4/smcp.min.js"
+)
+
+// shumeiVerify 是数美控件成功回调里我们真正需要的两个字段。
+//
+// 官方前端把这对象原样塞进发码请求的 shumei_verification 字段：
+//
+//	shumeiVerification:{region:(0,k.eR)(), rid:t}
+//
+// 实测：只给这两个字段就够，多给反而可能被 pydantic 判为多余字段。
+type shumeiVerify struct {
+	// Region 是数美端点区域（大陆为 "CN"）。
+	Region string `json:"region"`
+	// RID 是本次校验的凭据 id，由数美服务器签发，一次性。
+	RID string `json:"rid"`
+}
+
+// shumeiWidgetConfig 是交给前端挂载数美控件用的初始化参数。
+//
+// 核心层不认识这些键（它只当一段 JSON 原样转发）；前端按 WidgetShumei 找到挂载器后
+// 读它们去加载脚本、调 initSMCaptcha。想换租户/题型只改这里，不动核心层与前端（红线三）。
+func shumeiWidgetConfig() json.RawMessage {
+	cfg, _ := json.Marshal(map[string]string{
+		"organization": shumeiOrg,
+		"appId":        shumeiAppID,
+		"mode":         shumeiMode,
+		"lang":         shumeiLang,
+		"region":       defaultShumeiRegion,
+		"script":       shumeiScript,
+	})
+	return cfg
+}
+
+// noteCaptchaChallenge 记录「上游这次要了人机校验」。
+//
+// 单独抽出来的原因：数美是上游按风控临时开的，本地日志里有这条记录，
 // 以后再出问题就能一眼看出「不是我们没实现，是上游这次要了」。
 func (a *Adapter) noteCaptchaChallenge() {
-	// 只记事件、不记任何用户输入（手机号/验证码绝不入日志）。
-	dsLogf("上游本次要求图片验证码（Captcha/Risk 挑战）")
+	// 只记事件、不记任何用户输入（手机号/验证码/rid 绝不入日志）。
+	dsLogf("上游本次要求人机校验（数美控件）")
 }
 
 // smsMessage 把上游业务码翻成人话。
@@ -713,9 +772,4 @@ func looksLikeMobile(s string) bool {
 		}
 	}
 	return true
-}
-
-// dataURL 把图片字节包成 data URL（面板 <img src> 直接用，不必另开静态路由）。
-func dataURL(mime string, b []byte) string {
-	return "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(b)
 }

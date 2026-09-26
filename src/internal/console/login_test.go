@@ -874,6 +874,87 @@ func TestLoginStepImageChallengeCarriesDataURL(t *testing.T) {
 	}
 }
 
+// TestLoginStepWidgetCarriesConfig 交互控件那一屏要把控件标识与初始化参数带给面板。
+//
+// 这是「挂数美人机校验」的关键一环：面板只认 Widget 这个名字，参数（organization /
+// mode / 脚本地址 / region）全在 WidgetConfig 里，控制台必须原样透传、**不得解释**它。
+// 少带一样，前端就挂不起来，而现场只会是一句「initSMCaptcha is not a function」。
+func TestLoginStepWidgetCarriesConfig(t *testing.T) {
+	cfg := json.RawMessage(`{"organization":"ORG-X","appId":"default","mode":"spatial_select","lang":"zh-cn","region":"CN","script":"https://castatic.example/smcp.min.js"}`)
+	sess := &fakeStepSession{script: []channel.StepView{{
+		Stage:        channel.StageWidget,
+		Title:        "人机校验",
+		Widget:       channel.WidgetShumei,
+		WidgetConfig: cfg,
+	}}}
+	ch := &fakeAuthChannel{kind: channel.DeepSeek, sess: &sess.fakeSession, sessOverride: sess}
+	h, token, _, _ := newLoginTestServer(t, ch)
+
+	w := authed(t, h, http.MethodPost, "/api/login/start", channelLoginReq{Channel: "deepseek"}, token)
+	var resp struct {
+		Step *channel.StepView `json:"step"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Step == nil || resp.Step.Stage != channel.StageWidget {
+		t.Fatalf("应当是控件屏，实际 %+v", resp.Step)
+	}
+	if resp.Step.Widget != channel.WidgetShumei {
+		t.Fatalf("控件标识没带给面板：%q", resp.Step.Widget)
+	}
+	// 参数必须**一字不改**地到面板（控制台不认识这些键，也不该动它们）。
+	var got map[string]string
+	if err := json.Unmarshal(resp.Step.WidgetConfig, &got); err != nil {
+		t.Fatalf("WidgetConfig 应当是原样的 JSON 对象，实际 %s（%v）", resp.Step.WidgetConfig, err)
+	}
+	want := map[string]string{"organization": "ORG-X", "appId": "default",
+		"mode": "spatial_select", "lang": "zh-cn", "region": "CN",
+		"script": "https://castatic.example/smcp.min.js"}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("WidgetConfig[%q] = %q, 想要 %q", k, got[k], v)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("WidgetConfig 键数 = %d, 想要 %d（控制台不该增删字段）：%s", len(got), len(want), resp.Step.WidgetConfig)
+	}
+}
+
+// TestLoginStepAcceptsWidgetResult 面板回传的控件凭据必须**原样**到渠道，
+// 且不能因为它是 JSON 字符串就被拦下或改写。
+//
+// 为什么值得单测：这几步的失败最难查 —— 凭据被截断/转义错一点，上游只会回
+// 「没通过校验」，看起来像用户点错了题，实际是搬运环节的问题。
+func TestLoginStepAcceptsWidgetResult(t *testing.T) {
+	sess := &fakeStepSession{script: []channel.StepView{
+		{Stage: channel.StageWidget, Title: "人机校验", Widget: channel.WidgetShumei},
+		{Stage: channel.StageInput, Title: "输入短信验证码"},
+	}}
+	ch := &fakeAuthChannel{kind: channel.DeepSeek, sess: &sess.fakeSession, sessOverride: sess}
+	h, token, _, _ := newLoginTestServer(t, ch)
+	authed(t, h, http.MethodPost, "/api/login/start", channelLoginReq{Channel: "deepseek"}, token)
+
+	payload := `{"region":"CN","rid":"2026092620051945f0f652c9a10a8884"}`
+	w := authed(t, h, http.MethodPost, "/api/login/step",
+		map[string]any{"values": map[string]any{channel.FieldWidgetResult: payload}}, token)
+	if w.Code != http.StatusOK {
+		t.Fatalf("提交控件凭据应当成功，实际 %d %s", w.Code, w.Body.String())
+	}
+	if len(sess.got) != 1 {
+		t.Fatalf("渠道应当收到 1 次提交，实际 %d", len(sess.got))
+	}
+	if got := sess.got[0][channel.FieldWidgetResult]; got != payload {
+		t.Fatalf("凭据被改写了：%q，想要 %q", got, payload)
+	}
+	// 返回的应当是推进后的新屏（输入验证码）。
+	var resp struct {
+		Step *channel.StepView `json:"step"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Step == nil || resp.Step.Stage != channel.StageInput {
+		t.Fatalf("返回的应当是推进后的新屏，实际 %+v", resp.Step)
+	}
+}
+
 // TestLoginStepRejectsUnsupportedChannel 不支持多步的渠道要明确报错，不静默成功。
 func TestLoginStepRejectsUnsupportedChannel(t *testing.T) {
 	ch := &fakeAuthChannel{kind: channel.QoderCN, sess: &fakeSession{url: "u", pending: 99}}

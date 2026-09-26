@@ -82,7 +82,7 @@ M="$PKG/manifest"
   printf 'service_port          = %s\n'   "$PORT"
   printf 'desktop_uidir         = ui\n'
   printf 'desktop_applaunchname = %s.main\n' "$APPNAME"
-  printf 'changelog = 通用多步授权框架 + DeepSeek 短信登录调研结论：① 新增 channel.StepAcceptor / StepView 通用「多步授权」接口（渠道自己声明每一步要什么，面板照渲染；新增支持图片验证码那一屏，图以 data URL 内联显示）② DeepSeek 接入手机号+短信验证码流程（发码/验码/登录三段，含 60 秒重发窗口与图验分支），但实测上游把 shumei_verification 作结构化必填（数美 JS 控件令牌，服务端拿不到）→ 该路径默认关闭并如实告知，代码保留待上游放开 ③ 新增 /api/login/step 逐步提交接口 ④ 修复上游 422 只报「上游返回错误」的问题，现在逐字段翻译成人话 ⑤ 修复 idle 步骤顶掉账号密码表单的缺陷（面板原先只显示粘贴引导、密码框消失） | FPK %s\n' "$VERSION"
+  printf 'changelog = DeepSeek 手机号+短信验证码登录（打通数美人机校验）：① 面板内嵌数美验证控件完成「空间点选」人机校验——用户在 PoolGate 自己的界面里点一下图（题目形如「点击图中最小的蓝色三棱锥」），控件给的凭据由服务端原样转发，走的是真实登录流程 ② 新增 channel.StageWidget / WidgetShumei / FieldWidgetResult 通用「交互控件」接口（核心层与前端都不认识数美，参数由渠道给出并原样透传）③ 短信登录从 0.8.0 的「默认关闭」改为默认开启并作为主推路径（密码全程不落盘）④ 授权流程改为「填手机号 → 过人机校验 → 发码 → 填验证码 → 登录」⑤ 修复控件回调误判（initSMCaptcha 第 2 个参数是控件实例、不是成功回调，之前每次挂载都被判「没通过」）⑥ 控件结果被上游拒时留在原地换一题重试，不把用户弹回开头 ⑦ 短信路径若凭据失效，错误文案给出可执行动作（重新点一次题目） | FPK %s\n' "$VERSION"
 } >> "$M"
 chmod 0644 "$M"
 sed -n '1,20p' "$M" | sed 's/^/  /'

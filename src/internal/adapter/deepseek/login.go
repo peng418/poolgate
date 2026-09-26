@@ -67,9 +67,11 @@ type session struct {
 // StartLogin 返回「去这儿登录」的地址（粘贴路径用），并按可用性决定默认路径。
 //
 // 路径优先级：
-//  ① 短信验证码（SMSLoginAvailable 时才开）—— 最省事，但实测被上游数美控件挡住，默认关；
-//  ② 账号密码直登 —— 填一次就换 token，勾「记住密码」还能自动续期；**这是当前主推**；
-//  ③ 粘贴 userToken —— 不想给密码时的兜底。
+//  ① 短信验证码（SMSLoginAvailable 时）—— 最省事：只需手机号 + 收一条短信，
+//     **密码全程不落盘**。中间那道数美人机校验由面板挂控件完成（见 sms.go），
+//     用户点一下就过。**这是当前主推**；
+//  ② 账号密码直登 —— 不想收短信时用；勾「记住密码」可自动续期，代价是密码留存；
+//  ③ 粘贴 userToken —— 既不想给密码、也不想收短信时的兜底。
 func (a *Adapter) StartLogin(context.Context, channel.LoginOptions) (channel.LoginSession, error) {
 	s := &session{a: a}
 	if SMSLoginAvailable {
@@ -83,10 +85,11 @@ func (s *session) AuthURL() string { return loginPage }
 // Hint 是给面板的粘贴引导语（粘贴路径）。实现后控制台在 /api/login/start 的
 // 响应里带上 paste_hint，面板据此切换成「粘贴」形态。
 //
-// 文案必须诚实：短信这条路**当前走不通**（上游数美控件挡住，见 SMSLoginAvailable），
-// 所以不把它列成「首选」——否则用户照做只会白填一次手机号。
+// 文案必须诚实：短信这条路已经实测打通（含数美点选那一步），所以把它列为首选；
+// 密码路径作为不想收短信时的备选。
 func (s *session) Hint() string {
-	return "推荐：填 DeepSeek 的账号和密码点「直接登录」，勾上「记住密码」后 token 过期会自动重登，之后不用再管。\n" +
+	return "推荐：填手机号 → 点一下人机校验题 → 收短信填验证码即可登录；这条路不会把你的密码存到磁盘上。\n" +
+		"不想收短信：填 DeepSeek 的账号和密码点「直接登录」，勾上「记住密码」后 token 过期会自动重登。\n" +
 		"或者：在浏览器登录 DeepSeek 后，于控制台执行 JSON.parse(localStorage.getItem(\"userToken\")).value，把结果整段粘到输入框里"
 }
 

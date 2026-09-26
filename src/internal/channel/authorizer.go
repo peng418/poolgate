@@ -2,6 +2,7 @@ package channel
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 )
 
@@ -121,6 +122,21 @@ const (
 	// StageImageChallenge 表示上游要图片验证码：面板显示 ImageURL 的图 + 一个输入框，
 	// 用户看图填字后 Submit 交回。
 	StageImageChallenge LoginStage = "image_challenge"
+	// StageWidget 表示这一步要用户在**渠道自带的交互控件**里完成。
+	//
+	// 面板按 StepView.Widget 的名字挂载对应控件；控件自己渲染、自己与它的服务器交互，
+	// 成功后的结果由面板用保留键 FieldWidgetResult 交回。
+	//
+	// 为什么不能复用 StageImageChallenge：有些人机校验**根本不是一张静态图**。
+	// 例如数美的「空间点选」题（题目形如「点击图中最小的蓝色三棱锥」），答案是
+	// 一组点击坐标，并且校验发生在数美自己的服务器上、凭据是一次性令牌 ——
+	// 服务端既拿不到唯一正确答案，也无法凭空造出合法院验令牌。
+	//
+	// 正解是**把控件原样挂到面板里**：用户看到的就是上游自己那一屏，控件把令牌
+	// 交给面板，面板交给服务端，服务端再拿它去换正式凭据。这样既不需要逆向控件
+	// 的加密协议，也不需要伪造任何东西 —— 走的就是真实的登录流程，
+	// 只是发生在我们自己的界面里。
+	StageWidget LoginStage = "widget"
 	// StageSending 表示正在等上游把验证码发出去（面板显示「发送中」并可轮询）。
 	StageSending LoginStage = "sending"
 	// StageDone 表示授权已拿到凭证，控制台会走正常落盘/入池。
@@ -148,6 +164,12 @@ type StepView struct {
 	// 用 data URL（data:image/png;base64,…）直接内联，面板 <img src> 即可显示，
 	// 不用另开静态路由、也不依赖面板与网关同机。
 	ImageURL string `json:"image_url,omitempty"`
+	// Widget 仅在 StageWidget 时有值：控件标识（面板据此选挂载器）。取值见 Widget* 常量。
+	Widget string `json:"widget,omitempty"`
+	// WidgetConfig 是控件的初始化参数，**原样透传**给前端，核心层不解释其内容
+	// （渠道自有参数不进核心层，红线三）。由渠道声明，形如
+	// {"organization":"…","appId":"…","mode":"spatial_select","region":"CN","script":"https://…"}。
+	WidgetConfig json.RawMessage `json:"widget_config,omitempty"`
 	// Message 是失败/提示信息（StageFailed 时必填，红线一）。
 	Message string `json:"message,omitempty"`
 	// ResendAfterSecs > 0 时面板显示「N 秒后可重发」。上游通常在响应里给这个窗口。
@@ -172,7 +194,8 @@ type StepAcceptor interface {
 	Step() StepView
 
 	// Submit 交回用户在**当前步骤**填的值，并推进状态机（或原地报错）。
-	//   - values 的 key 与 Step().Fields[].Name 对应；图片验证码步骤用保留键 FieldCaptcha。
+	//   - values 的 key 与 Step().Fields[].Name 对应；图片验证码步骤用保留键 FieldCaptcha，
+	//     交互控件步骤（StageWidget）用保留键 FieldWidgetResult。
 	//   - 返回错误时：面板显示错误，状态机**不前进**（用户可改了重试）。
 	//   - 返回 nil 时：状态机可能进入下一步，也可能直接完成 —— 面板再调 Step() 看。
 	Submit(values map[string]string) error
@@ -185,3 +208,23 @@ type StepAcceptor interface {
 // 这一屏的形状是固定的（一张图 + 一个输入框），核心层与前端只需认识这一个约定，
 // 各渠道不必各造一套；渠道在 Submit 里把它映射成上游要的字段名即可。
 const FieldCaptcha = "captcha_code"
+
+// WidgetShumei 是数美（Shumei）人机校验控件的标识。
+//
+// 为什么这个名字要放在核心层：它是一个**跨层约定**。适配器声明
+// StepView.Widget = WidgetShumei 并给出初始化参数（WidgetConfig），前端据此加载
+// 数美的 smcp.min.js 并调用它的 initSMCaptcha。名字与握手方式只写在一处，
+// 两边不会对不上；而**具体参数**（organization / mode / 脚本地址）仍然由渠道给出，
+// 核心层与前端都不认识「数美」的业务含义（红线三）。
+const WidgetShumei = "shumei"
+
+// FieldWidgetResult 是「交互控件结果」的保留字段名。
+//
+// 约定：StageWidget 下，面板把控件成功后的结果用这个 key 交回，值是一段 **JSON 字符串**，
+// 内容由渠道自己定义，核心层只负责搬运。
+//
+// 与 FieldCaptcha 的区别（别混用）：
+//   - FieldCaptcha 传的是用户**看图敲进去的字**，服务端拿去填上游的字符校验字段；
+//   - FieldWidgetResult 传的是**控件自己产生的一次性令牌**（数美给的是 rid），
+//     它由控件厂商的服务器签发并校验，服务端只做转发，不参与生成。
+const FieldWidgetResult = "captcha_result"
