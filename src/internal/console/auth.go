@@ -191,6 +191,9 @@ func statusForKind(k errs.Kind) int {
 		return http.StatusBadRequest
 	case errs.UpstreamFault, errs.Transport:
 		return http.StatusBadGateway
+	case errs.SessionBusy:
+		// 上游同账号会话启动冲突（瞬态）：不是限流也不是凭证问题 → 503，前端提示「稍后重试」。
+		return http.StatusServiceUnavailable
 	case errs.NoCandidate:
 		return http.StatusServiceUnavailable
 	default:

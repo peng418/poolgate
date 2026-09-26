@@ -84,6 +84,12 @@ func loginToken(t *testing.T, srv *Server) string {
 }
 
 func addAccount(p *pool.Pool, kind channel.Kind, uid string) {
+	// 面板的账号清单是按 registry.All() 遍历的（渠道元数据也在那里），
+	// 所以造账号时必须把渠道一并登记，否则账号在 /api/accounts 里根本不出现 ——
+	// 用例会以为「账号丢了」，其实是 registry 里没有这个渠道（本包的这条用例曾长期红）。
+	if _, ok := registry.Get(kind); !ok {
+		registry.RegisterSpec(channel.Spec{Kind: kind, DisplayName: string(kind), Status: channel.Active})
+	}
 	p.AddFor(kind, channel.Credential{UID: uid, Nickname: "n-" + uid, AccessToken: "SENTINELTOKENVALUE"})
 }
 

@@ -67,12 +67,15 @@ func TestDisableExcludesAccount(t *testing.T) {
 }
 
 // 0.9.8：503 的结论必须自带处置所需的事实（哪个号、等多久、要不要动手）—— 2026-09-27 事故回归。
+// 0.9.9 补：推断类（软冷却）与上游裁决类（硬冷却）要说**两套话** —— 前者仍在被尝试，
+// 后者必须等；否则用户会以为整条渠道都要等到冷却结束。
 func TestErrNoCandidateExplainsEachAccount(t *testing.T) {
 	p := New()
 	kind := channel.QoderCN
 	add(p, kind, "aaaa1111-2222-3333", 100)
 	add(p, kind, "bbbb3333-4444-5555", 500)
-	p.Cooldown(kind, "aaaa1111-2222-3333", 10*time.Minute, "Transport")
+	// 上游明确裁决类（限流）：硬冷却，到点自恢复。
+	p.Cooldown(kind, "aaaa1111-2222-3333", 10*time.Minute, "SoftRate")
 	p.Disable(kind, "bbbb3333-4444-5555", "SessionDead")
 
 	msg := p.ErrNoCandidate(kind).Error()
@@ -82,9 +85,114 @@ func TestErrNoCandidateExplainsEachAccount(t *testing.T) {
 		}
 	}
 
+	// 推断类（连接中断/空流）是软冷却：措辞要说明「仍在尝试使用」。
+	p2 := New()
+	add(p2, kind, "cccc5555-6666-7777", 100)
+	p2.Cooldown(kind, "cccc5555-6666-7777", 10*time.Minute, "Transport")
+	m2 := p2.ErrNoCandidate(kind).Error()
+	for _, want := range []string{"cccc5555", "软冷却", "仍在尝试使用", "一次成功即自动解除"} {
+		if !strings.Contains(m2, want) {
+			t.Fatalf("软冷却结论必须含 %q，实际：%s", want, m2)
+		}
+	}
+	if strings.Contains(m2, "到点自恢复") {
+		t.Fatalf("软冷却不该说「到点自恢复」（它不等冷却结束也能用），实际：%s", m2)
+	}
+
 	// 空池也要说清「池里没账号」，而不是只丢一句「无可用账号」。
 	if m := New().ErrNoCandidate(kind).Error(); !strings.Contains(m, "没有该渠道的账号") {
 		t.Fatalf("空池结论应说明池里没账号，实际：%s", m)
+	}
+}
+
+// 0.9.9 ①③⑤：推断类错误的完整纪律。
+//
+//	① 单次抖动只计数，不冷却（门槛 = 连续 N 次）；
+//	③ 单账号渠道连门槛也不触发（冷唯一那个号 = 整条渠道下线）；
+//	⑤ 达到门槛后是「软冷却」：仍可被选用（排在健康号之后），一次成功即自动解除。
+func TestInferredErrorThresholdAndSoftCooldown(t *testing.T) {
+	kind := channel.QoderCN
+	ctx := context.Background()
+
+	// ① 多账号渠道：连续错误要攒到门槛才冷。
+	p := New()
+	add(p, kind, "a", 100)
+	add(p, kind, "b", 200)
+	p.SetErrorPolicy(3, time.Minute)
+	for i := 1; i <= 2; i++ {
+		p.NoteErrorAt(kind, "a", errs.Transport, time.Time{})
+		st, _ := p.Get(kind, "a")
+		if !st.Until.IsZero() {
+			t.Fatalf("第 %d 次推断类错误不该冷却（门槛 3 次），实际冷却至 %s", i, st.Until)
+		}
+		if st.ErrCount != i {
+			t.Fatalf("连续错误计数应为 %d，实际 %d", i, st.ErrCount)
+		}
+	}
+	p.NoteErrorAt(kind, "a", errs.Transport, time.Time{})
+	st, _ := p.Get(kind, "a")
+	if st.Until.IsZero() {
+		t.Fatal("达到门槛（3 次）后应当冷却")
+	}
+	if st.Reason != string(errs.Transport) {
+		t.Fatalf("冷却原因应记录触发的错误类型，实际 %q", st.Reason)
+	}
+	if st.ErrCount != 0 {
+		t.Fatalf("冷却后连续计数应清零（下一轮重新攒），实际 %d", st.ErrCount)
+	}
+
+	// ⑤ 软冷却：健康号优先，但它仍然可用（否则一次抖动就等于整条渠道停摆到冷却结束）。
+	cred, ok := p.Pick(ctx, kind, nil)
+	if !ok || cred.UID != "b" {
+		t.Fatalf("软冷却期间应优先选健康号 b，实际 %v %v", cred.UID, ok)
+	}
+	if cred, ok := p.Pick(ctx, kind, map[string]bool{"b": true}); !ok || cred.UID != "a" {
+		t.Fatalf("健康号都试过后，软冷却的号必须还能兜底，实际 %v %v", cred.UID, ok)
+	}
+	// 一次成功即解除（⑤）。
+	p.NoteSuccess(kind, "a")
+	if st, _ := p.Get(kind, "a"); !st.Until.IsZero() {
+		t.Fatalf("成功后应立刻解除推断类冷却，实际仍冷却至 %s", st.Until)
+	}
+
+	// 上游裁决类不吃这一套：限流冷却必须等（软冷却/提前解除都不适用）。
+	p2 := New()
+	add(p2, kind, "a", 100)
+	add(p2, kind, "b", 200)
+	p2.NoteErrorAt(kind, "a", errs.SoftRate, time.Time{})
+	if p2.States(kind)[0].SoftCooling {
+		// a 排在前面（UID 排序），且限流是硬冷却 → SoftCooling 必须为 false。
+		t.Fatal("限流（上游裁决类）不是软冷却：必须等上游放行")
+	}
+	if cred, _ := p2.Pick(ctx, kind, map[string]bool{"b": true}); cred.UID != "" {
+		t.Fatalf("硬冷却的号不该被兜底选中，实际 %s", cred.UID)
+	}
+	p2.NoteSuccess(kind, "a")
+	if st, _ := p2.Get(kind, "a"); st.Until.IsZero() {
+		t.Fatal("上游裁决类冷却不许被一次成功提前解除")
+	}
+}
+
+// ③ 单账号渠道纪律：唯一的号不会被推断类错误冷却（冷它 = 整条渠道下线）。
+func TestSingleAccountChannelNeverCooledByInferredError(t *testing.T) {
+	kind := channel.QoderCN
+	p := New()
+	add(p, kind, "only", 100)
+	p.SetErrorPolicy(1, time.Minute) // 门槛压到 1，最容易触发
+	for i := 0; i < 5; i++ {
+		p.NoteErrorAt(kind, "only", errs.Transport, time.Time{})
+	}
+	st, _ := p.Get(kind, "only")
+	if !st.Until.IsZero() {
+		t.Fatalf("单账号渠道不该因推断类错误被冷却，实际冷却至 %s", st.Until)
+	}
+	if _, ok := p.Pick(context.Background(), kind, nil); !ok {
+		t.Fatal("单账号渠道的号必须始终可用")
+	}
+	// 但上游明确裁决类照旧生效（429/402 是上游说的真话）。
+	p.NoteErrorAt(kind, "only", errs.SoftRate, time.Time{})
+	if st, _ := p.Get(kind, "only"); st.Until.IsZero() {
+		t.Fatal("单账号渠道也要尊重上游的限流处置")
 	}
 }
 

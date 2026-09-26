@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
+
 	"poolgate/internal/channel"
 	"poolgate/internal/errs"
 )
@@ -207,6 +209,11 @@ func TestClassify(t *testing.T) {
 		{403, `{"msg":"blocked by security policy"}`, errs.ContentBlocked},
 		{200, `{"msg":"Model is not available for this user"}`, errs.ModelUnavailable},
 		{404, `not found`, errs.ModelUnavailable},
+		// 同账号并发建会话：409 CONCURRENT_OPERATION 是**瞬态闸门**，不是限流。
+		// 真机实测（2026-09-27）：+0.2s → 409，+2.4s → 201。判成 SoftRate 会冷却 60 秒，
+		// 单账号渠道等于整条渠道冻结一分钟 —— 用户投诉的「一直冻结」就是这个。
+		{409, `{"code":"CONCURRENT_OPERATION","message":"Already handling session start request for this user"}`, errs.SessionBusy},
+		{200, `{"code":"CONCURRENT_OPERATION"}`, errs.SessionBusy},
 	}
 	for _, c := range cases {
 		if got := a.Classify(c.status, []byte(c.body)); got != c.want {
@@ -527,5 +534,157 @@ func TestRefreshWithoutTokenIsNoop(t *testing.T) {
 	nc, err := a.Refresh(context.Background(), &c)
 	if err != nil || nc != nil {
 		t.Fatalf("没有 refresh token 时应返回 (nil, nil)，实际 %v %v", nc, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 同账号并发建会话（409 CONCURRENT_OPERATION）的处置纪律
+//
+// 真机实测（2026-09-27，对真上游连发 4 次 POST /api/chat-sessions）：
+//
+//	+0.0s → 201   +0.2s → 409   +2.4s → 201   +4.0s → 201
+//
+// 结论：这是 2 秒级的瞬态闸门，不是限流、更不是账号故障。
+// 处置：适配器内联退避重试；耗尽后抛 SessionBusy（不冷却账号）。
+// ---------------------------------------------------------------------------
+
+// shrinkSessionBackoff 把退避压到毫秒级，测试里不真睡 1.6 秒。
+func shrinkSessionBackoff(t *testing.T) {
+	t.Helper()
+	orig := sessionStartBackoff
+	sessionStartBackoff = []time.Duration{time.Millisecond, time.Millisecond}
+	t.Cleanup(func() { sessionStartBackoff = orig })
+}
+
+// 409 之后退避重试同号即成功：调用方（路由/体检）根本看不到这次冲突。
+func TestCreateSessionRetriesOnConcurrentOperation(t *testing.T) {
+	shrinkSessionBackoff(t)
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if hits == 1 {
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"code":"CONCURRENT_OPERATION","message":"Already handling session start request for this user"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"sess-1"}`))
+	}))
+	defer srv.Close()
+
+	a := NewWithBase(srv.URL, nil)
+	sid, err := a.createSession(context.Background(), &channel.Credential{UID: "u1", AccessToken: "tok"}, "pro")
+	if err != nil {
+		t.Fatalf("并发冲突应被内联重试消化，实际报错：%v", err)
+	}
+	if sid != "sess-1" {
+		t.Fatalf("应拿到会话 id，实际 %q", sid)
+	}
+	if hits != 2 {
+		t.Fatalf("应只重试 1 次（共 2 次请求），实际 %d 次", hits)
+	}
+}
+
+// 退避耗尽仍冲突：如实抛出 SessionBusy（**不是**账号错误），可换号、可再试。
+func TestCreateSessionConcurrentOperationGivesUpAsSessionBusy(t *testing.T) {
+	shrinkSessionBackoff(t)
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"code":"CONCURRENT_OPERATION","message":"Already handling session start request for this user"}`))
+	}))
+	defer srv.Close()
+
+	a := NewWithBase(srv.URL, nil)
+	_, err := a.createSession(context.Background(), &channel.Credential{UID: "u1", AccessToken: "tok"}, "pro")
+	if err == nil {
+		t.Fatal("一直并发冲突时应把真实原因抛出去（红线一：零静默失败）")
+	}
+	k, _ := errs.KindOf(err)
+	if k != errs.SessionBusy {
+		t.Fatalf("应归 SessionBusy（不冷却账号），实际 %v", k)
+	}
+	if k.AccountBlamed() {
+		t.Fatal("并发冲突不得计入账号错误：否则单账号渠道会整条冻结 60 秒")
+	}
+	want := 1 + len(sessionStartBackoff)
+	if hits != want {
+		t.Fatalf("应请求 %d 次（首次 + %d 次退避重试），实际 %d 次", want, len(sessionStartBackoff), hits)
+	}
+}
+
+// 同账号会话令牌：等不到要能被 ctx 取消（sync.Mutex 那种「冻死在锁上」的写法不许回来）。
+func TestAcquireSessionWaitIsCancellable(t *testing.T) {
+	a := NewWithBase("http://127.0.0.1:1", nil)
+	release, err := a.acquireSession(context.Background(), "u1")
+	if err != nil {
+		t.Fatalf("首次取令牌不该失败：%v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = a.acquireSession(ctx, "u1")
+	if err == nil {
+		t.Fatal("同账号第二次取令牌应等不到并报错，而不是一直等")
+	}
+	if k, _ := errs.KindOf(err); k != errs.SessionBusy {
+		t.Fatalf("等锁超时应归 SessionBusy（可换号、不冷号），实际 %v", k)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("应随 ctx 立刻返回，实际等了 %s", d)
+	}
+	release()
+	// 释放后应能再取到（令牌是复用的，不能泄漏）。
+	release2, err := a.acquireSession(context.Background(), "u1")
+	if err != nil {
+		t.Fatalf("释放后应能再次取到令牌：%v", err)
+	}
+	release2()
+}
+
+// 端到端（真 HTTP + 真 WebSocket 握手，上游是桩）：上游第一次建会话回 409，
+// Chat 必须**照样返回可用流** —— 这一次冲突在适配器内部就被退避重试消化掉了，
+// 调用方（路由 / 体检）既看不到它，也不该因此冷却账号。
+func TestChatSurvivesConcurrentSessionStart(t *testing.T) {
+	shrinkSessionBackoff(t)
+	var creates int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/chat-sessions", func(w http.ResponseWriter, r *http.Request) {
+		creates++
+		if creates == 1 {
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"code":"CONCURRENT_OPERATION","message":"Already handling session start request for this user"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"sess-ok"}`))
+	})
+	up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	mux.HandleFunc("/api/chat-ws", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for { // 空转：等客户端关闭
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	a := NewWithBase(srv.URL, nil)
+	cred := channel.Credential{UID: "u1", AccessToken: "tok"}
+	stream, err := a.Chat(context.Background(), &cred, channel.ChatRequest{
+		Model:    "pro",
+		Messages: []channel.Message{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("一次并发冲突不该让整轮请求失败（应在适配器内退避重试掉），实际：%v", err)
+	}
+	_ = stream.Close()
+	if creates != 2 {
+		t.Fatalf("应重试一次建会话（共 2 次），实际 %d 次", creates)
 	}
 }

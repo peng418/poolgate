@@ -33,13 +33,19 @@ var DefaultPolicy = map[Kind]Policy{
 	ModelUnavailable: {Cooldown: 10 * time.Minute, Retry: true},
 	// 上游故障：渠道级降级告警，不计账号错误 —— 千问办公 503 就落在这里。
 	UpstreamFault: {Cooldown: 5 * time.Minute, Retry: true, BlameChannel: true},
-	// 连接中断：渠道/网络级抖动，**不冷却账号**（Cooldown 0 是刻意的），但保留换号重试 ——
-	// 别的号可能通，都通不了就把真实错误交给客户端。
-	// 2026-09-27 真机事故：这里原本是 10 分钟账号冷却，一次抖动把两个号一起冷却，整渠道 503
-	// 十分钟，而面板体检刚刚还是绿的（见 docs/02 §4 的补充说明）。
-	Transport: {Retry: true, BlameChannel: true},
-	// Parse 仍是账号错误：它代表「上游 200 却一个字都没有」（空流）——那种号该被冷掉。
-	Parse:       {Cooldown: 10 * time.Minute, Retry: true},
+	// 连接中断：**推断类**（见 Kind.Inferred）—— 计数、连续到阈值才冷却，且冷却可被一次成功解除。
+	// 所以这里没有 Cooldown（时长由 pool 的 err_cooldown 决定）。
+	// 2026-09-27 两段历史：先是 10 分钟账号冷却（一次抖动把两个号一起冷掉，整渠道 503 十分钟）；
+	// 0.9.8 又整个豁免（连「一直在断的号」也记不下来）。现在恢复计数 + 门槛，这才是与参考实现
+	// wild-work 逐字对齐的形态（它的 err_threshold 门槛我们当初漏移植了）。
+	Transport: {Retry: true},
+	// Parse（上游 200 却一个字都没有）同为推断类：同样计数到阈值才软冷却。
+	Parse: {Retry: true},
+	// 并发冲突：上游同一账号的「会话启动」还在处理中（409 CONCURRENT_OPERATION）。
+	// **不冷却账号**（Cooldown 0 是刻意的）：真机实测这个闸门 2 秒级就放行
+	// （+0.2s → 409；+2.4s → 201），适配器内部退避重试即可，账号本身没有任何问题。
+	// 2026-09-27 用户投诉「一直冻结」的根因就在这一类以前落到 SoftRate（60 秒冷却 = 单号渠道冻结一分钟）。
+	SessionBusy: {Retry: true},
 	AuthFailed:  {},
 	NoCandidate: {},
 }

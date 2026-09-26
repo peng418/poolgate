@@ -769,6 +769,8 @@
                 <td>
                   <span class="pill" :class="accountPill(a)"><span class="i">{{ accountIcon(a) }}</span><span class="swatch"></span>{{ accountText(a) }}</span>
                   <div class="hint" v-if="a.reason">{{ reasonText(a.reason, a.cooldown_until) }}</div>
+                  <div class="hint" v-if="a.soft_cooling">软冷却（推断类）：仍在尝试使用，一次成功即自动解除 —— 不用干等</div>
+                  <div class="hint" v-if="a.err_count>0">连续错误 {{ a.err_count }}/{{ a.err_threshold }}（达到门槛才冷却，成功即清零）</div>
                 </td>
                 <td class="num">{{ a.credits_known ? a.credits : '未知' }}</td>
                 <td>{{ a.expires_at ? fmtDate(a.expires_at) : '未知' }}</td>
@@ -1340,6 +1342,14 @@
               <span class="hint">越大越像同一台设备，风控概率越低；过大则单个号压力集中</span></div>
             <div class="field"><label for="rot">最大换号次数</label>
               <input id="rot" type="number" v-model.number="form.max_retry"></div>
+            <div class="field"><label for="eth">连续错误门槛（次）</label>
+              <input id="eth" type="number" min="1" v-model.number="form.err_threshold">
+              <span class="hint">只作用于<b>推断类</b>错误（连接中断 / 空流）：连续发生这么多次才冷却该号，
+                中间成功一次即清零。<b>上游明确裁决</b>（429 限流 / 额度不足 / 禁言）不走这个门槛，立即生效。</span></div>
+            <div class="field"><label for="ecl">达到门槛后的冷却（秒）</label>
+              <input id="ecl" type="number" min="0" v-model.number="form.err_cooldown_seconds">
+              <span class="hint">这段冷却是<b>软冷却</b>：该号仍会被选用（排在健康号之后），一次成功即自动解除。
+                池里只有一个可用账号的渠道干脆不冷却 —— 冷它等于整条渠道下线。</span></div>
             <table style="margin-top:6px">
               <thead><tr><th>错误类型</th><th>处置</th><th class="num">冷却</th></tr></thead>
               <tbody>
@@ -1487,6 +1497,7 @@ createApp({
     const allLogs=ref([]);
     const paths=ref({}), form=reactive({
       listen_host:'0.0.0.0',listen_port:5014,base_url:'',sticky_requests:50,max_retry:3,
+      err_threshold:5,err_cooldown_seconds:600,
       probe_interval_hours:6,probe_samples:3,probe_timeout_sec:60,only_healthy_models:false,
       checkin_times:['09:00','21:00'],
       keepalive_hours:22,checkin_enabled:true,keepalive_enabled:true,
@@ -1805,6 +1816,7 @@ createApp({
       const max=Math.max(1,...Object.values(stats));
       const labels={UpstreamFault:'上游故障 UpstreamFault',Transport:'传输失败 Transport',
         ContentBlocked:'内容拦截 ContentBlocked',SoftRate:'限流 SoftRate',
+        SessionBusy:'并发冲突 SessionBusy',
         HardCredit:'额度不足 HardCredit',SessionDead:'会话失效 SessionDead',
         Muted:'禁言 Muted',
         ModelUnavailable:'模型不可用 ModelUnavailable',Parse:'解析失败 Parse'};
@@ -2149,7 +2161,9 @@ createApp({
       {kind:'rate',label:'限流 429',disposition:'冷却该号',cooldown:'60s'},
       {kind:'sess',label:'会话失效',disposition:'禁用 + 提示重登',cooldown:'—'},
       {kind:'block',label:'内容拦截 / 超长',disposition:'不冷却，透传原文',cooldown:'—'},
-      {kind:'up',label:'<b>上游故障</b>',disposition:'<b>渠道级告警，不计账号错误</b>',cooldown:'5m'}
+      {kind:'up',label:'<b>上游故障</b>',disposition:'<b>渠道级告警，不计账号错误</b>',cooldown:'5m'},
+      {kind:'busy',label:'并发冲突（同账号会话启动中）',disposition:'<b>不冷却该号</b>，适配器内退避重试',cooldown:'—'},
+      {kind:'inf',label:'<b>连接中断 / 空流</b>',disposition:'<b>先计数，连续到门槛才「软冷却」</b>（仍会被选用，一次成功即解除）；单账号渠道不冷却',cooldown:'见下方门槛'}
     ];
 
     // ---------- 展示工具 ----------
@@ -2222,6 +2236,7 @@ createApp({
         AuthFailed:'认证失败 —— 该账号的上游凭证不被接受，点「重新登录」重新授权',
         HardCredit:'额度/权益不足 —— 充值或换号后点「启用」',
         SoftRate:'被上游限流 —— 冷却结束后自动恢复',
+        SessionBusy:'上游同账号会话启动冲突（瞬态，2 秒级）—— 网关已自动退避重试；这里只表示它正被另一个会话占用，不影响账号健康',
         ModelUnavailable:'该账号无权使用某些模型 —— 已按模型剔除',
         Transport:'连不上上游 —— 网络或代理问题',
         UpstreamFault:'上游故障 —— 不是账号的问题，换号或等上游恢复',
@@ -2230,9 +2245,9 @@ createApp({
       // 冷却会有到期时间（禁言尤其需要让人看到「等到什么时候」），直接缀在后面。
       return (map[r]||r)+(until?'（冷却至 '+fmtTime(until)+'）':'');
     };
-    const accountPill=a=>a.disabled?'crit':(a.cooling?'serious':'good');
+    const accountPill=a=>a.disabled?'crit':(a.cooling?(a.soft_cooling?'warn':'serious'):'good');
     const accountIcon=a=>a.disabled?'×':(a.cooling?'≈':'✓');
-    const accountText=a=>a.disabled?'禁用':(a.cooling?'冷却中':'正常');
+    const accountText=a=>a.disabled?'禁用':(a.cooling?(a.soft_cooling?'降级使用':'冷却中'):'正常');
     const checkinPill=c=>c.no_activity?'plain':(c.ok?'good':'warn');
     const checkinText=c=>{
       if(c.no_activity)return '无活动';

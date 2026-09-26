@@ -715,6 +715,8 @@ func verdictFor(k errs.Kind, hasAccount bool) string {
 		return "上游连不通（网络或上游不可达，非本地配置问题）"
 	case errs.SoftRate:
 		return "上游限流（429）：稍后重试，或降低并发"
+	case errs.SessionBusy:
+		return "上游同一账号的会话启动冲突（瞬态，2 秒级）：网关已自动退避重试；仍失败说明该号正被另一个会话占用 —— 稍后重试或换个账号。不是账号故障，也未计入错误"
 	case errs.HardCredit:
 		return "账号额度不足：需要充值或换号"
 	case errs.Muted:
@@ -1003,6 +1005,13 @@ func validateSettings(st *store.Settings) error {
 	}
 	if st.ProbeTimeoutSec < 5 || st.ProbeTimeoutSec > 600 {
 		return errs.New(errs.Parse, "单模型超时必须在 5–600 秒之间")
+	}
+	// 连续错误门槛（0.9.9 ①）：0 表示用出厂值（5 次）；上限拦住手滑写 100000 的情况。
+	if st.ErrThreshold < 0 || st.ErrThreshold > 100 {
+		return errs.New(errs.Parse, "连续错误门槛必须在 0–100 之间（0 = 用出厂值 5）")
+	}
+	if st.ErrCooldownSeconds < 0 || st.ErrCooldownSeconds > 86400 {
+		return errs.New(errs.Parse, "门槛冷却必须在 0–86400 秒之间（0 = 用出厂值 600）")
 	}
 	for _, t := range st.CheckinTimes {
 		if _, err := time.Parse("15:04", t); err != nil {

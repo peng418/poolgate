@@ -10,6 +10,7 @@ import (
 
 	"poolgate/internal/channel"
 	"poolgate/internal/health"
+	"poolgate/internal/pool"
 	"poolgate/internal/registry"
 	"poolgate/internal/store"
 )
@@ -230,10 +231,15 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt    string `json:"expires_at,omitempty"`
 		Disabled     bool   `json:"disabled"`
 		Cooling      bool   `json:"cooling"`
-		Reason       string `json:"reason,omitempty"`
+		// SoftCooling 表示这是「推断类软冷却」（连接中断/空流）：号仍在被尝试使用，
+		// 一次成功即自动解除 —— UI 要显示成「降级使用」，不是「下线」（0.9.9 ④⑤）。
+		SoftCooling bool   `json:"soft_cooling"`
+		Reason      string `json:"reason,omitempty"`
 		// CooldownUntil 是冷却截止时间，UI 显示「还要等多久」。
 		CooldownUntil string `json:"cooldown_until,omitempty"`
 		ErrCount      int    `json:"err_count"`
+		// ErrThreshold 是连续错误门槛：UI 显示「连续错误 n/m」（0.9.9 ④）。
+		ErrThreshold int `json:"err_threshold"`
 		// Checkin 是最近一次签到结果（可能为空）。
 		Checkin *checkinOut `json:"checkin,omitempty"`
 		// HasCredential 表示磁盘上是否有凭证文件（面板「重新登录」按钮的判据）。
@@ -241,6 +247,7 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	}
 	var out []acct
 	if s.opts.Pool != nil {
+		threshold := s.opts.Pool.ErrThreshold()
 		for _, e := range registry.All() {
 			for _, st := range s.opts.Pool.List(e.Spec.Kind) {
 				item := acct{
@@ -251,8 +258,10 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 					CreditsKnown:  st.CreditsKnown,
 					Disabled:      st.Disabled,
 					Cooling:       !st.Until.IsZero() && time.Now().Before(st.Until),
+					SoftCooling:   pool.SoftCoolingOf(st),
 					Reason:        st.Reason,
 					ErrCount:      st.ErrCount,
+					ErrThreshold:  threshold,
 					HasCredential: true,
 				}
 				// 到期时间优先用余额快照，其次用凭证自带的。

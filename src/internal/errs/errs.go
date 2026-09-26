@@ -23,6 +23,7 @@ const (
 	ContentBlocked   Kind = "ContentBlocked"   // 内容拦截
 	PromptTooLong    Kind = "PromptTooLong"    // 超出上下文窗口
 	ModelUnavailable Kind = "ModelUnavailable" // 该账号无此模型权限
+	SessionBusy      Kind = "SessionBusy"      // 上游同账号已有进行中的会话启动（瞬态并发冲突）
 	UpstreamFault    Kind = "UpstreamFault"    // 上游 5xx / 闸门 / 目录不可用
 	Transport        Kind = "Transport"        // 连不通 / TLS / 超时
 	Parse            Kind = "Parse"            // 响应无法解析
@@ -45,12 +46,42 @@ func (k Kind) String() string { return string(k) }
 //
 // Parse 故意**留在账号错误**一侧：它的主要用途是「上游 200 但一个字都没有（空流）」，
 // 那确实该冷却这个号，否则会一直拿这个空号去试（见 gateway 的空流纪律与配套测试）。
+//
+// Transport **回到账号错误一侧**（2026-09-27，0.9.9 ①+②）：0.9.8 为了止血，把它整个摘出
+// 账号错误（一次抖动谁都不许记），代价是「一个一直在断的号」也永远不会被记下来。
+// 正确形态不是「豁免」而是「门槛」——参考实现 wild-work 就是这样：传输错误照常计数，
+// 但要**连续** ErrThreshold 次才冷却（成功即清零）。所以这里恢复计数，
+// 冷却交给 pool 的阈值机制（PoolGate 之前把这个门槛整个丢了，才成了「一错即冷」）。
+//
+// SessionBusy 不算账号错误：它是上游那个同一账号的「会话启动」还没落地（2 秒级瞬态闸门，
+// 2026-09-27 真机实测：+0.2s → 409；+2.4s → 201）。记在账号头上会换来一次 60 秒冷却 ——
+// 单账号渠道等于整条渠道「冻结」一分钟，而它 2 秒后就能用。
 func (k Kind) AccountBlamed() bool {
 	switch k {
-	case UpstreamFault, ContentBlocked, PromptTooLong, NoCandidate, AuthFailed, Transport:
+	case UpstreamFault, ContentBlocked, PromptTooLong, NoCandidate, AuthFailed, SessionBusy:
 		return false
 	default:
 		return true
+	}
+}
+
+// Inferred 报告该错误是「本地推断」还是「上游明确裁决」。
+//
+// 推断类（连接中断 / 空流）：单次发生**不足以**判定账号坏 —— 可能是网络抖了一下，
+// 也可能是上游临时抽风。所以：
+//  1. 先计数，连续到 ErrThreshold 次才冷却（①，见 pool.NoteErrorAt）；
+//  2. 冷却属「软冷却」：该号仍可被选中（排在健康号之后），一次成功即解除（⑤）；
+//  3. 单账号渠道干脆不冷却（③）—— 唯一的号被冷 = 整条渠道下线。
+//
+// 上游明确裁决类（429 / 402 / 401 / 403 / 禁言 / 模型无权限）相反：上游已经给了判决，
+// 立即按 Policy 处置，且**不接受**「探通了就提前放开」（额度不足冷 12 小时，探一次恰好
+// 通了就解冻，下一波请求又整片 402 —— 等于拿用户的请求当探针烧）。
+func (k Kind) Inferred() bool {
+	switch k {
+	case Transport, Parse:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -62,6 +93,9 @@ func (k Kind) AccountBlamed() bool {
 // 换号重试（别的号可能通），但谁都不冷却。
 //
 // 单点定义：router.Route 与 health.Runner 的换号纪律共用这一条，别各写一份。
+//
+// SessionBusy **不在**这里（换号/同号重试都值得做）：它是「占用这个号的那次启动还没结束」，
+// 等一两秒重试同一个号即可；池里还有别的号时换号更好。
 func (k Kind) StopRetry() bool {
 	switch k {
 	case UpstreamFault, ContentBlocked, PromptTooLong, NoCandidate:

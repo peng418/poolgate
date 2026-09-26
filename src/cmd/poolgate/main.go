@@ -176,6 +176,16 @@ func main() {
 		return 0
 	})
 
+	// 连续错误门槛（①）：推断类错误（连接中断 / 空流）连续 err_threshold 次才冷却
+	// err_cooldown_seconds 秒 —— 对齐参考实现 wild-work 的 cooldown 块。
+	// 不装配的话池子用出厂值（5 次 / 10 分钟），行为与设置面板显示不一致。
+	if settings != nil {
+		s := settings.Get()
+		accPool.SetErrorPolicy(s.ErrThreshold, time.Duration(s.ErrCooldownSeconds)*time.Second)
+		log.Printf("poolgate: 连续错误门槛：推断类错误连续 %d 次才冷却 %d 秒（成功即清零；单账号渠道不冷却）",
+			s.ErrThreshold, s.ErrCooldownSeconds)
+	}
+
 	// 续期心跳：请求路径只续**被选中**的号，闲置账号没人管（它的 rt 会放坏）。每分钟醒一次，
 	// 真正续不续由池子按渠道节奏判定 —— 没声明节奏的渠道一次都不会续，不给上游白添调用。
 	go func() {

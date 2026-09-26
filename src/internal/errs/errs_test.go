@@ -23,17 +23,33 @@ func TestPassthroughKindsNotBlamed(t *testing.T) {
 	}
 }
 
-// 2026-09-27 事故回归：连接中断不是这个号的错，但换号仍值得试。
-func TestTransportNotBlamedButStillRetryable(t *testing.T) {
-	if Transport.AccountBlamed() {
-		t.Fatal("连接中断不是这个号的错，不得冷却账号")
+// 2026-09-27 事故回归 + 0.9.9 ①②：连接中断要**计数**（否则一个一直在断的号永远记不下来），
+// 但单次不得冷却账号（门槛在 pool 里：连续 ErrThreshold 次才冷，成功即清零），换号仍值得试。
+func TestTransportCountedButNotCooledByPolicy(t *testing.T) {
+	if !Transport.AccountBlamed() {
+		t.Fatal("连接中断应计入账号错误计数（0.9.9 ②：从「豁免」改回「门槛」）")
 	}
 	if Transport.StopRetry() {
 		t.Fatal("连接中断应当允许换号重试（别的号可能通），不该直接甩给客户端")
 	}
-	// 空流（Parse）仍然算这个号的错：gateway 的「空流要冷却」纪律不能丢。
-	if !Parse.AccountBlamed() {
-		t.Fatal("Parse（上游 200 但空流）仍应计入账号错误")
+	if p := PolicyOf(Transport); p.Cooldown != 0 {
+		t.Fatalf("连接中断的冷却时长由连续错误门槛给（err_cooldown），Policy 不该再带固定冷却，实际 %s", p.Cooldown)
+	}
+	if !Transport.Inferred() {
+		t.Fatal("连接中断是「本地推断类」：单次不足以判定账号坏")
+	}
+	// 空流（Parse）同为推断类：也要计数、也要过门槛，不再是「一错即冷 10 分钟」。
+	if !Parse.AccountBlamed() || !Parse.Inferred() {
+		t.Fatal("Parse（上游 200 但空流）应计入账号错误且属推断类")
+	}
+	if p := PolicyOf(Parse); p.Cooldown != 0 {
+		t.Fatalf("Parse 的冷却应走连续错误门槛，实际 Policy 冷却 %s", p.Cooldown)
+	}
+	// 上游明确裁决类不走门槛：它们立即生效，也不接受「探通了提前放开」。
+	for _, k := range []Kind{HardCredit, SoftRate, Muted, SessionDead, ModelUnavailable} {
+		if k.Inferred() {
+			t.Fatalf("%s 是上游明确裁决，不该被当成推断类（会被提前解除）", k)
+		}
 	}
 	for _, k := range []Kind{UpstreamFault, ContentBlocked, PromptTooLong, NoCandidate} {
 		if !k.StopRetry() {
@@ -45,6 +61,28 @@ func TestTransportNotBlamedButStillRetryable(t *testing.T) {
 	}
 }
 
+// 并发冲突（SessionBusy）：上游同一账号的「会话启动」还没落地 —— 2 秒级瞬态闸门。
+// 必须：① 不计入账号错误（否则换一次 60 秒冷却，单号渠道=整渠道冻结）；
+// ② 不阻断重试（等一两秒重试同号即可 / 有别的号就换号）。
+func TestSessionBusyNotBlamedAndRetryable(t *testing.T) {
+	if SessionBusy.AccountBlamed() {
+		t.Fatal("并发冲突不是这个号的错，不得冷却账号（真机实测 2 秒后即 201）")
+	}
+	if SessionBusy.StopRetry() {
+		t.Fatal("并发冲突应当允许重试（同号退避重试或换号），不该直接甩给客户端")
+	}
+	p := PolicyOf(SessionBusy)
+	if p.Cooldown != 0 {
+		t.Fatalf("并发冲突不得带冷却，实际 %s", p.Cooldown)
+	}
+	if !p.Retry {
+		t.Fatal("并发冲突应当允许重试")
+	}
+	if p.Disable {
+		t.Fatal("并发冲突绝不能禁用账号")
+	}
+}
+
 func TestPolicyMatchesDesignDoc(t *testing.T) {
 	// 与 docs/02-项目设计方案.md §4 的表一一对应。
 	cases := map[Kind]struct {
@@ -52,22 +90,27 @@ func TestPolicyMatchesDesignDoc(t *testing.T) {
 		disable      bool
 		passthrough  bool
 		blameChannel bool
+		retry        bool
 	}{
-		HardCredit:       {cd: 12 * time.Hour},
-		SoftRate:         {cd: 60 * time.Second},
+		HardCredit:       {cd: 12 * time.Hour, retry: true},
+		SoftRate:         {cd: 60 * time.Second, retry: true},
 		SessionDead:      {disable: true},
 		ContentBlocked:   {passthrough: true},
 		PromptTooLong:    {passthrough: true},
-		ModelUnavailable: {cd: 10 * time.Minute},
-		UpstreamFault:    {cd: 5 * time.Minute, blameChannel: true},
-		// 0.9.8：连接中断不算账号错误 → 不冷却账号，只记在渠道头上（事故回归）。
-		Transport: {blameChannel: true},
-		Parse:     {cd: 10 * time.Minute},
+		ModelUnavailable: {cd: 10 * time.Minute, retry: true},
+		UpstreamFault:    {cd: 5 * time.Minute, blameChannel: true, retry: true},
+		// 0.9.9 ①②：连接中断/空流是**推断类** → 冷却时长由 pool 的连续错误门槛给
+		// （err_cooldown），Policy 里不带固定冷却；换号仍然有意义。
+		Transport: {retry: true},
+		Parse:     {retry: true},
+		// 并发冲突：瞬态闸门，不冷却（适配器内部退避重试）。
+		SessionBusy: {retry: true},
 	}
 	for k, want := range cases {
 		got := PolicyOf(k)
 		if got.Cooldown != want.cd || got.Disable != want.disable ||
-			got.Passthrough != want.passthrough || got.BlameChannel != want.blameChannel {
+			got.Passthrough != want.passthrough || got.BlameChannel != want.blameChannel ||
+			got.Retry != want.retry {
 			t.Errorf("%s: got %+v want %+v", k, got, want)
 		}
 	}

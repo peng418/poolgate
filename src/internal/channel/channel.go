@@ -96,6 +96,13 @@ type AccountState struct {
 	Disabled bool
 	Reason   string    // 触发 Disabled 或冷却的原因（errs.Kind 字符串）
 	Until    time.Time // 冷却截止；零值 = 未冷却
+	// SoftCooling 为真表示这是「推断类软冷却」（连接中断 / 空流）：该号仍会被选用，
+	// 一次成功即自动解除 —— 面板要把它显示成「降级使用」而不是「下线」（④）。
+	SoftCooling bool
+	// ErrCount / ErrThreshold 是「连续错误 n/m」的展示口径（④）。
+	// 门槛机制：推断类错误连续到 ErrThreshold 次才冷却（成功即清零）。
+	ErrCount     int
+	ErrThreshold int
 }
 
 // Balance 是账号余额快照。未知字段保持零值，由 UI 显示「未知」而不是猜数字（F4.2）。

@@ -31,6 +31,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -104,8 +105,13 @@ type Adapter struct {
 	// 网页端上游对同一账号只允许一个进行中的会话：
 	// 并发建会话会返回 CONCURRENT_OPERATION「Already handling session start
 	// request for this user」。因此按账号串行化对话 —— 这是协议约束，不是性能取舍。
-	mu     sync.Mutex
-	locked map[string]*sync.Mutex
+	//
+	// 用带缓冲 channel 而不是 sync.Mutex（2026-09-27 改）：等锁必须能被 ctx 取消。
+	// sync.Mutex 的 Lock() 等不到取消，请求会一直「冻」在锁上直到自己的超时预算被吃光，
+	// 用户侧看到的就是「卡住不动」；换成可取消的信号量后，等不到就明确报「账号忙」，
+	// 让路由换号或把原因交给客户端。
+	mu       sync.Mutex
+	sessions map[string]chan struct{}
 }
 
 // New 建立适配器。
@@ -119,20 +125,35 @@ func NewWithTimeout(timeout time.Duration) *Adapter {
 		tokenURL:  OAuthTokenURL,
 		deviceURL: GatewayBase + epDeviceToken,
 		wsDialer:  &websocket.Dialer{HandshakeTimeout: 20 * time.Second},
-		locked:    map[string]*sync.Mutex{},
+		sessions:  map[string]chan struct{}{},
 	}
 }
 
-// lockFor 取某账号的串行锁（懒建）。
-func (a *Adapter) lockFor(uid string) *sync.Mutex {
+// lockFor 取某账号的会话令牌（懒建）。
+func (a *Adapter) lockFor(uid string) chan struct{} {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	l, ok := a.locked[uid]
+	ch, ok := a.sessions[uid]
 	if !ok {
-		l = &sync.Mutex{}
-		a.locked[uid] = l
+		ch = make(chan struct{}, 1)
+		a.sessions[uid] = ch
 	}
-	return l
+	return ch
+}
+
+// acquireSession 取某账号的会话令牌；ctx 取消/超时则明确报「账号忙」（不冷号、可换号）。
+//
+// 返回的 release 必须调用（幂等由调用方保证：wsStream 用 sync.Once 包着）。
+func (a *Adapter) acquireSession(ctx context.Context, uid string) (func(), error) {
+	ch := a.lockFor(uid)
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, nil
+	case <-ctx.Done():
+		// 本地上游没出错，是「这个号正忙」——归 SessionBusy：不冷却账号、允许换号。
+		return nil, errs.New(errs.SessionBusy, "该账号正在服务另一个会话，等待超出本次请求预算").
+			WithCause(ctx.Err()).WithChannel("qwenwork")
+	}
 }
 
 // NewWithBase 供测试指定上游基址。
@@ -427,12 +448,14 @@ func (a *Adapter) Checkin(ctx context.Context, c *channel.Credential) (channel.C
 func (a *Adapter) Chat(ctx context.Context, c *channel.Credential, req channel.ChatRequest) (channel.Stream, error) {
 	model := a.resolveModel(req.Model)
 
-	lk := a.lockFor(c.UID)
-	lk.Lock()
+	lk, err := a.acquireSession(ctx, c.UID)
+	if err != nil {
+		return nil, err
+	}
 
 	sessionID, err := a.createSession(ctx, c, model)
 	if err != nil {
-		lk.Unlock()
+		lk()
 		return nil, err
 	}
 
@@ -444,7 +467,7 @@ func (a *Adapter) Chat(ctx context.Context, c *channel.Credential, req channel.C
 			"Origin":     {a.base},
 		})
 	if err != nil {
-		lk.Unlock()
+		lk()
 		return nil, errs.New(errs.Transport, "连接上游 chat-ws 失败").WithCause(err).WithChannel("qwenwork")
 	}
 
@@ -455,7 +478,7 @@ func (a *Adapter) Chat(ctx context.Context, c *channel.Credential, req channel.C
 		model:     model,
 		chunks:    make(chan channel.ChatCompletionChunk, 64),
 		errc:      make(chan error, 1),
-		release:   func() { lk.Unlock() },
+		release:   lk,
 	}
 	go s.run(a.promptText(req))
 	return s, nil
@@ -492,21 +515,47 @@ func (a *Adapter) promptText(req channel.ChatRequest) string {
 	return strings.TrimSpace(b.String())
 }
 
+// sessionStartBackoff 是「上游同一账号会话启动未落地（409 / SessionBusy）」时的内联重试节奏。
+//
+// 真机实测（2026-09-27，对真上游连发 4 次 POST /api/chat-sessions）：+0.2s → 409，
+// +2.4s → 201，+4.0s → 201 —— 闸门只挡前一两次启动的「处理中」窗口，约 2 秒级。
+// 所以退避两次足够；每次重试都落一条日志（红线一：不许静默重试）。
+// 变量而非常量：测试把它压到毫秒级，避免用例真的睡 2 秒。
+var sessionStartBackoff = []time.Duration{400 * time.Millisecond, 1200 * time.Millisecond}
+
 // createSession 建一个对话会话，返回 session id。
+//
+// 遇到「上游同账号会话启动进行中」（409 CONCURRENT_OPERATION → errs.SessionBusy）时，
+// 在适配器内部退避重试同一个账号 —— 这是协议层的瞬态闸门，不该让调用方（路由/体检）看见，
+// 更不该记成账号错误去冷却它。
 func (a *Adapter) createSession(ctx context.Context, c *channel.Credential, mode string) (string, error) {
 	body, _ := json.Marshal(map[string]any{"mode": mode})
-	raw, _, err := a.do(ctx, c, http.MethodPost, epSessions, body)
-	if err != nil {
-		return "", err
+	for attempt := 0; ; attempt++ {
+		raw, _, err := a.do(ctx, c, http.MethodPost, epSessions, body)
+		if err == nil {
+			var resp struct {
+				ID string `json:"id"`
+			}
+			if uerr := json.Unmarshal(raw, &resp); uerr != nil || resp.ID == "" {
+				return "", errs.New(errs.Parse, "建会话失败：响应缺少 id").
+					WithChannel("qwenwork").WithUpstream(truncate(string(raw), 300))
+			}
+			return resp.ID, nil
+		}
+		k, _ := errs.KindOf(err)
+		if k != errs.SessionBusy || attempt >= len(sessionStartBackoff) {
+			return "", err
+		}
+		wait := sessionStartBackoff[attempt]
+		log.Printf("poolgate: 渠道 qwenwork 上游并发冲突（同账号上一次会话启动仍在处理中），%s 后重试建会话（第 %d/%d 次）",
+			wait, attempt+1, len(sessionStartBackoff))
+		select {
+		case <-ctx.Done():
+			// 预算用完了：把真实原因（SessionBusy）交出去，别把它记成账号故障。
+			return "", err
+		case <-time.After(wait):
+		}
 	}
-	var resp struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal(raw, &resp); err != nil || resp.ID == "" {
-		return "", errs.New(errs.Parse, "建会话失败：响应缺少 id").
-			WithChannel("qwenwork").WithUpstream(truncate(string(raw), 300))
-	}
-	return resp.ID, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -853,10 +902,10 @@ var (
 		"credits", "quota", "insufficient", "balance",
 	}
 	// rateMarkers 限流。429 之外，上游也常用 200/400 带这些文案回。
+	// 注意：并发建会话的 "concurrent_operation" **不在这里**（2026-09-27 挪出）——
+	// 它是瞬态闸门而不是限流，单独归 SessionBusy（不冷号），否则会被当成限流冷却 60 秒。
 	rateMarkers = []string{
 		"rate limit", "too many requests", "too many", "usage limit", "请求过于频繁",
-		// 同账号并发建会话被拒：限流性质，短冷却后重试即可，不算账号故障。
-		"concurrent_operation",
 	}
 	// contentBlockMarkers 内容拦截。marker 取自 wild-work Classify 的 400 分支。
 	contentBlockMarkers = []string{
@@ -889,6 +938,14 @@ func (a *Adapter) Classify(status int, body []byte) errs.Kind {
 	// 401 是明确的登录态失效。
 	if status == http.StatusUnauthorized {
 		return errs.SessionDead
+	}
+	// 409 / CONCURRENT_OPERATION：上游同一账号的「会话启动」还在处理中 —— 2 秒级瞬态闸门。
+	//
+	// 必须在宽匹配词表**之前**判定：body 里的 "concurrent_operation" 以前落在 rateMarkers 里，
+	// 于是被判成 SoftRate（限流）→ 冷却该账号 60 秒；单账号渠道等于整条渠道冻结一分钟，
+	// 而真机实测这个闸门 2 秒后就放行（2026-09-27 实测：+0.2s → 409；+2.4s → 201）。
+	if status == http.StatusConflict || strings.Contains(low, "concurrent_operation") {
+		return errs.SessionBusy
 	}
 	// 403 不一定是账号问题：内容拦截也常用 403（wild-work 会先看 body 标记再归类）。
 	if status == http.StatusForbidden {

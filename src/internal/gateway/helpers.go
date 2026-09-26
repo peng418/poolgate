@@ -169,6 +169,11 @@ func httpStatusFor(k errs.Kind) int {
 		return http.StatusBadGateway
 	case errs.Transport:
 		return http.StatusBadGateway
+	case errs.SessionBusy:
+		// 上游同一账号的「会话启动」还没落地（2 秒级瞬态闸门）。这不是调用方的问题，
+		// 也不是限流：网关侧已经退避重试过，仍然冲突就如实回 503 + Retry。
+		// **绝不用 429**：客户端看到 429 会立刻重试，正好再撞一次闸门。
+		return http.StatusServiceUnavailable
 	case errs.NoCandidate:
 		return http.StatusServiceUnavailable
 	default:

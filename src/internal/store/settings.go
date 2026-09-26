@@ -35,6 +35,12 @@ type Settings struct {
 	// CooldownSeconds 覆盖 errs.DefaultPolicy 的冷却时长（按 Kind 名索引）。
 	// 只覆盖冷却时长，不改「是否禁用/是否换号」——那些是判据的一部分，不做成旋钮。
 	CooldownSeconds map[string]int `json:"cooldown_seconds"`
+	// ErrThreshold / ErrCooldownSeconds 是「连续错误门槛」（①，对齐参考实现 wild-work
+	// 的 err_threshold / err_cooldown）：**推断类**错误（连接中断 / 空流）连续发生
+	// ErrThreshold 次才冷却 ErrCooldownSeconds 秒。单次抖动不罚号；成功即清零。
+	// 上游明确裁决类（429/402/401/禁言）不走这个门槛 —— 它们立即生效。
+	ErrThreshold       int `json:"err_threshold"`
+	ErrCooldownSeconds int `json:"err_cooldown_seconds"`
 
 	// 健康探测
 	ProbeIntervalHours int `json:"probe_interval_hours"`
@@ -77,6 +83,8 @@ func DefaultSettings() Settings {
 		StickyRequests:     50,
 		MaxRetry:           3,
 		CooldownSeconds:    map[string]int{},
+		ErrThreshold:       5,
+		ErrCooldownSeconds: 600,
 		ProbeIntervalHours: 6,
 		ProbeSamples:       3,
 		// 30s 对慢渠道（千问办公实测首字 11–16s）偏紧，默认给 60s。
@@ -139,6 +147,8 @@ func decodeSettings(raw []byte) Settings {
 	apply("sticky_requests", &out.StickyRequests)
 	apply("max_retry", &out.MaxRetry)
 	apply("cooldown_seconds", &out.CooldownSeconds)
+	apply("err_threshold", &out.ErrThreshold)
+	apply("err_cooldown_seconds", &out.ErrCooldownSeconds)
 	apply("probe_interval_hours", &out.ProbeIntervalHours)
 	apply("probe_samples", &out.ProbeSamples)
 	apply("probe_timeout_sec", &out.ProbeTimeoutSec)

@@ -61,7 +61,10 @@ func (g *Gate) account(kind channel.Kind, uid string) *accountGate {
 func (g *Gate) Acquire(ctx context.Context, kind channel.Kind, uid string) (func(), error) {
 	a := g.account(kind, uid)
 	if err := lockCtx(ctx, &a.mu); err != nil {
-		return nil, errs.New(errs.SoftRate, "等待该账号空闲超时").
+		// 「这个号正忙，等不到」——归 SessionBusy 而不是 SoftRate（2026-09-27 改）：
+		// SoftRate 会换一次 60 秒账号冷却，等于把一个只是"排队没轮到"的好号罚下场
+		// （单账号渠道直接整条渠道冻结）。SessionBusy 不冷号、可换号、可稍后重试。
+		return nil, errs.New(errs.SessionBusy, "等待该账号空闲超时").
 			WithChannel(string(kind)).WithAccount(uid).WithCause(err)
 	}
 	if d := g.intervalOf(kind) - time.Since(a.last); d > 0 {
@@ -71,7 +74,8 @@ func (g *Gate) Acquire(ctx context.Context, kind channel.Kind, uid string) (func
 		case <-ctx.Done():
 			t.Stop()
 			a.mu.Unlock()
-			return nil, errs.New(errs.SoftRate, "等待请求间隔超时").
+			// 同上：等间隔没等到，是这个号忙，不是它坏。
+			return nil, errs.New(errs.SessionBusy, "等待请求间隔超时").
 				WithChannel(string(kind)).WithAccount(uid).WithCause(ctx.Err())
 		}
 	}

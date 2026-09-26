@@ -269,9 +269,14 @@ func TestChatEmptyUpstreamStreamIsError(t *testing.T) {
 	if !strings.Contains(body, "[DONE]") {
 		t.Fatalf("错误帧后仍应发 [DONE] 收尾，实际 %s", body)
 	}
-	// 空流计入账号错误（冷却），否则会一直拿这个空号去试。
-	if _, ok := p.Pick(context.Background(), channel.QoderCN, nil); ok {
-		t.Fatal("空流应冷却该账号")
+	// 空流计入账号错误：0.9.9 起是「计数 + 门槛」——单次只记一笔，达到门槛才冷却；
+	// 而且单账号渠道按单账号纪律不冷却（③）—— 冷唯一的号 = 整条渠道下线。
+	st, ok := p.Get(channel.QoderCN, "u1")
+	if !ok || st.ErrCount != 1 {
+		t.Fatalf("空流应计入账号错误计数（期望 1，实际 %d）", st.ErrCount)
+	}
+	if _, ok := p.Pick(context.Background(), channel.QoderCN, nil); !ok {
+		t.Fatal("单账号渠道不该因一次空流就被下线（③ 单账号纪律）")
 	}
 
 	// 非流式：必须是错误响应，而不是 content 为空的 200。
