@@ -425,6 +425,11 @@ func packMessages(msgs []channel.Message) string {
 			role = "system"
 		}
 		content := m.Content
+		if role == "assistant" {
+			// 客户端历史里的脏正文（上一轮模型自演的剧本）不能原样回灌：模型看到自己上一轮
+			// 就是这么写的，就会接着演（真机同一会话连续 3 轮都脏）。用户/工具消息不动（红线一）。
+			content = cutAtControlMarker(content)
+		}
 		if len(m.ToolCalls) > 0 {
 			// 工具调用历史（shim 通常已经转成文本了，这里兜底）
 			var parts []string
@@ -493,6 +498,8 @@ func (s *stream) pump() {
 	defer s.once.Do(s.onClose)
 	br := bufio.NewReaderSize(s.rc, 256*1024)
 	state := &patchState{}
+	// 出站哨兵：正文/思考各一个（思考被截断不该终止本轮，正文被截断就是本轮结束，见 guard.go）。
+	gThink, gContent := &streamGuard{}, &streamGuard{}
 	var event, data strings.Builder
 
 	// raw 保留流开头的一小段原文，只用于「一个有效帧都没解析出来」时把上游原话带出去
@@ -521,9 +528,28 @@ func (s *stream) pump() {
 			return true
 		}
 		think, content, finished := state.feed(val)
-		if think != "" || content != "" || finished {
+		// 控制标记永不下发：出现标记即视为模型开始自演下一轮，本轮到此结束（guard.go）。
+		tOut, _ := gThink.feed(think)
+		cOut, cStop := gContent.feed(content)
+		if cStop {
+			if gContent.junkOnly() && !gThink.emitted {
+				// 整轮都是自演：没有任何正文可给客户端 —— 明确报错（红线二），且记在上游头上
+				// （不冷却账号：这不是账号的问题，是模型顺着我们拼的剧本往下写了）。
+				dsLogf("本轮整轮都是模型自演（丢弃 %d 字节，起始 %q）", gContent.dropped, gContent.preview(120))
+				s.ch <- chunkOrErr{err: errs.New(errs.UpstreamFault, guardUpstreamNote+"，本轮没有有效内容").
+					WithChannel(string(channel.DeepSeek)).
+					WithUpstream(gContent.preview(200))}
+				return true
+			}
+			dsLogf("正文出现对话模板标记，已截断模型自演的后续轮次（丢弃 %d 字节，起始 %q）",
+				gContent.dropped, gContent.preview(120))
 			sawSignal = true
-			s.ch <- chunkOrErr{chunk: chunkOf(s.model, think, content, finished)}
+			s.ch <- chunkOrErr{chunk: chunkOf(s.model, tOut, cOut, true)}
+			return true
+		}
+		if tOut != "" || cOut != "" || finished {
+			sawSignal = true
+			s.ch <- chunkOrErr{chunk: chunkOf(s.model, tOut, cOut, finished)}
 		}
 		return false
 	}
@@ -555,6 +581,14 @@ func (s *stream) pump() {
 		if err == io.EOF {
 			if flush() {
 				return
+			}
+			// 收尾：把哨兵扣住的尾巴放行（走到这里说明它不含完整标记）。
+			if out := gContent.flush(); strings.TrimSpace(out) != "" {
+				sawSignal = true
+				s.ch <- chunkOrErr{chunk: chunkOf(s.model, gThink.flush(), out, false)}
+			} else if out := gThink.flush(); strings.TrimSpace(out) != "" {
+				sawSignal = true
+				s.ch <- chunkOrErr{chunk: chunkOf(s.model, out, "", false)}
 			}
 			// 一个有效帧都没产出：上游多半是「HTTP 200 + JSON 业务错误信封」（DeepSeek 的业务
 			// 错误就藏在 200 里）。必须把上游原话（biz_code/biz_msg 或 code/msg）带出去，
