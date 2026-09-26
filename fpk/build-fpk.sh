@@ -82,7 +82,7 @@ M="$PKG/manifest"
   printf 'service_port          = %s\n'   "$PORT"
   printf 'desktop_uidir         = ui\n'
   printf 'desktop_applaunchname = %s.main\n' "$APPNAME"
-  printf 'changelog = 面板只显示在用的 6 个渠道（QoderCN/QoderCOM/TraeWork/WorkBuddyCN/WorkBuddyAI/千问办公），聊天渠道（豆包/ChatGPT/元宝/Kimi/智谱/通义/DeepSeek 网页/Gemini 等）与「接入源」入口先屏蔽 —— 代码一行未删，改两个常量即可恢复；面板显示与网关行为分开，要让客户端也选不到请在「设置→渠道开关」暂停 | FPK %s\n' "$VERSION"
+  printf 'changelog = DeepSeek 网页版做「好用」：① 新增账号密码直登（面板填一次账号密码即换取 token，无需开浏览器、无需复制 userToken；勾选「记住密码」后 token 过期自动重新登录续期）② 面板渠道选择器放行 DeepSeek（原先被 VISIBLE_CHANNELS 隐藏，根本看不到、加不了号）③ 工具调用保真度强化（工具名清单前置、正例/反例、完整 schema；实测 DSML 原生语法稳定解析回结构化 tool_calls）④ 修复粘贴路径下 userToken 失效被静默放进池子的问题（现在会当场报「凭证校验失败」） | FPK %s\n' "$VERSION"
 } >> "$M"
 chmod 0644 "$M"
 sed -n '1,20p' "$M" | sed 's/^/  /'

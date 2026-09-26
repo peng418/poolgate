@@ -573,3 +573,97 @@ func TestLoginStartExposesPasteHint(t *testing.T) {
 		t.Fatalf("普通渠道不应带 paste_hint，实际 %q", sr2.PasteHint)
 	}
 }
+
+// fakePwSession 是「账号密码直登」渠道的假会话（实现 channel.PasswordAcceptor）。
+type fakePwSession struct {
+	fakeSession
+	fields []channel.LoginField
+	got    map[string]string
+	accErr error
+}
+
+func (f *fakePwSession) LoginFields() []channel.LoginField { return f.fields }
+
+func (f *fakePwSession) AcceptPassword(v map[string]string) error {
+	if f.accErr != nil {
+		return f.accErr
+	}
+	f.got = v
+	return nil
+}
+
+// TestLoginPasswordAcceptsCheckboxBool 是回归测试：
+// 面板的「记住密码」是 checkbox，v-model 发的是布尔 true —— 服务端若把 values
+// 收成 map[string]string，整个请求体会解析失败（实测症状：表单提交报「请求体无法解析」）。
+// 这里锁住「布尔/数字/字符串都认」这条契约。
+func TestLoginPasswordAcceptsCheckboxBool(t *testing.T) {
+	sess := &fakePwSession{
+		fakeSession: fakeSession{url: "u", pending: 99},
+		fields: []channel.LoginField{
+			{Name: "account", Label: "账号", Type: "text", Required: true},
+			{Name: "password", Label: "密码", Type: "password", Required: true},
+			{Name: "remember", Label: "记住密码", Type: "text"},
+		},
+	}
+	ch := &fakeAuthChannel{kind: channel.DeepSeek, sess: &sess.fakeSession, sessOverride: sess}
+	h, token, _, _ := newLoginTestServer(t, ch)
+
+	// 先发起授权，才有「进行中的会话」可提交。
+	if w := authed(t, h, http.MethodPost, "/api/login/start", channelLoginReq{Channel: "deepseek"}, token); w.Code != http.StatusOK {
+		t.Fatalf("start 应 200，实际 %d %s", w.Code, w.Body.String())
+	}
+
+	// 关键：remember 是布尔 true（前端 checkbox 的真实形态）。
+	body := `{"values":{"account":"a@b.com","password":"pw","remember":true}}`
+	r := httptest.NewRequest(http.MethodPost, "/api/login/password", strings.NewReader(body))
+	r.Header.Set("Authorization", "Bearer "+token)
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("布尔字段应被接受，实际 %d %s", w.Code, w.Body.String())
+	}
+	if sess.got["account"] != "a@b.com" || sess.got["password"] != "pw" {
+		t.Fatalf("字段值传丢了：%+v", sess.got)
+	}
+	if sess.got["remember"] != "on" {
+		t.Fatalf("布尔 true 应转成 \"on\"，实际 %q", sess.got["remember"])
+	}
+
+	// 数字与 false 也要能过（同一份宽容度）。
+	body2 := `{"values":{"account":"a@b.com","password":"pw","remember":false,"extra":3}}`
+	r2 := httptest.NewRequest(http.MethodPost, "/api/login/password", strings.NewReader(body2))
+	r2.Header.Set("Authorization", "Bearer "+token)
+	r2.Header.Set("Content-Type", "application/json")
+	w2 := httptest.NewRecorder()
+	h.ServeHTTP(w2, r2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("false/数字应被接受，实际 %d %s", w2.Code, w2.Body.String())
+	}
+	if sess.got["remember"] != "" {
+		t.Fatalf("布尔 false 应为空串，实际 %q", sess.got["remember"])
+	}
+	if sess.got["extra"] != "3" {
+		t.Fatalf("数字应转成 \"3\"，实际 %q", sess.got["extra"])
+	}
+}
+
+// TestLoginPasswordUnsupportedChannel 校验非直登渠道被明确拒绝（不是静默成功）。
+func TestLoginPasswordUnsupportedChannel(t *testing.T) {
+	ch := &fakeAuthChannel{kind: channel.QoderCN, sess: &fakeSession{url: "u", pending: 99}}
+	h, token, _, _ := newLoginTestServer(t, ch)
+	authed(t, h, http.MethodPost, "/api/login/start", channelLoginReq{Channel: "qodercn"}, token)
+
+	body := `{"values":{"account":"a","password":"b"}}`
+	r := httptest.NewRequest(http.MethodPost, "/api/login/password", strings.NewReader(body))
+	r.Header.Set("Authorization", "Bearer "+token)
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code == http.StatusOK {
+		t.Fatal("不支持直登的渠道必须报错")
+	}
+	if !strings.Contains(w.Body.String(), "不支持账号密码直登") {
+		t.Fatalf("应说明不支持，实际 %s", w.Body.String())
+	}
+}

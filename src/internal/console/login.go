@@ -12,6 +12,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -41,6 +42,10 @@ type loginStartResp struct {
 	// PasteHint 是给「粘贴式」渠道（实现 CallbackAcceptor）的引导语，如 DeepSeek：
 	// 它的凭证是用户在自己浏览器登录后粘回来的 userToken，面板据此切换引导文案。
 	PasteHint string `json:"paste_hint,omitempty"`
+	// LoginFields 是「账号密码直登」渠道（实现 PasswordAcceptor）要用户填的字段。
+	// 非空时面板渲染一个表单（如 DeepSeek 的 账号+密码），填完直接换 token，
+	// 用户无需开浏览器、无需复制粘贴 —— 这是对粘贴路径的替代，不是叠加。
+	LoginFields []channel.LoginField `json:"login_fields,omitempty"`
 }
 
 // loginPollResp 是轮询结果：pending / ok 两态，失败直接走结构化错误。
@@ -229,6 +234,51 @@ func (m *loginManager) HintProvider() (string, bool) {
 	return hp.Hint(), true
 }
 
+// PasswordProvider 返回当前授权会话的直登表单字段（实现 channel.PasswordAcceptor 的渠道）；
+// 没有进行中的授权或渠道不提供表单时 ok=false。
+func (m *loginManager) PasswordProvider() ([]channel.LoginField, bool) {
+	m.mu.Lock()
+	al := m.active
+	m.mu.Unlock()
+	if al == nil {
+		return nil, false
+	}
+	pa, ok := al.sess.(channel.PasswordAcceptor)
+	if !ok {
+		return nil, false
+	}
+	fields := pa.LoginFields()
+	if len(fields) == 0 {
+		return nil, false
+	}
+	return fields, true
+}
+
+// acceptPassword 把面板填的账号密码交给当前这次授权（未实现该能力的渠道报错说清）。
+func (m *loginManager) acceptPassword(values map[string]string) (channel.Kind, error) {
+	m.mu.Lock()
+	al := m.active
+	m.mu.Unlock()
+	if al == nil {
+		return "", errs.New(errs.Parse, "没有进行中的渠道授权（先点「添加账号」再填）")
+	}
+	pa, ok := al.sess.(channel.PasswordAcceptor)
+	if !ok {
+		return al.kind, errs.New(errs.Parse,
+			"渠道 "+string(al.kind)+" 不支持账号密码直登，请在浏览器完成授权").
+			WithChannel(string(al.kind))
+	}
+	if err := pa.AcceptPassword(values); err != nil {
+		if ee, ok := err.(*errs.Error); ok {
+			return al.kind, ee.WithChannel(string(al.kind))
+		}
+		return al.kind, errs.New(errs.Parse, "表单内容无法识别").WithCause(err).
+			WithChannel(string(al.kind))
+	}
+	log.Printf("console: 渠道 %s 收到账号密码直登表单，等待下次轮询兑换", al.kind)
+	return al.kind, nil
+}
+
 // authorizerFor 从注册表取该渠道的授权能力。没注册或没实现都不算错误，
 // 但要能说清楚「为什么这个渠道点不了授权」。
 func authorizerFor(kind channel.Kind) (channel.Authorizer, bool) {
@@ -279,7 +329,12 @@ func (s *Server) handleLoginStart(w http.ResponseWriter, r *http.Request) {
 	if hp, ok := s.login.HintProvider(); ok {
 		pasteHint = hp
 	}
-	writeJSON(w, http.StatusOK, loginStartResp{Channel: req.Channel, AuthURL: url, Expires: until.Format(time.RFC3339), CallbackBase: base, PasteHint: pasteHint})
+	// 直登表单字段（实现 PasswordAcceptor 的渠道）：面板据此渲染账号/密码表单。
+	var fields []channel.LoginField
+	if pf, ok := s.login.PasswordProvider(); ok {
+		fields = pf
+	}
+	writeJSON(w, http.StatusOK, loginStartResp{Channel: req.Channel, AuthURL: url, Expires: until.Format(time.RFC3339), CallbackBase: base, PasteHint: pasteHint, LoginFields: fields})
 }
 
 func (s *Server) handleLoginPoll(w http.ResponseWriter, r *http.Request) {
@@ -339,6 +394,61 @@ func (s *Server) handleLoginCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	kind, err := s.login.acceptCallback(req.Raw)
+	if err != nil {
+		writeErrFromErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "channel": string(kind)})
+}
+
+// handleLoginPassword 收「账号密码直登」表单（实现 channel.PasswordAcceptor 的渠道）。
+//
+// 安全要点：请求体解析后立即交给适配器，不回显、不写日志；响应里只带 channel 名，
+// 绝不把用户填的密码原样返回（面板也就能保证密码不出前端 → 服务端单向）。
+func (s *Server) handleLoginPassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, errs.New(errs.Parse, "仅支持 POST"))
+		return
+	}
+	var req struct {
+		// Values 必须是 map[string]any 而不是 map[string]string：
+		// 面板的「记住密码」是 checkbox，v-model 给它的是布尔值 —— 收成 string
+		// 会让整个请求体解析失败（实测踩过：表单提交报「请求体无法解析」）。
+		// 这里统一收 any，再按需转成字符串交给适配器。
+		Values map[string]any `json:"values"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, errs.New(errs.Parse, "请求体无法解析").WithCause(err))
+		return
+	}
+	if len(req.Values) == 0 {
+		writeErr(w, http.StatusBadRequest, errs.New(errs.Parse, "缺少 values 字段"))
+		return
+	}
+	values := make(map[string]string, len(req.Values))
+	for k, v := range req.Values {
+		switch t := v.(type) {
+		case string:
+			values[k] = t
+		case bool:
+			// checkbox 勾选 → "on"（与 HTML 表单的语义一致，适配器按此判定）。
+			if t {
+				values[k] = "on"
+			} else {
+				values[k] = ""
+			}
+		case float64:
+			values[k] = strconv.FormatFloat(t, 'f', -1, 64)
+		case nil:
+			values[k] = ""
+		default:
+			// 其余类型（数组/对象）不是表单会产生的，明确报错而不是静默丢弃。
+			writeErr(w, http.StatusBadRequest,
+				errs.New(errs.Parse, "字段 "+k+" 的类型不被支持").WithCause(nil))
+			return
+		}
+	}
+	kind, err := s.login.acceptPassword(values)
 	if err != nil {
 		writeErrFromErr(w, err)
 		return

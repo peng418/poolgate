@@ -457,3 +457,79 @@ func TestClassify(t *testing.T) {
 		}
 	}
 }
+
+// TestParseLoginToken 覆盖直登响应解析：成功取 token、失败把人话原因带出来。
+func TestParseLoginToken(t *testing.T) {
+	cases := []struct {
+		name, raw, wantTok string
+		wantMsgHas         string
+	}{
+		{"成功-user_token", `{"code":0,"data":{"biz_data":{"user_token":"tok-abc-12345678901234567890"}}}`, "tok-abc-12345678901234567890", ""},
+		{"成功-token 别名", `{"code":0,"data":{"biz_data":{"token":"tok-xyz-12345678901234567890"}}}`, "tok-xyz-12345678901234567890", ""},
+		{"密码错", `{"code":0,"data":{"biz_code":2,"biz_msg":"PASSWORD_OR_USER_NAME_IS_WRONG"}}`, "", "账号或密码不对"},
+		{"风控", `{"code":0,"data":{"biz_code":7,"biz_msg":"RISK_DEVICE_DETECTED"}}`, "", "风控"},
+		{"无法解析", `not json`, "", "无法解析"},
+	}
+	for _, c := range cases {
+		tok, msg := parseLoginToken([]byte(c.raw))
+		if tok != c.wantTok {
+			t.Errorf("%s: token = %q，want %q", c.name, tok, c.wantTok)
+		}
+		if c.wantMsgHas != "" && !strings.Contains(msg, c.wantMsgHas) {
+			t.Errorf("%s: 原因 = %q，应含 %q", c.name, msg, c.wantMsgHas)
+		}
+	}
+}
+
+// TestLoginFieldsDeclaresPasswordForm 校验直登表单声明了账号与密码两个必填项，
+// 且密码框类型是 password（面板据此渲染，绝不显示明文）。
+func TestLoginFieldsDeclaresPasswordForm(t *testing.T) {
+	s := &session{}
+	fields := s.LoginFields()
+	if len(fields) != 3 {
+		t.Fatalf("应有 3 个字段（账号/密码/记住密码），得到 %d", len(fields))
+	}
+	byName := map[string]channel.LoginField{}
+	for _, f := range fields {
+		byName[f.Name] = f
+	}
+	acc, ok := byName[fieldAccount]
+	if !ok || !acc.Required {
+		t.Fatalf("账号字段应存在且必填：%+v", acc)
+	}
+	pw, ok := byName[fieldPassword]
+	if !ok || pw.Type != "password" || !pw.Required {
+		t.Fatalf("密码字段应为 password 类型且必填：%+v", pw)
+	}
+	if _, ok := byName[fieldRemember]; !ok {
+		t.Fatal("应有「记住密码」字段（供自动续期）")
+	}
+}
+
+// TestAcceptPasswordRejectsEmpty 校验空账号/空密码被当场拒绝（红线一：不静默接受）。
+func TestAcceptPasswordRejectsEmpty(t *testing.T) {
+	s := &session{}
+	if err := s.AcceptPassword(map[string]string{fieldAccount: "", fieldPassword: "x"}); err == nil {
+		t.Fatal("空账号必须报错")
+	}
+	if err := s.AcceptPassword(map[string]string{fieldAccount: "a@b.com", fieldPassword: ""}); err == nil {
+		t.Fatal("空密码必须报错")
+	}
+	if err := s.AcceptPassword(map[string]string{fieldAccount: "a@b.com", fieldPassword: "pw"}); err != nil {
+		t.Fatalf("填全了不该报错：%v", err)
+	}
+}
+
+// TestMaskAccount 校验账号打码：邮箱保留前 2 位+域名、手机号保留前 3 后 2。
+func TestMaskAccount(t *testing.T) {
+	cases := map[string]string{
+		"pengjincheng@qq.com": "pe***@qq.com",
+		"13800001234":         "138****34",
+		"ab@c.com":            "ab@c.com",
+	}
+	for in, want := range cases {
+		if got := maskAccount(in); got != want {
+			t.Errorf("maskAccount(%q) = %q，want %q", in, got, want)
+		}
+	}
+}

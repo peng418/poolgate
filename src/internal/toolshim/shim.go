@@ -24,6 +24,7 @@ package toolshim
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"poolgate/internal/channel"
@@ -47,33 +48,75 @@ func ToolPrompt(tools []map[string]any) string {
 	if len(tools) == 0 {
 		return ""
 	}
-	var b strings.Builder
-	b.WriteString("你可以调用工具。可用工具如下（JSON Schema）：\n\n")
+	// 先把有效工具挑出来（同名去重：后面的覆盖前面的，与 OpenAI 语义一致）。
+	type toolDef struct {
+		name, desc string
+		params     any
+	}
+	var defs []toolDef
+	seen := map[string]int{}
 	for _, t := range tools {
 		fn, _ := t["function"].(map[string]any)
 		if fn == nil {
 			continue
 		}
 		name, _ := fn["name"].(string)
+		name = strings.TrimSpace(name)
 		if name == "" {
 			continue
 		}
-		if d, _ := fn["description"].(string); d != "" {
-			fmt.Fprintf(&b, "- %s：%s\n", name, d)
-		} else {
-			fmt.Fprintf(&b, "- %s\n", name)
-		}
+		desc, _ := fn["description"].(string)
 		params := fn["parameters"]
 		if params == nil {
 			params = map[string]any{"type": "object", "properties": map[string]any{}}
 		}
-		raw, _ := json.Marshal(params)
-		fmt.Fprintf(&b, "  参数格式：%s\n", string(raw))
+		if i, ok := seen[name]; ok {
+			defs[i] = toolDef{name: name, desc: desc, params: params}
+			continue
+		}
+		seen[name] = len(defs)
+		defs = append(defs, toolDef{name: name, desc: desc, params: params})
 	}
-	b.WriteString("\n当你需要调用工具时，**只输出**下面这种标记（不要写额外的解释、不要用代码围栏）：\n")
+	if len(defs) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	// 开头就把「最重要的一件事」放在生成位置最近处能看见的地方：必须用标记、不许用自然语言描述。
+	b.WriteString("【工具调用协议 · 必须遵守】\n")
+	// 工具名索引紧跟其后（实测位置敏感：越靠前越不会被长请求淹没）。
+	b.WriteString("可用工具（共 ")
+	b.WriteString(strconv.Itoa(len(defs)))
+	b.WriteString(" 个）：")
+	names := make([]string, 0, len(defs))
+	for _, d := range defs {
+		names = append(names, d.name)
+	}
+	b.WriteString(strings.Join(names, " / "))
+	b.WriteString("\n")
+	b.WriteString("**需要动作时（读文件 / 写文件 / 执行命令 / 搜索 / 打开网页等），")
+	b.WriteString("你必须先真正发出工具调用，而不是用自然语言描述你打算怎么做，也不是凭已有知识直接作答。**\n\n")
+
+	// 输出格式写死，并给出「正例 / 反例」——实测反例能显著降低模型写成自然语言或 markdown 的概率。
+	b.WriteString("调用格式（**只输出这个标记本身，不要写任何解释、不要用 ``` 代码围栏、不要加前缀**）：\n")
 	b.WriteString(OpenTag + `{"name":"工具名","arguments":{"参数名":值}}` + CloseTag + "\n")
-	b.WriteString("需要同时调用多个工具，就并排写多个这样的标记。arguments 必须是合法 JSON 对象。\n")
-	b.WriteString("不需要调用工具时，正常用自然语言回答即可。\n")
+	b.WriteString("多个工具并排写多个标记。arguments 必须是合法 JSON 对象（键值用双引号）。\n")
+	b.WriteString("正例：" + OpenTag + `{"name":"Read","arguments":{"file_path":"/tmp/a.txt"}}` + CloseTag + "\n")
+	b.WriteString("反例（禁止）：先写「我来读一下文件」再写标记；写成 ```json 代码块；把参数写成非 JSON。\n\n")
+
+	// 完整 schema 逐条给（不简化 —— 简化会让模型编参数）。
+	b.WriteString("各工具参数 schema：\n")
+	for _, d := range defs {
+		if d.desc != "" {
+			fmt.Fprintf(&b, "\n● %s —— %s\n", d.name, d.desc)
+		} else {
+			fmt.Fprintf(&b, "\n● %s\n", d.name)
+		}
+		raw, _ := json.Marshal(d.params)
+		fmt.Fprintf(&b, "  %s\n", string(raw))
+	}
+
+	b.WriteString("\n不需要调用工具时，正常用自然语言回答即可。\n")
 	b.WriteString("工具执行结果会以「[工具执行结果]」开头回给你，请据此继续回答用户。\n")
 	return b.String()
 }
@@ -127,7 +170,10 @@ func BuildRequest(req channel.ChatRequest) channel.ChatRequest {
 // 一个工具都不调；同一份请求只在最后一条消息末尾补这句，4/4 次都正确调用工具
 // （doubao 另一个档位 2/3）。系统提示词一长，那里的约定就被淹没了，
 // 而紧挨着生成位置的那句话才起作用。所以两份都留着：系统里那份给完整说明，末尾这份保命中率。
-const ReminderSuffix = "\n\n[工具调用格式提醒] 只要这个任务需要动作（读文件、查日志、执行命令、搜索等），" +
+//
+// 措辞要点（照实测调过）：把「必须先用工具」和「不要用自然语言描述」两句都写死，
+// 并给出可直接照抄的标记形状 —— 只写「你可以调用工具」实测无效。
+const ReminderSuffix = "\n\n[工具调用格式提醒] 只要这个任务需要动作（读文件、写文件、查日志、执行命令、搜索等），" +
 	"你必须**先调用工具**再作答：只输出 " + OpenTag + `{"name":"工具名","arguments":{…}}` + CloseTag + "，" +
 	"不要用自然语言描述你打算怎么做，也不要凭已有知识直接回答。可用工具见系统提示词。"
 

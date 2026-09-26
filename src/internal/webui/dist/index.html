@@ -62,6 +62,14 @@
 .cb-paste{max-width:100%;margin-top:12px;border:1px solid var(--border);border-radius:9px;padding:10px 12px;background:var(--surface-2)}
 .cb-paste summary{cursor:pointer;font-size:12.5px;color:var(--ink-2)}
 .cb-paste[open] summary{color:var(--ink)}
+/* 账号密码直登表单：与粘贴区视觉同级，入口更靠前（推荐路径） */
+.direct-login{max-width:100%;margin-top:12px;border:1px solid var(--border);border-radius:9px;padding:12px;background:var(--surface-2)}
+.direct-login .dl-title{font-size:12.5px;font-weight:600;color:var(--ink);margin-bottom:10px}
+.direct-login .dl-row{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.direct-login .dl-row>label:first-child{flex:0 0 92px;font-size:12.5px;color:var(--ink-2)}
+.direct-login .dl-row input[type=text],.direct-login .dl-row input[type=password]{flex:1 1 auto;min-width:0}
+.direct-login .dl-check{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--ink-2);cursor:pointer}
+.direct-login .dl-check input{width:auto}
 
 /* 覆盖层自己滚：内容高过视口时不该把整页撑长（否则背后页面能被滑出来）。 */
 .auth-main{padding:22px 18px 40px}
@@ -267,6 +275,35 @@
           <div class="sub" v-else>这个渠道<b>没法扫码</b>（它的回调地址被上游锁死在本机）：点下面的「打开授权页」在浏览器里完成，
             或者完成之后用「手工回填」把那串地址粘回来</div>
 
+          <!-- 账号密码直登（实现 PasswordAcceptor 的渠道，如 DeepSeek）：
+               填一次账号密码，服务端直接换 token —— 不用开浏览器、不用复制粘贴。
+               密码框 type=password 且不落任何前端持久化状态。 -->
+          <div class="direct-login" v-if="loginFields.length">
+            <div class="dl-title">直接登录（推荐）</div>
+            <div class="dl-row" v-for="f in loginFields" :key="f.name">
+              <label :for="'dl-'+f.name">{{ f.label }}</label>
+              <template v-if="f.type==='password'">
+                <input :id="'dl-'+f.name" type="password" v-model="loginForm[f.name]"
+                  :placeholder="f.placeholder||''" autocomplete="off"
+                  @keyup.enter="submitPassword">
+              </template>
+              <template v-else-if="f.name==='remember'">
+                <label class="dl-check">
+                  <input type="checkbox" v-model="loginForm.remember"> 记住密码
+                </label>
+              </template>
+              <template v-else>
+                <input :id="'dl-'+f.name" type="text" v-model="loginForm[f.name]"
+                  :placeholder="f.placeholder||''" autocomplete="off"
+                  @keyup.enter="submitPassword">
+              </template>
+            </div>
+            <div class="row" style="margin-top:10px;align-items:center;gap:10px">
+              <button class="btn primary" @click="submitPassword" :disabled="busy">直接登录</button>
+              <span class="hint" style="margin:0">密码只在服务端用于换取 token，不会回显到页面；勾选「记住密码」后 token 过期可自动重登续期。</span>
+            </div>
+          </div>
+
           <div class="qr-wrap" v-if="!pasteLogin">
             <div class="qr-frame" :data-tip="qrTip">
               <!-- 真二维码：内容是这次授权的地址，手机扫完在手机上完成登录，
@@ -295,9 +332,20 @@
             <span>{{ auth.status==='waiting' ? qrScanHint + ' · 剩余 ' + authCountdown : authLabel }}</span>
           </div>
 
+          <!-- 失败时把**具体原因**摆出来（红线一）：
+               只显示「授权失败」四个字等于没说 —— 用户需要知道是密码错了、
+               被风控挡了、还是 token 过期了，才能决定下一步怎么办。 -->
+          <div class="banner warn" v-if="auth.status==='error' && auth.message" style="margin-top:10px">
+            <span class="ico">⚠️</span>
+            <div><b>没能完成授权</b>
+              <p style="overflow-wrap:anywhere">{{ auth.message }}</p>
+              <p class="hint" v-if="auth.upstream">上游原话：{{ auth.upstream }}</p></div>
+          </div>
+
           <div class="banner warn" v-if="pasteLogin">
             <span class="ico">🔒</span>
-            <div><b>登录要在你自己的浏览器里完成，面板只收一个凭证，不收密码</b>
+            <div><b v-if="hasDirectLogin">方式二的凭证从你自己的浏览器里取；本页不显示、不保存你粘进来的内容</b>
+              <b v-else>登录要在你自己的浏览器里完成，面板只收一个凭证，不收密码</b>
               <p>按下面输入框上方的说明拿到凭证后，整段粘进去即可 ——
                  各渠道要粘的东西不一样（token / Cookie / 请求头里的一行），
                  面板会把这个渠道的步骤写清楚。</p>
@@ -337,8 +385,8 @@
             </tbody>
           </table>
 
-          <details class="cb-paste" :open="pasteLogin">
-            <summary>{{ pasteLogin ? '粘贴凭证（在此输入）' : '浏览器跳回来打不开？把地址栏里的整串地址粘到这里' }}</summary>
+          <details class="cb-paste" :open="pasteLogin&&!hasDirectLogin">
+            <summary>{{ hasDirectLogin ? '方式二：也可以粘贴 userToken' : (pasteLogin ? '粘贴凭证（在此输入）' : '浏览器跳回来打不开？把地址栏里的整串地址粘到这里') }}</summary>
             <div class="copy-row" style="margin-top:8px">
               <input v-model="cbRaw" :placeholder="cbPlaceholder"
                 @keyup.enter="submitCallback">
@@ -1342,6 +1390,10 @@ createApp({
     const diag=reactive({channel:'',result:null});
     const auth=ref({channel:'',channelName:'',url:'',expires:'',status:'idle',message:'',kind:'',upstream:'',
       account:null,modelCount:0,balance:null,balanceError:'',callbackBase:'',pasteHint:''});
+    // loginFields 是「账号密码直登」渠道（服务端 PasswordAcceptor）声明的表单字段。
+    // loginForm 只活在内存里（用户切走视图即清空），绝不写 localStorage —— 密码不出前端持久层。
+    const loginFields=ref([]);
+    const loginForm=reactive({});
     let authTimer=null, authLeft=0;
 
     // ---------- 面板入口开关 ----------
@@ -1359,7 +1411,10 @@ createApp({
     // **代码与功能一行不删**：适配器、凭证、暂停状态全都没动，把 kind 加回下面的数组即可恢复。
     // 边界要说清楚：这里只管**面板显示**；网关仍会下发被隐藏渠道的模型。要让 Studio 里也选不到，
     // 去「设置 → 渠道开关」把它们暂停（那是运行状态，随时能恢复，与这里的显示无关）。
-    const VISIBLE_CHANNELS=['qodercn','qodercom','traework','workbuddy','workbuddyai','qwenwork'];
+    //
+    // 2026-09-26 追加：把 deepseek 加回来 —— 用户明确要「接入 DeepSeek 网页版并做完美」，
+    // 而它在面板上根本看不见（渠道选择器里没有）就没法添加账号。已加账号密码直登，故放行。
+    const VISIBLE_CHANNELS=['qodercn','qodercom','traework','workbuddy','workbuddyai','qwenwork','deepseek'];
     const chVisible=kind=>VISIBLE_CHANNELS.includes(kind);
     const visChannels=computed(()=>(overview.value.channels||[]).filter(c=>chVisible(c.kind)));
 
@@ -1606,7 +1661,7 @@ createApp({
         qodercn:'设备码（扫码或浏览器授权）',qodercom:'设备码（扫码或浏览器授权）',
         workbuddy:'state 轮询（扫码或浏览器授权）',workbuddyai:'state 轮询（扫码或浏览器授权）',
         traework:'授权码回调',qwenwork:'授权码 + 本机回调（PKCE）',
-        gemini:'OAuth 授权码（扫码或浏览器授权）',deepseek:'浏览器登录后粘贴 userToken',
+        gemini:'OAuth 授权码（扫码或浏览器授权）',deepseek:'账号密码直登（或粘贴 userToken）',
         kimi:'浏览器登录后粘贴 refresh token',
         chatglm:'浏览器登录后粘贴 chatglm_refresh_token',
         doubao:'浏览器登录后粘贴整行 Cookie',
@@ -1638,6 +1693,9 @@ createApp({
     const callbackLockedLocal=computed(()=>auth.value.channel==='qwenwork');
     const callbackViaPanel=computed(()=>auth.value.channel==='traework'&&!!auth.value.callbackBase);
     const pasteLogin=computed(()=>!!auth.value.pasteHint);
+    // 有直登表单时，粘贴区收起为「方式二」备选（折叠起来，默认不开），
+    // 避免一屏两个互相竞争的输入入口让用户犯迷糊。
+    const hasDirectLogin=computed(()=>(loginFields.value||[]).length>0);
     // 粘贴形态的引导语**来自服务端**（就是各渠道 Hint() 的返回值）：Kimi 要 refresh token、
     // 豆包要整行 Cookie、通义灵码要 IDE 的缓存文件……文案必须跟着渠道走 ——
     // 把它硬编码成某一家的说法，别的渠道的用户会去找一个根本不存在的东西（上一版就是这个毛病）。
@@ -1673,6 +1731,30 @@ createApp({
     const cbPlaceholder=computed(()=>pasteLogin.value
       ? '把凭证整段粘到这里（渠道不同，要粘的东西也不同，见上面的说明）'
       : 'http://127.0.0.1:54321/callback?code=…（只贴 code 也行）');
+
+    // submitPassword 提交「账号密码直登」表单：把字段值交给服务端换 token。
+    // 提交成功后立刻触发一次 poll —— 服务端 Poll 会现换 token 并落盘入池，
+    // 与粘贴/扫码路径共用同一条链路，所以这里复用轮询收尾逻辑。
+    const submitPassword=async()=>{
+      if(busy.value)return;
+      const missing=(loginFields.value||[]).filter(f=>f.required&&!(loginForm[f.name]||'').trim());
+      if(missing.length)return toast('请先填写：'+missing.map(f=>f.label).join('、'));
+      busy.value=true;
+      try{
+        // 把值统一成字符串再发：服务端收 map[string]any，但布尔/数字也认；
+        // 这里显式转一次，让 wire 上的形态稳定（便于排查，也少依赖服务端的宽容度）。
+        const values={};
+        for(const k of Object.keys(loginForm))values[k]=String(loginForm[k]??'');
+        await post('/api/login/password',{values});
+        toast('已提交，正在用账号密码登录 DeepSeek…');
+        pollAuth();
+      }catch(e){
+        toast(e&&e.message?e.message:'直登提交失败');
+      }finally{
+        busy.value=false;
+      }
+    };
+
     const submitCallback=async()=>{
       if(busy.value)return;
       if(!cbRaw.value.trim())return toast(pasteLogin.value?'先把 userToken 粘进来':'先粘贴回调地址或授权码');
@@ -2086,6 +2168,11 @@ createApp({
         }
         auth.value.url=r.auth_url||'';auth.value.expires=r.expires_at||'';auth.value.callbackBase=r.callback_base||'';
         auth.value.pasteHint=r.paste_hint||'';auth.value.status='waiting';
+        // 直登表单字段（服务端 PasswordAcceptor 声明）：有则渲染账号密码表单。
+        // 同时把残留的表单值清掉 —— 换渠道后不该带着上一个渠道填过的内容。
+        loginFields.value=Array.isArray(r.login_fields)?r.login_fields:[];
+        for(const k of Object.keys(loginForm))delete loginForm[k];
+        if(loginFields.value.some(f=>f.name==='remember'))loginForm.remember=true;
         authLeft=r.expires_at?Math.max(0,Math.round((new Date(r.expires_at)-Date.now())/1000)):300;
         // 能出二维码就不抢着开浏览器：用户本该拿手机扫这个码（桌面不用跳转）。
         // 只有「这个渠道出不了码」或「码没生成出来（库没加载/地址过长）」时才自动打开授权页。
@@ -2260,6 +2347,8 @@ createApp({
       catalogChannels,filteredModels,modelGroups,errorKinds,filteredLogs,historyDesc,failedResults,
       authLabel,authCountdown,authMethod,policyRows,pwStrength,
       callbackLockedLocal,callbackViaPanel,pasteLogin,pasteHintText,qrUsable,authQr,qrTip,qrScanHint,cbRaw,cbPlaceholder,submitCallback,
+      // 账号密码直登（DeepSeek 这类）：表单字段由服务端声明，面板只负责渲染与提交。
+      hasDirectLogin,loginFields,loginForm,submitPassword,
       channelName,channelClass,icoOf,pickChannels,statusPill,statusIcon,statusText,sevLabel,
       accountPill,accountIcon,accountText,checkinPill,checkinText,logPill,logIcon,logText,accountSections,catOf,
       srcLabel,humanCtx,capsText,shortUid,fmtNum,fmtTime,fmtDate,barPct,barColor,

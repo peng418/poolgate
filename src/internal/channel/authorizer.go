@@ -62,3 +62,44 @@ type LoginOptions struct {
 type CallbackAcceptor interface {
 	AcceptCallback(raw string) error
 }
+
+// PasswordAcceptor 由「账号密码直登」类渠道实现：面板给一个账号/密码表单，
+// 用户填一次，服务端直接拿它去换 token —— 不需要开浏览器、不需要复制粘贴。
+//
+// 为什么要有这一层（与 CallbackAcceptor 的区别）：
+//   - CallbackAcceptor 解决的是「回调地址回不来」，本质仍是**用户先在自己浏览器登录**
+//     （DeepSeek 粘 userToken 就是这类：用户得先登录、再进控制台复制 localStorage）。
+//   - PasswordAcceptor 解决的是「连登录这一步都想省掉」——网页版 token 是短期会话令牌，
+//     几小时就过期且无刷新接口，每次都要重新登录复制，体验上不可接受。
+//
+// 安全边界（实现方必须遵守）：
+//   - 账号密码**只用于换取 token**，换到后由实现方决定是否留存（留存才能自动刷新续期）；
+//   - 面板与日志**永不回显**密码；面板上的密码框一律 type=password 且不落前端状态；
+//   - 未实现本接口的渠道，面板不出现账号密码表单（红线三：核心层零渠道专有代码）。
+//
+// 实现方若同时实现 LoginSession（见 password_session），控制台会在 Poll 时
+// 拿到已换好的凭证；这使「表单直登」与现有授权轮询走同一条落盘/入池链路。
+type PasswordAcceptor interface {
+	// LoginFields 描述本渠道需要用户填哪些字段（面板据此渲染表单）。
+	// 例如 DeepSeek 返回 [账号, 密码]；未来某渠道可能是 [手机号, 验证码]。
+	// 返回空切片表示本渠道当前不提供直登表单。
+	LoginFields() []LoginField
+
+	// AcceptPassword 收用户填的字段值。字段名与 LoginFields 的 Name 一一对应。
+	// 返回错误时面板显示原因（红线一：失败必带原因，不静默）。
+	AcceptPassword(values map[string]string) error
+}
+
+// LoginField 描述直登表单里的一个输入项。
+type LoginField struct {
+	// Name 是字段键（AcceptPassword 收到的 map 里的 key），如 "account" / "password"。
+	Name string `json:"name"`
+	// Label 是面板上显示的中文标签，如 "邮箱或手机号"。
+	Label string `json:"label"`
+	// Type 是输入框类型：text / password。
+	Type string `json:"type"`
+	// Placeholder 是输入框占位提示，可为空。
+	Placeholder string `json:"placeholder,omitempty"`
+	// Required 表示必填。
+	Required bool `json:"required"`
+}

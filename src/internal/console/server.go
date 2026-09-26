@@ -190,6 +190,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/api/login/cancel", s.withAuth(s.handleLoginCancel))
 	// 手工回填回调地址（本机回调被网络挡住时的兜底，如千问办公）
 	mux.HandleFunc("/api/login/callback", s.withAuth(s.handleLoginCallback))
+	// 账号密码直登表单（实现 channel.PasswordAcceptor 的渠道，如 DeepSeek）
+	mux.HandleFunc("/api/login/password", s.withAuth(s.handleLoginPassword))
 	// 账号操作（F1.7/F1.8/F1.9）
 	mux.HandleFunc("/api/account/enable", s.withAuth(s.handleAccountEnable))
 	mux.HandleFunc("/api/account/remove", s.withAuth(s.handleAccountRemove))

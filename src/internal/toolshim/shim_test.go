@@ -208,3 +208,46 @@ func TestWrapEndToEnd(t *testing.T) {
 		t.Fatalf("调用数不对：%d", n)
 	}
 }
+
+// TestToolPromptListsNamesUpFrontAndDedupes 校验工具说明的两条新性质：
+// ① 工具名清单出现在开头（长请求下模型能先扫到有哪些工具）；
+// ② 同名工具去重（与 OpenAI 语义一致，后出现的覆盖先出现的）。
+func TestToolPromptListsNamesUpFrontAndDedupes(t *testing.T) {
+	tools := []map[string]any{
+		{"function": map[string]any{"name": "Read", "description": "读文件",
+			"parameters": map[string]any{"type": "object"}}},
+		{"function": map[string]any{"name": "Bash", "description": "执行命令",
+			"parameters": map[string]any{"type": "object"}}},
+		{"function": map[string]any{"name": "Read", "description": "读文件（新版）",
+			"parameters": map[string]any{"type": "object"}}},
+	}
+	got := ToolPrompt(tools)
+	if !strings.Contains(got, "共 2 个") {
+		t.Fatalf("应去重为 2 个工具，得到：\n%s", got)
+	}
+	if !strings.Contains(got, "Read / Bash") {
+		t.Fatalf("开头应有工具名清单，得到：\n%s", got)
+	}
+	// 说明取后出现的那个（覆盖语义）。
+	if !strings.Contains(got, "读文件（新版）") {
+		t.Fatalf("同名工具应取后者，得到：\n%s", got)
+	}
+	// 名称清单必须出现在正文前 300 字符内（证明它真的在开头）。
+	idx := strings.Index(got, "Read / Bash")
+	if idx < 0 || idx > 300 {
+		t.Fatalf("工具名清单应在开头 300 字符内，实际位置 %d", idx)
+	}
+}
+
+// TestToolPromptHasPositiveAndNegativeExample 校验正例/反例都在，
+// 这是实测里压住「模型用自然语言描述」的关键措辞。
+func TestToolPromptHasPositiveAndNegativeExample(t *testing.T) {
+	got := ToolPrompt([]map[string]any{
+		{"function": map[string]any{"name": "Read", "description": "读文件"}},
+	})
+	for _, want := range []string{"正例：", "反例（禁止）", OpenTag, CloseTag} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("工具说明缺 %q：\n%s", want, got)
+		}
+	}
+}
