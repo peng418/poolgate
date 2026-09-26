@@ -102,6 +102,11 @@ type AccountSource interface {
 	NoteErrorAt(kind channel.Kind, uid string, k errs.Kind, retryAt time.Time)
 	// NoteSuccess 清零该账号的错误计数。
 	NoteSuccess(kind channel.Kind, uid string)
+	// States 返回该渠道各账号的运行态。
+	//
+	// 「无可用账号」这句结论必须带上原因：用户要能一眼分辨
+	// 「等一会儿自己会好（冷却）」还是「要动手（禁用了，得重新登录）」。
+	States(kind channel.Kind) []channel.AccountState
 }
 
 // NewRunner 建立探测器。timeout<=0 时用 30 秒（原型 06-settings.html 的默认）。
@@ -295,6 +300,42 @@ func (r *Runner) Full(ctx context.Context, entries []Entry) Run {
 	return run
 }
 
+// noCandidateReason 把「该渠道无可用账号」写成一句能处置的话。
+//
+// 只报「无可用账号」等于把问题原样丢回给用户：既看不出是**等一会儿**（冷却到点自恢复）
+// 还是**要动手**（已禁用，需重新登录），也看不出是哪个号的锅。
+// 所以这里把池里每个号的状态逐个列出来（uid 只留前 8 位，够对上面板账号行）。
+func noCandidateReason(states []channel.AccountState) string {
+	if len(states) == 0 {
+		return "该渠道无可用账号，无法探测（池里没有该渠道的账号）"
+	}
+	now := time.Now()
+	parts := make([]string, 0, len(states))
+	for _, st := range states {
+		switch {
+		case st.Disabled:
+			if st.Reason != "" {
+				parts = append(parts, shortUID(st.UID)+" 已禁用（"+st.Reason+"），需重新授权或手动启用")
+			} else {
+				parts = append(parts, shortUID(st.UID)+" 已禁用，需重新授权或手动启用")
+			}
+		case !st.Until.IsZero() && now.Before(st.Until):
+			parts = append(parts, shortUID(st.UID)+" 冷却至 "+st.Until.Local().Format("01-02 15:04")+"（到点自恢复）")
+		default:
+			parts = append(parts, shortUID(st.UID)+" 状态未知")
+		}
+	}
+	return "该渠道无可用账号，无法探测（" + strings.Join(parts, "；") + "）"
+}
+
+// shortUID 把 uid 截到前 8 位：面板账号行就是这么显示的，够对上号又不啰嗦。
+func shortUID(uid string) string {
+	if len(uid) > 8 {
+		return uid[:8]
+	}
+	return uid
+}
+
 // plan 把渠道素材展开成探测目标；无可用账号的渠道单独记一条失败，
 // 不让它从面板上悄悄消失（「不撒谎」的另一个侧面）。
 func (r *Runner) plan(ctx context.Context, entries []Entry, modelsOf func(Entry) []string) ([]Target, []Result) {
@@ -307,7 +348,7 @@ func (r *Runner) plan(ctx context.Context, entries []Entry, modelsOf func(Entry)
 		if !ok {
 			missing = append(missing, Result{
 				Channel: string(e.Kind), Model: "-", OK: false,
-				Kind: string(errs.NoCandidate), Reason: "该渠道无可用账号，无法探测",
+				Kind: string(errs.NoCandidate), Reason: noCandidateReason(r.pool.States(e.Kind)),
 				CheckedAt: time.Now().UTC(),
 			})
 			continue

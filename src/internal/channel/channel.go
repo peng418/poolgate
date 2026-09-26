@@ -85,6 +85,19 @@ type Credential struct {
 	Extra        map[string]string
 }
 
+// AccountState 是账号运行态的最小事实集：谁、能不能用、为什么、什么时候可能恢复。
+//
+// 为什么要它：面板上「该渠道无可用账号，无法探测」这种结论必须能自己解释原因 ——
+// 「在冷却，到 XX 点自己恢复」和「已禁用，要重新授权」是两种完全不同的处置，
+// 只给一句「无可用账号」，用户连该等还是该动手都判断不了
+// （实测 2026-09-26：面板就只有那一句，用户无从下手）。
+type AccountState struct {
+	UID      string
+	Disabled bool
+	Reason   string    // 触发 Disabled 或冷却的原因（errs.Kind 字符串）
+	Until    time.Time // 冷却截止；零值 = 未冷却
+}
+
 // Balance 是账号余额快照。未知字段保持零值，由 UI 显示「未知」而不是猜数字（F4.2）。
 type Balance struct {
 	Credits   int64

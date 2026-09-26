@@ -24,6 +24,8 @@ type fakePool struct {
 	creds []channel.Credential
 	// refresh 里有的 uid 才能续期成功（返回这里给的凭证）；没有的当作续期失败。
 	refresh map[string]channel.Credential
+	// states 是 States 的返回值：用来测「无可用账号时把原因写清楚」。
+	states []channel.AccountState
 
 	mu           sync.Mutex
 	pickCalls    int
@@ -79,6 +81,11 @@ func (f *fakePool) NoteSuccess(_ channel.Kind, uid string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.oks = append(f.oks, uid)
+}
+
+// States 返回预置的运行态：用来测「无可用账号时必须说出为什么」。
+func (f *fakePool) States(_ channel.Kind) []channel.AccountState {
+	return f.states
 }
 
 func (f *fakePool) snapshot() (int, []string, []poolNote, []string) {
@@ -375,3 +382,44 @@ func (s *emptyStream) Next() (channel.ChatCompletionChunk, error) {
 	return channel.ChatCompletionChunk{}, io.EOF
 }
 func (s *emptyStream) Close() error { return nil }
+
+// 「该渠道无可用账号，无法探测」必须自己解释原因。
+//
+// 起因：2026-09-26 真机 —— 千问办公两个号在 23:12 前后都离开了可用集，
+// 面板体检只给了一句「该渠道无可用账号，无法探测」，用户既不知道是「等 10 分钟自己恢复」
+// 还是「要重新授权」，也不知道是哪个号的锅。结论必须自带处置所需的事实。
+func TestPlanExplainsWhyNoCandidate(t *testing.T) {
+	utc := time.Now()
+	fp := &fakePool{states: []channel.AccountState{
+		{UID: "9567c2c8-3ad2-4443-bee7-95abcef69691", Until: utc.Add(3 * time.Minute), Reason: "Transport"},
+		{UID: "700f4798-f040-4dbe-af01-7181069a0f6e", Disabled: true, Reason: "SessionDead"},
+	}}
+	r := NewRunner(fp, time.Second)
+	_, missing := r.plan(context.Background(),
+		[]Entry{{Kind: "qwenwork", Models: []string{"flash"}}},
+		func(e Entry) []string { return e.Models })
+	if len(missing) != 1 {
+		t.Fatalf("无可用账号应记 1 条失败，实际 %d", len(missing))
+	}
+	got := missing[0].Reason
+	if !strings.Contains(got, "9567c2c8") || !strings.Contains(got, "冷却至") || !strings.Contains(got, "到点自恢复") {
+		t.Fatalf("原因里要写明「哪个号在冷却、到什么时候」，实际 %q", got)
+	}
+	if !strings.Contains(got, "700f4798") || !strings.Contains(got, "已禁用（SessionDead）") {
+		t.Fatalf("原因里要写明「哪个号被禁用、原因是什么」，实际 %q", got)
+	}
+	if !strings.HasPrefix(got, "该渠道无可用账号，无法探测") {
+		t.Fatalf("应保留原有前缀（面板/日志按它归类），实际 %q", got)
+	}
+}
+
+// 池里一个号都没有时也要说清楚，而不是留一句「无法探测」让人猜。
+func TestPlanNoCandidateWithoutAccounts(t *testing.T) {
+	r := NewRunner(&fakePool{}, time.Second)
+	_, missing := r.plan(context.Background(),
+		[]Entry{{Kind: "qwenwork", Models: []string{"flash"}}},
+		func(e Entry) []string { return e.Models })
+	if len(missing) != 1 || !strings.Contains(missing[0].Reason, "池里没有该渠道的账号") {
+		t.Fatalf("应说明「池里没有该渠道的账号」，实际 %+v", missing)
+	}
+}

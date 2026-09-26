@@ -82,7 +82,7 @@ M="$PKG/manifest"
   printf 'service_port          = %s\n'   "$PORT"
   printf 'desktop_uidir         = ui\n'
   printf 'desktop_applaunchname = %s.main\n' "$APPNAME"
-  printf 'changelog = 千问办公不再因为带 tools 被顶死（真机 2026-09-26）：千问办公（qwenwork）的网页协议是 chat-ws 的纯文本 new_prompt，确实没有放工具定义的位置；但客户端（本项目自己的 coding agent）习惯性挂 tools 时，整轮请求会被网关明确拒绝（HTTP 400），于是表现为「千问办公用不了」。新增 channel.Spec.ToolsIgnore 能力档：声明它的渠道（现为千问办公）收到带 tools 的请求时不报错，网关把这批 tools 丢掉、按纯文本转发，并落一条日志（面板日志可见，不静默）；工具位仍如实标 CapNo —— 客户端拿不到 tool_calls，这一点不撒谎。默认档不变：既不原生、也不代做模拟、更没声明忽略的渠道，带 tools 仍然明确拒绝（红线一）。OpenAI 与 Anthropic 两个入口走同一条合同。新增 4 条回归测试：忽略档放行且不把工具说明塞进提示词、默认档仍 400 且不打上游、Anthropic 入口同样放行、只有千问办公声明忽略（其它渠道不许悄悄变成忽略）。 | FPK %s\n' "$VERSION"
+  printf 'changelog = 面板体检不再只说「该渠道无可用账号，无法探测」（真机 2026-09-26 教训）：这句话本身没错，但用户看不出是「等一会儿自己恢复」还是「要重新授权」，也看不出是哪个号的锅 —— 那晚千问办公两个号在 23:12 前后同时离开可用集，面板只给了这一句，排查只能靠翻日志和时间戳。现在结论自带处置所需的事实：逐个列出该渠道每个账号的运行态（uid 前 8 位 + 冷却至 MM-DD HH:MM（到点自恢复），或 已禁用（原因），需重新授权或手动启用）；池里没有该渠道账号时也会明说。池侧新增 pool.States / channel.AccountState（只读运行态，不含任何凭证材料）。新增 2 条回归测试。 | FPK %s\n' "$VERSION"
 } >> "$M"
 chmod 0644 "$M"
 sed -n '1,20p' "$M" | sed 's/^/  /'

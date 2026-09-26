@@ -264,6 +264,24 @@ func (p *Pool) List(kind channel.Kind) []State {
 	return out
 }
 
+// States 返回某渠道各账号的运行态（按 UID 排序）。
+//
+// 给体检/面板用：「这个渠道为什么没有可用账号」必须答得出来 ——
+// 冷却到什么时候、被禁用的原因是什么，都是用户处置时要看的事实。
+func (p *Pool) States(kind channel.Kind) []channel.AccountState {
+	listed := p.List(kind)
+	out := make([]channel.AccountState, 0, len(listed))
+	for _, st := range listed {
+		out = append(out, channel.AccountState{
+			UID:      st.Cred.UID,
+			Disabled: st.Disabled,
+			Reason:   st.Reason,
+			Until:    st.Until,
+		})
+	}
+	return out
+}
+
 // Remove 移除一个账号（F1.9 的删除侧）。返回是否确实删掉了。
 // 删除只影响内存池；磁盘凭证由 store.CredsStore 负责，两层分开是为了
 // 「删掉凭证但保留运行态观察」这类操作不至于互相牵连。
