@@ -143,11 +143,22 @@ type Spec struct {
 	//
 	// 与 Tools 互斥使用：Tools=true 走原生透传；两个都 false 时网关明确拒绝带 tools
 	// 的请求（F3.7）—— 静默丢弃会让模型把工具调用写成文本，客户端只看到乱码。
-	ToolsShim  bool
-	Images     bool
-	Reasoning  bool
-	SSEOnly    bool // 上游只有流式 → 非流式由本地聚合成
-	CheckinCap bool // 是否支持签到
+	ToolsShim bool
+	// ToolsIgnore 表示上游协议里**没有放工具定义的位置**，但该渠道的定位就是「纯文本入口」：
+	// 客户端（coding agent）习惯性带上 tools 时**不报错**，网关把这批 tools 丢掉、
+	// 按纯文本转发，客户端拿到的是模型的自然语言回答（不会有 tool_calls）。
+	//
+	// 用它的前提是「本渠道的工具不需要我们代做」—— 千问办公就是这一类：工具由上游
+	// 自己那套内置能力承担，客户端塞进来的工具定义它本来也不认。
+	// 打开它必须同时落一条日志（不静默，见 gateway 的 tools 分支），否则客户端会
+	// 以为自己的工具真的挂上了。
+	//
+	// 与 Tools / ToolsShim 互斥；三者都 false 时网关**明确拒绝**（默认档，F3.7）。
+	ToolsIgnore bool
+	Images      bool
+	Reasoning   bool
+	SSEOnly     bool // 上游只有流式 → 非流式由本地聚合成
+	CheckinCap  bool // 是否支持签到
 	// Category 是渠道的「大类」，面板按它分组展示：互相隔离、不混在一起。
 	//
 	//   CategoryCoding —— 编程助手 / IDE 类（订阅额度池，扫码或设备码授权后按额度用）

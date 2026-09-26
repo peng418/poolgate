@@ -112,13 +112,21 @@ func TestSpecsAreHonest(t *testing.T) {
 		// （请求 #10、响应 #6 ChatToolCall），不再是 toolshim 模拟。
 		{channel.Windsurf, true, false, true, true, channel.CategoryCoding},
 		// 千问办公是编程/办公助手（不是网页聊天），归编程类；但协议是 chat-ws 纯文本，
-		// 放不下工具定义 → Tools=false、也不做 toolshim，交给网关明确拒绝。
+		// 放不下工具定义 → Tools=false、也不做 toolshim。它是纯文本入口：客户端带
+		// tools 时按 ToolsIgnore 丢掉转发（不顶死整轮请求），并落日志（不静默）。
 		{channel.QwenWork, false, false, true, true, channel.CategoryCoding},
+	}
+	// 只有千问办公声明「忽略 tools」：默认档仍是明确拒绝，别的渠道不许悄悄变成忽略。
+	if sp, ok := registry.GetSpec(channel.QwenWork); !ok || !sp.ToolsIgnore {
+		t.Error("千问办公应声明 ToolsIgnore=true（纯文本入口：带 tools 丢掉转发，不是 400）")
 	}
 	for _, c := range cases {
 		got, ok := registry.GetSpec(c.kind)
 		if !ok {
 			t.Fatalf("渠道 %q 没有能力声明", c.kind)
+		}
+		if c.kind != channel.QwenWork && got.ToolsIgnore {
+			t.Errorf("%q 不该声明 ToolsIgnore（默认档是明确拒绝，只有纯文本入口才允许忽略）", c.kind)
 		}
 		if got.Tools != c.tools || got.ToolsShim != c.toolsShim {
 			t.Errorf("%q 工具能力位不对：Tools=%v ToolsShim=%v（期望 %v/%v）",

@@ -829,6 +829,104 @@ func TestToolsShimChannel(t *testing.T) {
 	}
 }
 
+// 声明「忽略 tools」的渠道（千问办公这条路的合同）：客户端带 tools 也不报错，
+// 网关把 tools 丢掉、按纯文本转发并落一条日志（不静默）；响应侧不做任何工具解析。
+func TestToolsIgnoreChannel(t *testing.T) {
+	var got channel.ChatRequest
+	ch := &fakeChannel{
+		kind: channel.QwenWork,
+		spec: channel.Spec{Kind: channel.QwenWork, Status: channel.Active, ToolsIgnore: true},
+		chat: func(ctx context.Context, c *channel.Credential, req channel.ChatRequest) (channel.Stream, error) {
+			got = req
+			return &sliceStream{chunks: []channel.ChatCompletionChunk{chunk("你好")}}, nil
+		},
+	}
+	srv, _ := newTestGateway(t, ch, true)
+	w := postJSON(t, srv, "/v1/chat/completions", map[string]any{
+		"model":       "qwenwork/pro",
+		"messages":    []map[string]any{{"role": "user", "content": "你好"}},
+		"tool_choice": "auto",
+		"tools": []map[string]any{{
+			"type": "function",
+			"function": map[string]any{"name": "get_weather", "description": "查天气",
+				"parameters": map[string]any{"type": "object", "properties": map[string]any{}}},
+		}},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("声明忽略 tools 的渠道不该 400，实际 %d body=%s", w.Code, w.Body.String())
+	}
+	if len(got.Tools) != 0 || got.ToolChoice != nil {
+		t.Fatalf("tools / tool_choice 都该被丢掉：%+v / %v", got.Tools, got.ToolChoice)
+	}
+	// 忽略档**不代做**：工具说明不许进提示词（那是 shim 档的事）
+	for _, m := range got.Messages {
+		if strings.Contains(m.Content, "get_weather") {
+			t.Fatalf("忽略档不该代做工具（不该出现工具说明）：%+v", m)
+		}
+	}
+	if !strings.Contains(w.Body.String(), "你好") {
+		t.Fatalf("正常回答要逐字透传：%s", w.Body.String())
+	}
+}
+
+// 默认档：没声明任何工具能力的渠道，带 tools 必须**明确拒绝**（不是静默丢掉、也不是忽略）。
+// 这条锁红线一：新渠道忘了声明能力时默认是拒绝，而不是「看起来能用」。
+func TestToolsRejectedByDefault(t *testing.T) {
+	reached := false
+	ch := &fakeChannel{
+		kind: channel.QwenWork,
+		spec: channel.Spec{Kind: channel.QwenWork, Status: channel.Active},
+		chat: func(context.Context, *channel.Credential, channel.ChatRequest) (channel.Stream, error) {
+			reached = true
+			return &sliceStream{chunks: []channel.ChatCompletionChunk{chunk("不该走到上游")}}, nil
+		},
+	}
+	srv, _ := newTestGateway(t, ch, true)
+	w := postJSON(t, srv, "/v1/chat/completions", map[string]any{
+		"model":    "qwenwork/pro",
+		"messages": []map[string]any{{"role": "user", "content": "你好"}},
+		"tools":    []map[string]any{{"type": "function", "function": map[string]any{"name": "get_weather"}}},
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("默认档应 400 明确拒绝，实际 %d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "暂不支持工具调用") {
+		t.Fatalf("拒绝原因要可读：%s", w.Body.String())
+	}
+	if reached {
+		t.Fatal("拒绝必须发生在打上游之前")
+	}
+}
+
+// Anthropic 入口（Claude Code 那类客户端）同样认「忽略 tools」档。
+func TestAnthropicToolsIgnoreChannel(t *testing.T) {
+	var got channel.ChatRequest
+	ch := &fakeChannel{
+		kind: channel.QwenWork,
+		spec: channel.Spec{Kind: channel.QwenWork, Status: channel.Active, ToolsIgnore: true},
+		chat: func(ctx context.Context, c *channel.Credential, req channel.ChatRequest) (channel.Stream, error) {
+			got = req
+			return &sliceStream{chunks: []channel.ChatCompletionChunk{chunk("你好")}}, nil
+		},
+	}
+	srv, _ := newTestGateway(t, ch, true)
+	w := postJSON(t, srv, "/v1/messages", map[string]any{
+		"model":      "qwenwork/pro",
+		"max_tokens": 64,
+		"messages":   []map[string]any{{"role": "user", "content": "北京天气"}},
+		"tools": []map[string]any{{
+			"name": "get_weather", "description": "查天气",
+			"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
+		}},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("Anthropic 入口也该放行，实际 %d body=%s", w.Code, w.Body.String())
+	}
+	if len(got.Tools) != 0 {
+		t.Fatalf("tools 应被丢掉：%+v", got.Tools)
+	}
+}
+
 // stallStream 在 release 被关闭前一直阻塞（模拟上游长时间不出字）。
 type stallStream struct {
 	release chan struct{}

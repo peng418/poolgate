@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -282,20 +283,31 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			WithChannel(string(kind)))
 		return
 	}
-	// 工具调用能力分三档（F3.7）：
+	// 工具调用能力分四档（F3.7）：
 	//   ① 原生支持（spec.Tools）→ tools 原样透传给上游；
 	//   ② 只支持「网关代做模拟」（spec.ToolsShim）→ 把工具定义翻成提示词，
 	//      再把模型输出的标记解析回结构化 tool_calls（见 internal/toolshim）；
-	//   ③ 都不支持 → **明确拒绝**。
-	// 静默丢掉 tools 是最坏的一种处理：上游收不到工具定义，会把「我要调用工具」
-	// 写成普通文本（各家的标记还不一样），客户端拿不到 tool_calls，
-	// 表现成「模型不回复 / 回一堆看不懂的乱码」—— coding agent 直接不可用。
+	//   ③ 明确声明「忽略 tools」（spec.ToolsIgnore）→ 丢掉这批 tools、按纯文本转发，
+	//      并落一条日志（不静默）。只给「本来就是纯文本入口、工具由上游自己那套
+	//      内置能力承担」的渠道用（千问办公）。
+	//   ④ 都不支持 → **明确拒绝**（默认档）。
+	// 默认拒绝而不是默认忽略：静默丢掉 tools，上游会把「我要调用工具」写成普通文本
+	// （各家的标记还不一样），客户端拿不到 tool_calls，表现成「模型不回复 / 回一堆
+	// 看不懂的乱码」—— coding agent 直接不可用。要忽略的渠道必须自己声明（③），
+	// 而且忽略也要留痕。
 	useShim := false
 	if len(req.Tools) > 0 {
 		switch {
 		case spec.Tools:
 		case spec.ToolsShim:
 			useShim = true
+		case spec.ToolsIgnore:
+			// 丢掉 tools 按纯文本转发：本渠道没有工具位，但它是纯文本入口，
+			// 不该因为客户端挂了 tools 就把整轮顶死。日志留痕 = 不静默。
+			log.Printf("poolgate: 渠道 %s 本轮请求带 %d 个 tools，该渠道无工具位（已声明忽略），按纯文本转发",
+				string(kind), len(req.Tools))
+			req.Tools = nil
+			req.ToolChoice = nil
 		default:
 			writeErr(w, http.StatusBadRequest, errs.New(errs.ModelUnavailable,
 				"渠道 "+string(kind)+" 暂不支持工具调用（tools）：已明确拒绝而不是静默忽略，"+

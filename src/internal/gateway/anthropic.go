@@ -7,6 +7,7 @@ package gateway
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -36,7 +37,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	}
 
 	// 工具调用：Anthropic tools → OpenAI tools（input_schema → function.parameters）。
-	// 能力同样分三档：原生透传 / 网关代做模拟（toolshim）/ 明确拒绝。
+	// 能力同样分四档：原生透传 / 网关代做模拟（toolshim）/ 忽略（纯文本入口）/ 明确拒绝。
 	tools := anthropicToolsToOpenAI(body["tools"])
 	useShim := false
 	if len(tools) > 0 {
@@ -44,6 +45,11 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		case ch.Spec().Tools:
 		case ch.Spec().ToolsShim:
 			useShim = true
+		case ch.Spec().ToolsIgnore:
+			// 与 /v1/chat/completions 同一条合同：本渠道没有工具位，丢掉 tools 转发 + 日志留痕。
+			log.Printf("poolgate: 渠道 %s 本轮请求带 %d 个 tools，该渠道无工具位（已声明忽略），按纯文本转发",
+				string(kind), len(tools))
+			tools = nil
 		default:
 			writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error",
 				"渠道 "+string(kind)+" 暂不支持工具调用（tools）：已明确拒绝而不是静默忽略")

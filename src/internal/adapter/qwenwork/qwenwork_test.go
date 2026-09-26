@@ -333,7 +333,9 @@ func TestEmitUpdateSkipsEmptyText(t *testing.T) {
 }
 
 // 能力声明：千问办公支持图片/推理但没有签到，**不支持工具调用**
-// （chat-ws 的 new_prompt 只有纯文本，放不下工具定义 → 如实声明，交给网关明确拒绝）。
+// （chat-ws 的 new_prompt 只有纯文本，放不下工具定义 → 如实声明 Tools=false）。
+// 但它是纯文本入口：客户端（coding agent）习惯性带 tools 时不许把整轮请求顶死
+// → ToolsIgnore=true（网关丢掉 tools 按纯文本转发 + 落日志）。
 func TestSpec(t *testing.T) {
 	sp := New().Spec()
 	if sp.Kind != "qwenwork" {
@@ -341,6 +343,12 @@ func TestSpec(t *testing.T) {
 	}
 	if sp.Tools {
 		t.Fatal("本渠道不实现工具调用，Tools 应为 false")
+	}
+	if sp.ToolsShim {
+		t.Fatal("本渠道不做网关代做模拟，ToolsShim 应为 false")
+	}
+	if !sp.ToolsIgnore {
+		t.Fatal("本渠道是纯文本入口，应声明 ToolsIgnore（带 tools 丢转发，而不是 400 顶死）")
 	}
 	if !sp.Images || !sp.Reasoning {
 		t.Fatal("应声明图片/推理能力")

@@ -65,7 +65,9 @@ const (
 )
 
 // staticModels 是网页端 /api/chat-modes 拿不到时的兜底档位表（实测三档）。
-// Tools 一律 CapNo：不是「不知道」，是本渠道的协议位置确实放不下工具定义。
+// Tools 一律 CapNo：不是「不知道」，是本渠道的协议位置确实放不下工具定义 ——
+// 客户端拿不到 tool_calls，这一点不撒谎。客户端带上来的 tools 则由网关按
+// Spec.ToolsIgnore 丢掉转发（见 Spec 注释），不让整轮请求因为 tools 被顶死。
 var staticModels = []channel.ModelInfo{
 	{ID: "pro", DisplayName: "Pro", ContextWindow: 200000, Source: channel.SourceLocal,
 		Tools: channel.CapNo, Reasoning: channel.CapYes, Images: channel.CapNo},
@@ -150,9 +152,14 @@ func (a *Adapter) Kind() channel.Kind { return "qwenwork" }
 
 // Spec 返回能力声明。签到：实测无签到接口 → CheckinCap=false（UI 显示「无活动」）。
 //
-// Tools=false：网页端协议是 WebSocket 的 `new_prompt`（纯文本），没有放工具定义的
-// 位置，也拿不到结构化 tool_calls —— 与其静默丢掉客户端传来的 tools（会让上游把
-// 工具调用写成文本，coding agent 直接不可用），不如如实声明不支持，由网关明确拒绝。
+// Tools=false + ToolsIgnore=true：网页端协议是 WebSocket 的 `new_prompt`（纯文本），
+// 没有放工具定义的位置，也拿不到结构化 tool_calls，所以**工具位如实标不支持**。
+// 但本渠道是**纯文本入口**（产品定位是编程/办公助手，工具由上游自己那套内置能力承担），
+// 客户端（coding agent）习惯性带上 tools 时不该把整轮请求顶死 —— 声明 ToolsIgnore：
+// 网关丢掉这批 tools、按纯文本转发，并落一条日志（不静默）。
+//
+// 注意：这不是「静默丢弃」，是**该渠道自己声明的合同**；默认档（既不原生也不模拟、
+// 也没声明忽略）的渠道仍然被明确拒绝，见 gateway 的四档。
 func (a *Adapter) Spec() channel.Spec {
 	return channel.Spec{
 		Kind:        "qwenwork",
@@ -160,6 +167,7 @@ func (a *Adapter) Spec() channel.Spec {
 		Status:      channel.Active,
 		Category:    channel.CategoryCoding, // 编程助手类
 		Tools:       false,
+		ToolsIgnore: true, // 带 tools 不报错：丢掉按纯文本转发 + 落日志
 		Images:      true,
 		Reasoning:   true,
 		SSEOnly:     true, // 上游只有流式（WebSocket 推流），非流式由本地聚合
@@ -337,7 +345,7 @@ func (a *Adapter) Models(ctx context.Context, c *channel.Credential) ([]channel.
 			ContextWindow: m.MaxInputToken,
 			Source:        channel.SourceUpstream,
 			// 本渠道不实现工具调用（协议位置不存在），能力位如实标不支持；
-			// 网关收到带 tools 的请求会明确拒绝，不会静默丢掉。
+			// 网关收到带 tools 的请求会按 Spec.ToolsIgnore 丢掉并落日志，不静默。
 			Tools:     channel.CapNo,
 			Reasoning: capOf(m.IsReasoning),
 			Images:    capOf(m.IsVL),

@@ -82,7 +82,7 @@ M="$PKG/manifest"
   printf 'service_port          = %s\n'   "$PORT"
   printf 'desktop_uidir         = ui\n'
   printf 'desktop_applaunchname = %s.main\n' "$APPNAME"
-  printf 'changelog = 禁言不再被当成「凭证失效」（真机 2026-09-26 复现）：修 DeepSeek 网页版把上游的临时风控禁言误判成会话失效的问题。上游禁言时回的是 HTTP 200 + biz_code=5 / biz_msg=user is muted / biz_data.mute_until（官方客户端收到 MUTED=50006 只置 isMuted/muteUntil 标记，既不掉登录也不跳重登页），但池子里被归成 SessionDead 后账号被永久禁用、面板还让用户去「重新登录」—— 而重登根本解不开禁言。新增 Muted 错误档：① 算账号错误（池里有别的号就换号），但不算凭证问题（不白敲续期）、不永久禁用（临时状态，到点自恢复）；② 冷却时长以上游给的 mute_until 为准（另设 1 分钟下限，防止上游给过去的时间点导致空转），面板与客户端都能看到解禁时间；③ 上游没给时间时按 30 分钟兜底；④ 上游处置原话照旧透传给用户（红线一）；⑤ HTTP 503 —— 该渠道眼下没有可用号，等解禁而不是让你去重登。新增 Muted 分类/策略/冷却三处回归测试锁住这条行为。 | FPK %s\n' "$VERSION"
+  printf 'changelog = 千问办公不再因为带 tools 被顶死（真机 2026-09-26）：千问办公（qwenwork）的网页协议是 chat-ws 的纯文本 new_prompt，确实没有放工具定义的位置；但客户端（本项目自己的 coding agent）习惯性挂 tools 时，整轮请求会被网关明确拒绝（HTTP 400），于是表现为「千问办公用不了」。新增 channel.Spec.ToolsIgnore 能力档：声明它的渠道（现为千问办公）收到带 tools 的请求时不报错，网关把这批 tools 丢掉、按纯文本转发，并落一条日志（面板日志可见，不静默）；工具位仍如实标 CapNo —— 客户端拿不到 tool_calls，这一点不撒谎。默认档不变：既不原生、也不代做模拟、更没声明忽略的渠道，带 tools 仍然明确拒绝（红线一）。OpenAI 与 Anthropic 两个入口走同一条合同。新增 4 条回归测试：忽略档放行且不把工具说明塞进提示词、默认档仍 400 且不打上游、Anthropic 入口同样放行、只有千问办公声明忽略（其它渠道不许悄悄变成忽略）。 | FPK %s\n' "$VERSION"
 } >> "$M"
 chmod 0644 "$M"
 sed -n '1,20p' "$M" | sed 's/^/  /'
