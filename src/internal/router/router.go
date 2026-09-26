@@ -144,7 +144,7 @@ func (r *Router) Route(ctx context.Context, ch channel.Channel, kind channel.Kin
 		//
 		// 这是「token 到期」这类问题唯一体面的处理方式：账号本身是好的，
 		// 直接把号禁用掉等于让用户每小时重新授权一次（实测踩过：千问办公）。
-		if ok && credentialKind(k) {
+		if ok && errs.CredentialKind(k) {
 			if nc, rerr := r.p.RefreshNow(ctx, kind, cred); rerr == nil && nc != nil {
 				cred = *nc
 				if stream, err = r.chat(ctx, ch, kind, cred, req); err == nil {
@@ -159,7 +159,7 @@ func (r *Router) Route(ctx context.Context, ch channel.Channel, kind channel.Kin
 		// 失败：按 kind 冷却该号，换号重试。
 		if ok {
 			r.p.NoteError(kind, cred.UID, k)
-			if !k.AccountBlamed() && !credentialKind(k) {
+			if !k.AccountBlamed() && !errs.CredentialKind(k) {
 				// 上游故障/内容拦截/超长：非账号问题，直接返回错误，不换号白折腾。
 				return nil, err
 			}
@@ -172,14 +172,7 @@ func (r *Router) Route(ctx context.Context, ch channel.Channel, kind channel.Kin
 	return nil, errs.New(errs.NoCandidate, "渠道 "+string(kind)+" 所有可用账号均失败").WithChannel(string(kind))
 }
 
-// credentialKind 报告该错误是不是「这个账号的凭证不行了」。
-//
-// SessionDead 已经算账号错误；AuthFailed 故意不算（同一个 Kind 还用于控制台登录失败），
-// 但在**对话路径**上它同样意味着这个号的凭证不通 —— 该冷却它、并换下一个号试，
-// 而不是把错误直接甩给客户端。
-func credentialKind(k errs.Kind) bool {
-	return k == errs.SessionDead || k == errs.AuthFailed
-}
+// 说明：换号纪律里的「凭证类失败」判据统一用 errs.CredentialKind（单点定义）。
 
 func (r *Router) pick(ctx context.Context, kind channel.Kind, tried map[string]bool, preferred string) (channel.Credential, bool) {
 	if preferred != "" {

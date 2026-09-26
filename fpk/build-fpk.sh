@@ -82,7 +82,7 @@ M="$PKG/manifest"
   printf 'service_port          = %s\n'   "$PORT"
   printf 'desktop_uidir         = ui\n'
   printf 'desktop_applaunchname = %s.main\n' "$APPNAME"
-  printf 'changelog = 修 0.9.1 真机暴露的问题（DeepSeek 手机号+验证码登录）：① 填完验证码点「登录」报「上游原话：LOGIN_TO_EXISTING_ACCOUNT」—— 这不是上游拒绝，官方前端把这个码和 code 0 并列当**成功**（0=新号注册并登入、1=已有账号直接登入）；真正的原因是我们把 token 读错了位置：token 在 data.biz_data.user.token（用户对象内部，官方映射函数取 e.token 当 userToken 用），而旧代码只找了 data.biz_data.user_token—— 那是照密码路径猜的字段名。现在三处兼容读取，user.token 优先。换句话说：手机号已有 DeepSeek 账号的用户，之前根本登不进来。② 失败时把（脱敏后的）上游信封结构写进日志（token/手机号/验证码一律换成 [已隐藏]），以后再遇到「上游这么说」不用猜。③ 日志脱敏与解析各加了回归测试（含一条专门锁「已有账号」这条真实路径的测试）。 | FPK %s\n' "$VERSION"
+  printf 'changelog = 修 0.9.2 之后真机暴露的问题（抽样体检把一个好好的渠道整个判红）：① 根因是体检只随机抽一个账号代表整个渠道，而池子里可能躺着 token 早已失效的旧号 —— 真机上三个模型全被抽到死号，面板三条全红、上游原话都是 {"code":40003,Authorization Failed (invalid token)}，用户完全看不出是哪个号坏了。现在体检与真实流量走同一套换号纪律：凭证类失败先强制续期一次（存了账号密码的直登号能靠它救回来），救不回来才换下一个号，一次探测最多试 3 个号。② 体检结论回写池子：失效号按 SessionDead 禁用（「账号」页能看到是哪个号、什么原因），跑通的号记一次成功。③ 「失败明细」表新增「账号」列，柱状图浮层也带上账号 —— 一条坏号不该让整个渠道看起来都是红的。④ 体检结论（含「换号后才通过」）落日志；以前体检失败在日志里一个字都没有，出事时只能靠用户截图。 | FPK %s\n' "$VERSION"
 } >> "$M"
 chmod 0644 "$M"
 sed -n '1,20p' "$M" | sed 's/^/  /'

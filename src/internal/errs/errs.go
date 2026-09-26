@@ -41,6 +41,15 @@ func (k Kind) AccountBlamed() bool {
 	}
 }
 
+// CredentialKind 报告该错误是不是「这个账号的凭证不行了」。
+//
+// SessionDead 已经算账号错误；AuthFailed 故意不算（同一个 Kind 还用于控制台登录失败），
+// 但在**用凭证去打上游**的路径上（对话路由、健康探测），它同样意味着这个号的凭证不通 ——
+// 该续期、该换号，而不是把错误直接甩给客户端。
+//
+// 单点定义：router.Route 与 health.Runner 的换号纪律共用这一条判据，别各写一份。
+func CredentialKind(k Kind) bool { return k == SessionDead || k == AuthFailed }
+
 // Error 是贯穿全链路的结构化错误。upstream 字段保存上游原话摘要，
 // 供面板与客户端展示 —— 「失败必带原因」是硬性验收项（F1.2a / 可见性契约）。
 type Error struct {

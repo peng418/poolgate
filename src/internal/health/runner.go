@@ -39,6 +39,9 @@ type Result struct {
 	Upstream  string    `json:"upstream,omitempty"`
 	TTFTms    int64     `json:"ttft_ms,omitempty"`
 	CheckedAt time.Time `json:"checked_at"`
+	// Skipped 是这次探测里「因为账号自身的问题被跳过」的账号 uid（按跳过顺序）。
+	// 有它面板才能说清「这条红是哪个号的锅」—— 只给一句「失败」等于让用户猜。
+	Skipped []string `json:"skipped_accounts,omitempty"`
 }
 
 // Run 是一次探测批次的汇总（体检历史的一行）。
@@ -79,8 +82,23 @@ type Runner struct {
 //
 // 带 ctx 是有意的：选号会顺带做凭证续期（pool.Pick 的行为），
 // 那是一次真实的上游请求，必须能随请求一起取消。
+//
+// 探测结论必须回写池子（NoteError / NoteSuccess）：体检发的是**真实请求**，
+// 它的结论必须和真实流量共用同一份状态 —— 否则面板会对着一个死号说「渠道正常」，
+// 也会对着活号说「渠道挂了」。
+//
+// 2026-09-26 的真机事故就是这么来的：池里躺着两个 token 早已失效的旧账号，
+// 而 Pick 遍历的是 map、余额相同时顺序随机 —— 三个模型全被随机抽到死号，体检全红，
+// 用户看到的是「上游原话：Authorization Failed (invalid token)」却不知道是哪个号。
 type AccountSource interface {
 	Pick(ctx context.Context, kind channel.Kind, tried map[string]bool) (channel.Credential, bool)
+	// RefreshNow 强制续期一次（不看到期时间）。凭证类失败时先试它再换号，
+	// 与 router.Route 的纪律一致 —— 直登账号能靠它救回来，而不是被直接禁用。
+	RefreshNow(ctx context.Context, kind channel.Kind, c channel.Credential) (*channel.Credential, error)
+	// NoteError 按 errs.Kind 分档冷却/禁用该账号（UpstreamFault 等不计账号错误）。
+	NoteError(kind channel.Kind, uid string, k errs.Kind)
+	// NoteSuccess 清零该账号的错误计数。
+	NoteSuccess(kind channel.Kind, uid string)
 }
 
 // NewRunner 建立探测器。timeout<=0 时用 30 秒（原型 06-settings.html 的默认）。
@@ -91,13 +109,80 @@ func NewRunner(p AccountSource, timeout time.Duration) *Runner {
 	return &Runner{pool: p, timeout: timeout, conc: 3}
 }
 
+// maxAccountAttempts 是一次探测最多用几个账号（含首个）。
+//
+// 与 router 的换号重试同一个道理：一条死号不该让整个渠道在面板上变红。
+// 但不能无限换（池子可能有几十个号），所以给一个上限。
+const maxAccountAttempts = 3
+
 // ProbeOne 对单个目标发一次真实请求并判读。
 //
 // 这是判据的唯一执行点：先看请求是否发出，再看是否收到内容。
+//
+// 账号纪律（与 router.Route 一致，2026-09-26 补）：
+//  1. 结论回写池子：失败按 errs.Kind 分档（NoteError），成功清零（NoteSuccess）；
+//  2. 只有「账号/凭证的问题」才续期与换号 —— 上游故障、超长、内容拦截换号只会白折腾，
+//     还会把一个好号冷却掉（红线 D4）；
+//  3. 凭证类失败（SessionDead/AuthFailed）先强制续期一次再重试，救不回来才换下一个号；
+//  4. 池里的号都试完了才认账「这个渠道现在不可用」，并把**最后一个真实错误**带出去。
 func (r *Runner) ProbeOne(ctx context.Context, t Target) Result {
+	cred := t.Account
+	tried := map[string]bool{}
+	var (
+		skipped []string
+		last    Result
+	)
+
+	for attempt := 0; attempt < maxAccountAttempts; attempt++ {
+		tried[cred.UID] = true
+		res, err := r.probeWith(ctx, t, cred)
+		res.Skipped = append([]string(nil), skipped...)
+		last = res
+		if res.OK {
+			r.pool.NoteSuccess(t.Kind, cred.UID)
+			return res
+		}
+		k := failureKind(res, err)
+		r.pool.NoteError(t.Kind, cred.UID, k)
+		if !k.AccountBlamed() && !errs.CredentialKind(k) {
+			// 不是这个号的锅：换号没意义，直接给出结论（渠道级故障）。
+			return res
+		}
+		// 凭证类失败：先试续期再谈换号（「token 到期」唯一体面的处理方式）。
+		if errs.CredentialKind(k) {
+			if nc, rerr := r.pool.RefreshNow(ctx, t.Kind, cred); rerr == nil && nc != nil && nc.AccessToken != cred.AccessToken {
+				res, err = r.probeWith(ctx, t, *nc)
+				res.Skipped = append([]string(nil), skipped...)
+				last = res
+				if res.OK {
+					r.pool.NoteSuccess(t.Kind, nc.UID)
+					return res
+				}
+				k = failureKind(res, err)
+				r.pool.NoteError(t.Kind, nc.UID, k)
+				if !k.AccountBlamed() && !errs.CredentialKind(k) {
+					return res
+				}
+			}
+		}
+		next, ok := r.pool.Pick(ctx, t.Kind, tried)
+		if !ok {
+			return last // 没有别的号可试了：这一条红才是真红
+		}
+		skipped = append(skipped, cred.UID)
+		cred = next
+	}
+	return last
+}
+
+// probeWith 用指定账号发一次探测请求（换号/续期的纪律在 ProbeOne 外层）。
+//
+// 返回的 error 只在「请求本身就错了、没拿到流」或「读流中途断了」时非空；
+// 「HTTP 200 但流里没内容」这类失败只体现在 Result 里（没有 error 可归因到账号）。
+func (r *Runner) probeWith(ctx context.Context, t Target, cred channel.Credential) (Result, error) {
 	res := Result{
 		Channel:   string(t.Kind),
-		Account:   t.Account.UID,
+		Account:   cred.UID,
 		Model:     t.Model,
 		CheckedAt: time.Now().UTC(),
 	}
@@ -105,7 +190,7 @@ func (r *Runner) ProbeOne(ctx context.Context, t Target) Result {
 	defer cancel()
 
 	start := time.Now()
-	stream, err := t.Channel.Chat(cctx, &t.Account, channel.ChatRequest{
+	stream, err := t.Channel.Chat(cctx, &cred, channel.ChatRequest{
 		Model:     t.Model,
 		Messages:  []channel.Message{{Role: "user", Content: "hi"}},
 		MaxTokens: 8,
@@ -117,7 +202,7 @@ func (r *Runner) ProbeOne(ctx context.Context, t Target) Result {
 		res.Kind = string(k)
 		res.Reason = v.Reason
 		res.Upstream = upstreamOf(err)
-		return res
+		return res, err
 	}
 	defer stream.Close()
 
@@ -162,7 +247,18 @@ func (r *Runner) ProbeOne(ctx context.Context, t Target) Result {
 	if v.OK {
 		res.TTFTms = v.TTFT.Milliseconds()
 	}
-	return res
+	return res, readErr
+}
+
+// failureKind 取一次失败探测的分类：优先用错误自带的 Kind（带得最准），
+// 其次用判据给的分类（空流那条路没有 error，判据会给出 UpstreamFault）。
+func failureKind(res Result, err error) errs.Kind {
+	if err != nil {
+		if k, ok := errs.KindOf(err); ok {
+			return k
+		}
+	}
+	return errs.Kind(res.Kind)
 }
 
 // Sample 执行抽样体检：每渠道取 samples 个代表模型。

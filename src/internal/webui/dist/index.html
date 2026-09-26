@@ -1075,7 +1075,7 @@
           <div class="sub">每渠道取代表模型（含默认模型）· {{ lastRun?fmtTime(lastRun.started_at):'—' }} · 耗时 {{ lastRun?(lastRun.duration_ms/1000).toFixed(1):'—' }}s</div>
           <div class="bars" v-if="lastResults.length">
             <div class="bar-row" v-for="r in lastResults" :key="'b'+r.channel+r.model"
-              :data-tip="'<b>'+r.channel+' / '+r.model+'</b><br>'+(r.ok?'首字 '+(r.ttft_ms/1000).toFixed(1)+'s · 收到内容 ✓':'失败 · '+(r.reason||r.kind))">
+              :data-tip="'<b>'+r.channel+' / '+r.model+'</b><br>'+(r.ok?'首字 '+(r.ttft_ms/1000).toFixed(1)+'s · 收到内容 ✓':'失败 · '+(r.reason||r.kind)+(r.account?' · 账号 '+r.account:''))">
               <span class="name"><span class="ch" :class="channelClass(r.channel)"><img class="logo" v-if="icoOf(r.channel)" :src="icoOf(r.channel)" alt=""><span class="k" v-else></span>{{ r.model }}</span></span>
               <span class="bar-track"><span class="bar-fill"
                 :style="{width:barPct(r.ttft_ms)+'%',background:r.ok?barColor(r.ttft_ms):'var(--crit)'}"></span></span>
@@ -1093,13 +1093,19 @@
 
         <div class="card" style="margin-bottom:14px" v-if="lastResults.length">
           <h2>失败明细</h2>
-          <div class="sub">失败必带分类与上游原话 —— 不写「请重试」</div>
+          <div class="sub">失败必带账号、分类与上游原话 —— 不写「请重试」</div>
           <table>
-            <thead><tr><th>渠道</th><th>模型</th><th>分类</th><th>原因</th><th>上游原话</th></tr></thead>
+            <thead><tr><th>渠道</th><th>模型</th><th>账号</th><th>分类</th><th>原因</th><th>上游原话</th></tr></thead>
             <tbody>
               <tr v-for="r in failedResults" :key="'f'+r.channel+r.model">
                 <td><span class="ch" :class="channelClass(r.channel)"><img class="logo" v-if="icoOf(r.channel)" :src="icoOf(r.channel)" alt=""><span class="k" v-else></span>{{ channelName(r.channel) }}</span></td>
                 <td class="mono">{{ r.model }}</td>
+                <td class="mono">{{ r.account || '—' }}
+                  <!-- 探测失败时用过的账号要能看见：一条坏号不该让整个渠道看起来都是红的。 -->
+                  <div class="hint" v-if="(r.skipped_accounts||[]).length">
+                    已跳过 {{ r.skipped_accounts.length }} 个失效账号：{{ r.skipped_accounts.join('、') }}
+                  </div>
+                </td>
                 <td><span class="pill crit"><span class="i">×</span><span class="swatch"></span>{{ r.kind || '失败' }}</span></td>
                 <td>{{ r.reason }}</td>
                 <td class="mono" style="font-size:11.5px;max-width:320px;word-break:break-all">{{ r.upstream || '—' }}</td>

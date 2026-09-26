@@ -493,7 +493,51 @@ func (s *Server) handleProbe(w http.ResponseWriter, r *http.Request) {
 	if s.opts.History != nil {
 		s.opts.History.Add(run)
 	}
+	logProbeRun(run)
 	writeJSON(w, http.StatusOK, run)
+}
+
+// logProbeRun 把体检结论落进日志。
+//
+// 面板是给眼睛看的，日志是给「事后回看」用的。2026-09-26 的真机事故就是这样：
+// 体检三个模型全红、红得有理有据（上游原话都在面板上），但日志里一个字都没有 ——
+// 用户把日志发过来，我们只能看到「什么都没发生过」。失败项必须留下痕迹（红线一）。
+func logProbeRun(run health.Run) {
+	label := "抽样体检"
+	if run.Kind == health.RunFull {
+		label = "全量测速"
+	}
+	dash := func(s string) string {
+		if strings.TrimSpace(s) == "" {
+			return "-"
+		}
+		return s
+	}
+	clip := func(s string, n int) string {
+		if len(s) <= n {
+			return s
+		}
+		return s[:n] + "…"
+	}
+	log.Printf("console: %s完成 %d/%d 通过，耗时 %.1fs",
+		label, run.Passed, run.Total, float64(run.Duration)/1000)
+	for _, res := range run.Results {
+		skip := ""
+		if n := len(res.Skipped); n > 0 {
+			skip = fmt.Sprintf("（已跳过 %d 个失效账号：%s）", n, strings.Join(res.Skipped, "、"))
+		}
+		// 「换号后才通过」也要留痕：只写失败的话，日志里会看不见中间换过号，
+		// 而「哪个号是坏的」恰恰是最该被记住的那件事。
+		if res.OK {
+			if skip != "" {
+				log.Printf("console: %s通过 %s/%s 账号=%s%s", label, res.Channel, res.Model, dash(res.Account), skip)
+			}
+			continue
+		}
+		log.Printf("console: %s失败 %s/%s 账号=%s 分类=%s%s · %s · 上游原话 %s",
+			label, res.Channel, res.Model, dash(res.Account), dash(res.Kind),
+			skip, dash(res.Reason), dash(clip(res.Upstream, 200)))
+	}
 }
 
 // handleProbeHistory 返回体检历史（F5.5：能回看「上次为什么判它坏」）。
