@@ -244,7 +244,7 @@
               <button class="btn primary" v-if="c.panel_auth" @click="startAuth(c.kind)" :disabled="busy">
                 授权{{ c.account_count ? '（再加一个）' : '' }}
               </button>
-              <span v-else class="muted">请用「从 wild-work 导入账号」</span>
+              <span v-else class="muted">无法面板授权，请在服务端导入凭证</span>
             </div>
           </div>
 
@@ -627,29 +627,6 @@
                   <button class="btn sm" @click="startRelogin(a)">重新登录</button>
                   <button class="btn sm danger" @click="toggleAccount(a)" :disabled="busy">{{ a.disabled?'启用':'禁用' }}</button>
                   <button class="btn sm danger" @click="askRemoveAccount(a)">删除</button>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-
-        <div class="card" v-if="sec.paused.length">
-          <h2>暂停的渠道 <span class="hint">· {{ sec.key==='chat' ? '聊天平台类' : '编程助手类' }}</span></h2>
-          <div class="sub">保留账号与适配器，但不向客户端下发模型；恢复只需改状态</div>
-          <table>
-            <thead><tr><th>渠道 / 账号</th><th>暂停原因</th><th class="num">余额</th><th>恢复条件</th><th>操作</th></tr></thead>
-            <tbody>
-              <tr v-for="g in sec.paused" :key="'pg'+g.kind">
-                <td><b>{{ g.name }}</b><div class="hint">{{ g.accounts.map(a=>a.nickname||a.uid).join(' · ') || '无账号' }}</div></td>
-                <td>
-                  <span class="pill" :class="statusPill(g)"><span class="i">{{ statusIcon(g) }}</span><span class="swatch"></span>{{ statusText(g) }}</span>
-                  <div class="hint mono">{{ g.reason ? reasonText(g.reason) : '—' }}</div>
-                </td>
-                <td class="num">{{ g.credits }}</td>
-                <td class="hint">{{ g.recover }}</td>
-                <td>
-                  <button class="btn sm" @click="go('logs')">查看诊断</button>
-                  <button class="btn sm" @click="toggleChannel(g)" :disabled="busy">恢复</button>
                 </td>
               </tr>
             </tbody>
@@ -1291,21 +1268,6 @@
           </div>
 
           <div class="card">
-            <h2>数据与备份</h2>
-            <div class="sub">升级不丢数据；导出默认剔除凭证</div>
-            <dl class="kv">
-              <dt>配置目录</dt><dd class="mono">{{ paths.config_dir || '—' }}</dd>
-              <dt>凭证目录</dt><dd class="mono">{{ paths.creds_dir || '—' }} · 0600</dd>
-              <dt>流水保留</dt><dd>{{ form.log_retention_days }} 天 · 上限 {{ form.log_retention_max_mb }} MB</dd>
-              <dt>上次备份</dt><dd>{{ form.last_backup_at ? fmtTime(form.last_backup_at) : '从未' }}</dd>
-            </dl>
-            <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
-              <button class="btn" @click="backup">导出配置（不含凭证）</button>
-              <button class="btn" @click="migrate">从 wild-work 导入账号</button>
-            </div>
-          </div>
-
-          <div class="card">
             <h2>危险操作</h2>
             <div class="sub">均需二次确认</div>
             <div style="display:flex;gap:8px;flex-wrap:wrap">
@@ -1483,7 +1445,7 @@ createApp({
       if(view.value==='providers'){
         return `${providers.value.length} 个 API Key 式来源 · 扫码登录的渠道在「账号」页 · 客户端只连一个入口`;
       }
-      if(view.value==='accounts')return `按渠道分组 · ${totalHealthy.value} 个可用 · ${pausedAccountCount.value} 个暂停`;
+      if(view.value==='accounts')return `按渠道分组 · ${totalHealthy.value} 个可用`+ (pausedAccountCount.value?` · ${pausedAccountCount.value} 个账号在暂停渠道（去设置→渠道开关恢复）`:'');
       if(view.value==='models'){
         // 分开说「人工剔除」与「健康隐藏」：两者来源不同、恢复方法也不同
         // （前者点开关，后者跑体检或关掉设置里的开关）。混成一句「因健康度剔除」
@@ -1581,14 +1543,7 @@ createApp({
         };
       });
     });
-    const pausedGroups=computed(()=>{
-      return (overview.value.channels||[]).filter(c=>!c.downstream).map(c=>({
-        kind:c.kind,name:c.display_name,status:c.status,reason:c.reason,
-        accounts:accounts.value.filter(a=>a.kind===c.kind),
-        credits:accounts.value.filter(a=>a.kind===c.kind).reduce((s,a)=>s+(a.credits_known?a.credits:0),0)||0,
-        recover:c.reason_kind==='upstream'?'等上游逆向社区跟进':'充值后手动恢复'
-      }));
-    });
+    const pausedGroups=computed(()=>[]); // 暂停/恢复统一收归设置页「渠道开关」，账号页不再展示暂停渠道
     const catalogChannels=computed(()=>{
       const seen={};
       for(const m of modelRows.value)seen[m.channel]=m.channel_name||m.channel;
@@ -2105,14 +2060,12 @@ createApp({
     };
     const resetSettings=()=>act(()=>post('/api/danger/reset'),'配置已重置');
     const removeAllAccounts=()=>act(()=>post('/api/danger/remove_accounts'),'全部账号已移除');
-    const backup=()=>{window.open(base+'/api/backup','_blank');toast('已开始导出（不含凭证）');};
-    const migrate=()=>act(()=>post('/api/migrate',{}),'已从 wild-work 导入账号');
 
     // ---------- 渠道授权 ----------
     const startAddAccount=()=>{
       // 加号是「选渠道 → 授权 → 绑号」三步：先让用户挑，别替他决定。
       const canAuth=channels.value.filter(x=>x.panel_auth);
-      if(!canAuth.length)return toast('没有可面板授权的渠道；请用「从 wild-work 导入账号」');
+      if(!canAuth.length)return toast('没有可面板授权的渠道；请在服务端导入凭证');
       authFlowOpen.value=true;
       authView.value='pick';
     };
@@ -2314,7 +2267,7 @@ createApp({
       go,loadModels,checkinOne,refreshOne,toggleAccount,checkinAll,refreshAll,askRemoveAccount,
       toggleModel,toggleChannel,probe,runDiagnose,exportLogs,clearLogs,saveSettings,resetSettings,
       pwForm,changePassword,pwStrengthOf,lastErr,errDetail,browserHost,browserIsLocal,
-      removeAllAccounts,backup,migrate,startAddAccount,startRelogin,startAuth,cancelAuth,closeAuthFlow,openAuth,copyAuth,
+      removeAllAccounts,startAddAccount,startRelogin,startAuth,cancelAuth,closeAuthFlow,openAuth,copyAuth,
       // keyPlain 必须一起透出：模板用它决定按钮文案（显示明文/隐藏、复制/复制明文）。
       // 只透出 keyShown 的话按钮永远停在「未显示明文」那一态 —— 值变了、按钮不变。
       detectedBase,clientBase,keyShown,keyPlain,keyPath,copyClientBase,useDetectedBase,copyKey,revealKey,hideKey,rotateKey,

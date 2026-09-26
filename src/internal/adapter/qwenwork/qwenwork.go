@@ -158,7 +158,7 @@ func (a *Adapter) Spec() channel.Spec {
 		Kind:        "qwenwork",
 		DisplayName: "千问办公",
 		Status:      channel.Active,
-		Category:    channel.CategoryChat, // 聊天平台类
+		Category:    channel.CategoryCoding, // 编程助手类
 		Tools:       false,
 		Images:      true,
 		Reasoning:   true,

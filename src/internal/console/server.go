@@ -423,7 +423,7 @@ func (s *Server) handleChannels(w http.ResponseWriter, r *http.Request) {
 		}
 		note := ""
 		if !canAuth {
-			note = "该渠道暂不支持面板授权，请用「从 wild-work 导入账号」"
+			note = "该渠道暂不支持面板授权，请在服务端导入凭证"
 		}
 		out = append(out, item{
 			Kind:          string(e.Spec.Kind),

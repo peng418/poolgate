@@ -111,6 +111,9 @@ func TestSpecsAreHonest(t *testing.T) {
 		// description=2 / parameters=3，2026-07-04 opus-4-8 实弹确认）→ 走原生工具调用
 		// （请求 #10、响应 #6 ChatToolCall），不再是 toolshim 模拟。
 		{channel.Windsurf, true, false, true, true, channel.CategoryCoding},
+		// 千问办公是编程/办公助手（不是网页聊天），归编程类；但协议是 chat-ws 纯文本，
+		// 放不下工具定义 → Tools=false、也不做 toolshim，交给网关明确拒绝。
+		{channel.QwenWork, false, false, true, true, channel.CategoryCoding},
 	}
 	for _, c := range cases {
 		got, ok := registry.GetSpec(c.kind)

@@ -358,7 +358,7 @@ func probeTimeout(settings *store.SettingsStore) time.Duration {
 }
 
 // migrateFrom 从 wild-work 的 auth 目录导入凭证（F6.6）。
-// 供 CLI 的 migrate 子命令与面板的「从 wild-work 导入账号」共用同一实现。
+// 供 CLI 的 migrate 子命令与面板的服务端凭证导入共用同一实现。
 func migrateFrom(from, confDir string) (int, error) {
 	dst := filepath.Join(confDir, "creds")
 	if err := os.MkdirAll(dst, 0o755); err != nil {
