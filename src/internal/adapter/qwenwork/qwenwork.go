@@ -112,6 +112,12 @@ type Adapter struct {
 	// 让路由换号或把原因交给客户端。
 	mu       sync.Mutex
 	sessions map[string]chan struct{}
+
+	// 会话复用台账（0.10.0）：把「客户端对话」映射到「上游会话」，
+	// 每轮只发最新一轮，绕开上游 chat-ws 的 32768 字节单帧上限。
+	// 详见 session.go 的文件头注释。
+	convMu sync.Mutex
+	convs  []*convState
 }
 
 // New 建立适配器。
@@ -453,10 +459,22 @@ func (a *Adapter) Chat(ctx context.Context, c *channel.Credential, req channel.C
 		return nil, err
 	}
 
-	sessionID, err := a.createSession(ctx, c, model)
+	// 先算方案：能复用既有上游会话就只发最新一轮（绕开单帧上限），
+	// 不能复用就发全量并在发之前自查帧长（超限当场拒绝，不建会话、不烧上游配额）。
+	plan, err := a.planTurn(c.UID, model, req.Messages)
 	if err != nil {
 		lk()
 		return nil, err
+	}
+
+	sessionID := plan.sessionID
+	if sessionID == "" {
+		sessionID, err = a.createSession(ctx, c, model)
+		if err != nil {
+			lk()
+			return nil, err
+		}
+		plan.conv.sessionID = sessionID
 	}
 
 	conn, _, err := a.wsDialer.DialContext(ctx,
@@ -468,6 +486,10 @@ func (a *Adapter) Chat(ctx context.Context, c *channel.Credential, req channel.C
 		})
 	if err != nil {
 		lk()
+		if plan.resumed {
+			// 会话可能已被上游回收：摘掉台账，下一轮走新建（全量/或如实报超限）。
+			a.dropConv(sessionID)
+		}
 		return nil, errs.New(errs.Transport, "连接上游 chat-ws 失败").WithCause(err).WithChannel("qwenwork")
 	}
 
@@ -479,8 +501,12 @@ func (a *Adapter) Chat(ctx context.Context, c *channel.Credential, req channel.C
 		chunks:    make(chan channel.ChatCompletionChunk, 64),
 		errc:      make(chan error, 1),
 		release:   lk,
+
+		adapter: a,
+		conv:    plan.conv,
+		lastSeq: plan.lastSeq,
 	}
-	go s.run(a.promptText(req))
+	go s.run(plan.text)
 	return s, nil
 }
 
@@ -496,23 +522,9 @@ func (a *Adapter) resolveModel(m string) string {
 	return m
 }
 
-// promptText 把 messages 拼成单条 prompt。上游服务端无状态，多轮必须带全量上下文。
+// promptText 把 messages 拼成单条 prompt（新建会话时用；正文长度由 planTurn 自查）。
 func (a *Adapter) promptText(req channel.ChatRequest) string {
-	if len(req.Messages) == 1 {
-		return req.Messages[0].Content
-	}
-	var b strings.Builder
-	for _, m := range req.Messages {
-		switch m.Role {
-		case "system":
-			b.WriteString("[系统] " + m.Content + "\n\n")
-		case "assistant":
-			b.WriteString("[助手] " + m.Content + "\n\n")
-		default:
-			b.WriteString(m.Content + "\n\n")
-		}
-	}
-	return strings.TrimSpace(b.String())
+	return promptTextOf(req.Messages)
 }
 
 // sessionStartBackoff 是「上游同一账号会话启动未落地（409 / SessionBusy）」时的内联重试节奏。
@@ -563,8 +575,10 @@ func (a *Adapter) createSession(ctx context.Context, c *channel.Credential, mode
 // ---------------------------------------------------------------------------
 
 // wsFrame 是上游的外层帧：{"type":"control"|"data","payload":{...}}。
+// data 帧带自增 seq（会话内事件序号），重挂会话时用 lastSeqId 对齐。
 type wsFrame struct {
 	Type    string          `json:"type"`
+	Seq     int64           `json:"seq"`
 	Payload json.RawMessage `json:"payload"`
 }
 
@@ -602,6 +616,20 @@ type wsStream struct {
 	started bool
 	// wroteContent 记录是否真的收到过内容（判据用）。
 	wroteContent bool
+
+	// 会话复用（0.10.0）。
+	adapter *Adapter
+	conv    *convState
+	// lastSeq 是重挂时 join 要带的 lastSeqId（已消费到的事件序号）。
+	lastSeq int64
+	// maxSeq 是本轮读到的最大事件序号，结束时回写台账，供下一轮 join 对齐。
+	maxSeq int64
+	// inReplay 表示正处在上游的历史重放区间（replay_start → replay_end）。
+	// 这段区间里的帧**不是本轮输出**：既不能当正文吐给客户端，
+	// 也不能让里面的 session_status:idle 把本轮提前结束掉。
+	inReplay bool
+	// finished 保证一轮只结账一次（成功入台账 / 失败摘会话）。
+	finished bool
 }
 
 // Next 实现 channel.Stream：返回下一个归一化 chunk。
@@ -644,22 +672,24 @@ func (s *wsStream) releaseOnce() {
 
 // run 是读循环：join → new_prompt → 读帧直到 idle。
 func (s *wsStream) run(prompt string) {
+	ok := false
+	// 结账：成功才把上游会话记入台账（下一轮才敢复用），失败就摘掉。
+	defer func() { s.finish(ok) }()
 	defer close(s.chunks)
 	defer s.conn.Close()
 	defer s.releaseOnce()
 
 	// 1) join
-	if err := s.sendRPC("join", map[string]any{"sessionId": s.sessionID, "lastSeqId": 0}); err != nil {
+	//
+	// lastSeqId 必须带「已消费到的事件序号」：复用既有上游会话时，带 0 会让上游
+	// 从头全量 replay（真机实测：会丢上下文，且历史正文会漏进本轮输出）。
+	if err := s.sendRPC("join", map[string]any{"sessionId": s.sessionID, "lastSeqId": s.lastSeq}); err != nil {
 		s.fail(errs.New(errs.Transport, "join 发送失败").WithCause(err).WithChannel("qwenwork"))
 		return
 	}
-	// 2) new_prompt
-	if err := s.sendRPC("new_prompt", map[string]any{
-		"sessionId": s.sessionID,
-		"text":      prompt,
-		"_meta":     map[string]any{"channel": wsChannel},
-	}); err != nil {
-		s.fail(errs.New(errs.Transport, "new_prompt 发送失败").WithCause(err).WithChannel("qwenwork"))
+	// 2) new_prompt（发前按真实帧字节自查，超限如实报 PromptTooLong）
+	if err := s.sendPrompt(prompt); err != nil {
+		s.fail(err)
 		return
 	}
 
@@ -673,7 +703,18 @@ func (s *wsStream) run(prompt string) {
 		_ = s.conn.SetReadDeadline(time.Now().Add(180 * time.Second))
 		_, raw, err := s.conn.ReadMessage()
 		if err != nil {
+			// 上游的「单帧超限」专用 close 码：如实报成 PromptTooLong（附上游原话），
+			// 不再谎报成「上游连接中断」——「帧太大发不出去」和「连不上上游」
+			// 是两件完全不同的事，混在一起会把排查带偏（红线一）。
+			if closeCodeOf(err) == websocket.CloseMessageTooBig && !s.wroteContent {
+				e := tooLongFromUpstream(err)
+				log.Printf("poolgate: 渠道 qwenwork 上游以 close 1009 掐断本轮连接（上游原话 %q），按 PromptTooLong 归类（单帧上限 %d 字节）",
+					e.Upstream, maxFrameBytes)
+				s.fail(e)
+				return
+			}
 			if s.wroteContent {
+				ok = true
 				return // 已出内容，连接关闭视作正常结束
 			}
 			s.fail(errs.New(errs.Transport, "上游连接中断且未收到内容").
@@ -681,9 +722,29 @@ func (s *wsStream) run(prompt string) {
 			return
 		}
 		if done := s.handleFrame(raw); done {
+			ok = true
 			return
 		}
 	}
+}
+
+// finish 一轮结束时结账（只生效一次）。
+func (s *wsStream) finish(ok bool) {
+	if s.adapter == nil || s.conv == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.finished {
+		s.mu.Unlock()
+		return
+	}
+	s.finished = true
+	s.mu.Unlock()
+	if ok {
+		s.adapter.commitConv(s.conv, s.maxSeq)
+		return
+	}
+	s.adapter.dropConv(s.conv.sessionID)
 }
 
 // handleFrame 处理一帧；返回 true 表示本轮结束。
@@ -692,11 +753,25 @@ func (s *wsStream) handleFrame(raw []byte) bool {
 	if err := json.Unmarshal(raw, &f); err != nil {
 		return false
 	}
+	if f.Seq > s.maxSeq {
+		s.maxSeq = f.Seq
+	}
 	var env rpcEnvelope
 	if err := json.Unmarshal(f.Payload, &env); err != nil {
 		return false
 	}
-	// 心跳：服务端 ping 必须回 pong，否则连接会被断。
+	// 重挂既有上游会话时，上游会把历史事件重放一遍（replay_start → replay_end）。
+	// 这段区间里的帧**不是本轮输出**：既不能当正文吐给客户端（否则上一轮的回复
+	// 会漏进本轮），也不能让里面那条 session_status:idle 把本轮提前结束掉。
+	switch env.Method {
+	case "replay_start":
+		s.inReplay = true
+		return false
+	case "replay_end":
+		s.inReplay = false
+		return false
+	}
+	// 心跳：服务端 ping 必须回 pong，否则连接会被断（重放期间也要照回）。
 	if env.Method == "ping" {
 		_ = s.sendRaw(map[string]any{
 			"type":    "control",
@@ -711,6 +786,9 @@ func (s *wsStream) handleFrame(raw []byte) bool {
 	if env.Error != nil {
 		s.fail(s.classifyRPC(env.Error.Code, env.Error.Message))
 		return true
+	}
+	if s.inReplay {
+		return false
 	}
 	switch env.Method {
 	case "session/update":
@@ -811,6 +889,32 @@ func (s *wsStream) sendRaw(v any) error {
 	if err != nil {
 		return err
 	}
+	return s.writeRaw(raw)
+}
+
+// sendPrompt 发 new_prompt，并在发送前按**真实帧字节**自查单帧上限。
+//
+// 真机实测上游上限 32768 字节（超一字节就被 close 1009 掐断）。这里量的是
+// 真正 WriteMessage 出去的那串字节（含 JSON 转义后的膨胀），不是估算。
+func (s *wsStream) sendPrompt(text string) error {
+	s.mu.Lock()
+	s.seq++
+	id := s.seq
+	s.mu.Unlock()
+	raw, err := promptFrame(s.sessionID, text, id)
+	if err != nil {
+		return errs.New(errs.Transport, "构造上游请求失败").WithCause(err).WithChannel("qwenwork")
+	}
+	if len(raw) > maxFrameBytes {
+		return tooLongError(len(raw), "")
+	}
+	if err := s.writeRaw(raw); err != nil {
+		return errs.New(errs.Transport, "new_prompt 发送失败").WithCause(err).WithChannel("qwenwork")
+	}
+	return nil
+}
+
+func (s *wsStream) writeRaw(raw []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {

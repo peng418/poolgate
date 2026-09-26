@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -686,5 +689,347 @@ func TestChatSurvivesConcurrentSessionStart(t *testing.T) {
 	_ = stream.Close()
 	if creates != 2 {
 		t.Fatalf("应重试一次建会话（共 2 次），实际 %d 次", creates)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 0.10.0：上游会话复用（绕开 32768 字节单帧上限）+ 单帧限长自查
+// ---------------------------------------------------------------------------
+
+// upstreamStub 是最小的上游桩：记下每轮 join 的 lastSeqId 与 new_prompt 正文，
+// 默认按 running → 正文 → idle 回帧。
+type upstreamStub struct {
+	t *testing.T
+
+	mu       sync.Mutex
+	creates  int
+	prompts  []string
+	lastSeqs []int64
+
+	// onPrompt 非空时接管回帧（promptNo 从 0 开始）。
+	onPrompt func(conn *websocket.Conn, promptNo int)
+}
+
+func newUpstreamStub(t *testing.T, onPrompt func(*websocket.Conn, int)) (*upstreamStub, *httptest.Server) {
+	t.Helper()
+	s := &upstreamStub{t: t, onPrompt: onPrompt}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/chat-sessions", func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		s.creates++
+		n := s.creates
+		s.mu.Unlock()
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"id":"sess-%d"}`, n)))
+	})
+	up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	mux.HandleFunc("/api/chat-ws", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		seq := int64(0)
+		for {
+			_, raw, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			var f struct {
+				Payload struct {
+					Method string `json:"method"`
+					Params struct {
+						Text    string `json:"text"`
+						LastSeq int64  `json:"lastSeqId"`
+					} `json:"params"`
+				} `json:"payload"`
+			}
+			if err := json.Unmarshal(raw, &f); err != nil {
+				continue
+			}
+			switch f.Payload.Method {
+			case "join":
+				s.mu.Lock()
+				s.lastSeqs = append(s.lastSeqs, f.Payload.Params.LastSeq)
+				s.mu.Unlock()
+			case "new_prompt":
+				s.mu.Lock()
+				s.prompts = append(s.prompts, f.Payload.Params.Text)
+				no := len(s.prompts) - 1
+				s.mu.Unlock()
+				if s.onPrompt != nil {
+					s.onPrompt(conn, no)
+					continue
+				}
+				seq++
+				writeFrame(t, conn, seq, "session_status", map[string]any{"sessionStatus": "running"})
+				seq++
+				writeFrame(t, conn, seq, "session/update", map[string]any{
+					"update": map[string]any{
+						"sessionUpdate": "agent_message_chunk",
+						"messageId":     "m1",
+						"content":       map[string]any{"text": "ok", "type": "text"},
+					},
+				})
+				seq++
+				writeFrame(t, conn, seq, "session_status", map[string]any{"sessionStatus": "idle"})
+			}
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return s, srv
+}
+
+func (s *upstreamStub) snapshot() (creates int, prompts []string, lastSeqs []int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.creates, append([]string(nil), s.prompts...), append([]int64(nil), s.lastSeqs...)
+}
+
+// writeFrame 往桩连接写一帧上游形态的外层帧。
+func writeFrame(t *testing.T, c *websocket.Conn, seq int64, method string, params map[string]any) {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "method": method, "params": params})
+	if err != nil {
+		t.Fatalf("构造桩帧失败：%v", err)
+	}
+	frame, err := json.Marshal(map[string]any{"type": "data", "seq": seq, "payload": json.RawMessage(payload)})
+	if err != nil {
+		t.Fatalf("构造桩帧失败：%v", err)
+	}
+	if err := c.WriteMessage(websocket.TextMessage, frame); err != nil {
+		t.Logf("桩写帧失败（连接多半已关）：%v", err)
+	}
+}
+
+// drainStream 读完一条流，返回正文与终止错误。
+func drainStream(s channel.Stream) (string, error) {
+	var b strings.Builder
+	for {
+		c, err := s.Next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return b.String(), nil
+			}
+			return b.String(), err
+		}
+		for _, ch := range c.Choices {
+			b.WriteString(ch.Delta.Content)
+		}
+	}
+}
+
+// 复用上游会话：第二轮只发最新一轮（不重发全量历史），
+// 且重挂必须带 lastSeqId=上一轮最大事件序号（带 0 会触发上游全量 replay，实测丢上下文）。
+func TestChatReusesUpstreamSessionAndSendsOnlyLatestTurn(t *testing.T) {
+	stub, srv := newUpstreamStub(t, nil)
+	a := NewWithBase(srv.URL, nil)
+	cred := channel.Credential{UID: "u1", AccessToken: "tok"}
+	ctx := context.Background()
+
+	first, err := a.Chat(ctx, &cred, channel.ChatRequest{
+		Model:    "pro",
+		Messages: []channel.Message{{Role: "user", Content: "第一问"}},
+	})
+	if err != nil {
+		t.Fatalf("第一轮不该失败：%v", err)
+	}
+	if _, err := drainStream(first); err != nil {
+		t.Fatalf("第一轮读流失败：%v", err)
+	}
+	_ = first.Close()
+
+	second, err := a.Chat(ctx, &cred, channel.ChatRequest{
+		Model: "pro",
+		Messages: []channel.Message{
+			{Role: "system", Content: "新的系统提示"},
+			{Role: "user", Content: "第一问"},
+			{Role: "assistant", Content: "ok"},
+			{Role: "user", Content: "第二问"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("第二轮不该失败：%v", err)
+	}
+	if _, err := drainStream(second); err != nil {
+		t.Fatalf("第二轮读流失败：%v", err)
+	}
+	_ = second.Close()
+
+	creates, prompts, lastSeqs := stub.snapshot()
+	if creates != 1 {
+		t.Fatalf("第二轮应复用上游会话、不该再建会话，实际建了 %d 次", creates)
+	}
+	if len(prompts) != 2 {
+		t.Fatalf("应发出两轮 prompt，实际 %d 条：%q", len(prompts), prompts)
+	}
+	if prompts[0] != "第一问" {
+		t.Fatalf("第一轮应发全量，实际 %q", prompts[0])
+	}
+	want := "[系统] 新的系统提示\n\n第二问"
+	if prompts[1] != want {
+		t.Fatalf("第二轮只该发最新一轮（系统提示变了才补发），实际 %q，期望 %q", prompts[1], want)
+	}
+	if len(lastSeqs) != 2 || lastSeqs[0] != 0 || lastSeqs[1] != 3 {
+		t.Fatalf("第二轮重挂必须带 lastSeqId=3（第一轮最大事件序号），实际 %v", lastSeqs)
+	}
+}
+
+// 超限请求必须在**建会话之前**就拒绝：不消耗上游配额，且错误自带原因与上限数值。
+func TestOversizePromptRejectedBeforeCreatingSession(t *testing.T) {
+	stub, srv := newUpstreamStub(t, nil)
+	a := NewWithBase(srv.URL, nil)
+	cred := channel.Credential{UID: "u1", AccessToken: "tok"}
+	big := strings.Repeat("占位文本", 9000) // ≈108KB 正文，远超 32768 字节单帧上限
+
+	_, err := a.Chat(context.Background(), &cred, channel.ChatRequest{
+		Model:    "pro",
+		Messages: []channel.Message{{Role: "user", Content: big}},
+	})
+	k, ok := errs.KindOf(err)
+	if !ok || k != errs.PromptTooLong {
+		t.Fatalf("超限应报 PromptTooLong，实际 %v", err)
+	}
+	creates, _, _ := stub.snapshot()
+	if creates != 0 {
+		t.Fatalf("超限必须在建会话之前拒绝（不消耗上游配额），实际建了 %d 次会话", creates)
+	}
+	if !strings.Contains(err.Error(), "32768") {
+		t.Fatalf("错误文案要自带上限数值，实际：%v", err)
+	}
+}
+
+// 上游 close 1009（单帧超限）必须如实归 PromptTooLong 并附上游原话，
+// 不能谎报成「上游连接中断且未收到内容」（红线一）。
+func TestUpstreamMessageTooBigIsClassifiedAsPromptTooLong(t *testing.T) {
+	_, srv := newUpstreamStub(t, func(conn *websocket.Conn, _ int) {
+		_ = conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseMessageTooBig, "read limited at 32769 bytes"),
+			time.Now().Add(2*time.Second))
+		time.Sleep(200 * time.Millisecond)
+	})
+	a := NewWithBase(srv.URL, nil)
+	cred := channel.Credential{UID: "u1", AccessToken: "tok"}
+	stream, err := a.Chat(context.Background(), &cred, channel.ChatRequest{
+		Model:    "pro",
+		Messages: []channel.Message{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("建流不该失败：%v", err)
+	}
+	_, err = drainStream(stream)
+	_ = stream.Close()
+
+	k, ok := errs.KindOf(err)
+	if !ok || k != errs.PromptTooLong {
+		t.Fatalf("close 1009 应归 PromptTooLong，实际 %v", err)
+	}
+	var e *errs.Error
+	if !errors.As(err, &e) || !strings.Contains(e.Upstream, "read limited at 32769 bytes") {
+		t.Fatalf("必须透传上游原话，实际 %v", err)
+	}
+}
+
+// 重挂上游会话时上游会重放历史（replay_start → replay_end）：
+// 重放区间的帧既不能当正文吐给客户端，也不能让里面的 idle 把本轮提前结束掉。
+func TestReplayFramesAreNotTakenAsThisTurnOutput(t *testing.T) {
+	_, srv := newUpstreamStub(t, func(conn *websocket.Conn, _ int) {
+		writeFrame(t, conn, 0, "replay_start", map[string]any{})
+		writeFrame(t, conn, 1, "session/update", map[string]any{
+			"update": map[string]any{
+				"sessionUpdate": "agent_message_chunk",
+				"messageId":     "old",
+				"content":       map[string]any{"text": "上一轮的旧内容", "type": "text"},
+			},
+		})
+		writeFrame(t, conn, 2, "session_status", map[string]any{"sessionStatus": "running"})
+		writeFrame(t, conn, 3, "session_status", map[string]any{"sessionStatus": "idle"})
+		writeFrame(t, conn, 4, "replay_end", map[string]any{})
+		writeFrame(t, conn, 5, "session_status", map[string]any{"sessionStatus": "running"})
+		writeFrame(t, conn, 6, "session/update", map[string]any{
+			"update": map[string]any{
+				"sessionUpdate": "agent_message_chunk",
+				"messageId":     "new",
+				"content":       map[string]any{"text": "本轮内容", "type": "text"},
+			},
+		})
+		writeFrame(t, conn, 7, "session_status", map[string]any{"sessionStatus": "idle"})
+	})
+	a := NewWithBase(srv.URL, nil)
+	cred := channel.Credential{UID: "u1", AccessToken: "tok"}
+	stream, err := a.Chat(context.Background(), &cred, channel.ChatRequest{
+		Model:    "pro",
+		Messages: []channel.Message{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("建流不该失败：%v", err)
+	}
+	got, err := drainStream(stream)
+	_ = stream.Close()
+	if err != nil {
+		t.Fatalf("读流失败：%v", err)
+	}
+	if got != "本轮内容" {
+		t.Fatalf("重放区间的帧不得进入本轮输出（也不能让重放里的 idle 提前结束本轮），实际正文 %q", got)
+	}
+}
+
+// 用户真实场景：历史很大（这里把 40KB 塞进系统段，模拟 Hermes 那种很长的 system/tools 说明）
+// 而新问题很短，且系统提示这一轮还变了。
+// 必须靠复用只发最新一轮；系统段补发放不下时退回「只发最新一轮」，而不是把整轮打死。
+func TestResumeSurvivesHugeHistoryAndHugeSystemPrompt(t *testing.T) {
+	stub, srv := newUpstreamStub(t, nil)
+	a := NewWithBase(srv.URL, nil)
+	cred := channel.Credential{UID: "u1", AccessToken: "tok"}
+	ctx := context.Background()
+
+	u1 := channel.Message{Role: "user", Content: "第一问"}
+	first, err := a.Chat(ctx, &cred, channel.ChatRequest{Model: "flash", Messages: []channel.Message{u1}})
+	if err != nil {
+		t.Fatalf("第一轮不该失败：%v", err)
+	}
+	got1, err := drainStream(first)
+	if err != nil {
+		t.Fatalf("第一轮读流失败：%v", err)
+	}
+	_ = first.Close()
+
+	u2 := channel.Message{Role: "user", Content: "第二问"}
+	second, err := a.Chat(ctx, &cred, channel.ChatRequest{Model: "flash", Messages: []channel.Message{
+		u1, {Role: "assistant", Content: got1}, u2,
+	}})
+	if err != nil {
+		t.Fatalf("第二轮不该失败：%v", err)
+	}
+	got2, err := drainStream(second)
+	if err != nil {
+		t.Fatalf("第二轮读流失败：%v", err)
+	}
+	_ = second.Close()
+
+	// 40KB 的系统段：远超 32768 字节单帧上限。
+	filler := strings.Repeat("很长的系统说明文本。", 40*1024/len("很长的系统说明文本。")+1)
+	u3 := channel.Message{Role: "user", Content: "最后确认：答案是什么？"}
+	third, err := a.Chat(ctx, &cred, channel.ChatRequest{Model: "flash", Messages: []channel.Message{
+		{Role: "system", Content: "你是测试助手。" + filler},
+		u1, {Role: "assistant", Content: got1}, u2, {Role: "assistant", Content: got2}, u3,
+	}})
+	if err != nil {
+		t.Fatalf("长历史 + 大系统提示不该把整轮打死（应复用会话只发最新一轮），实际：%v", err)
+	}
+	if _, err := drainStream(third); err != nil {
+		t.Fatalf("第三轮读流失败：%v", err)
+	}
+	_ = third.Close()
+
+	creates, prompts, _ := stub.snapshot()
+	if creates != 1 {
+		t.Fatalf("三轮应只有一个上游会话，实际建了 %d 次", creates)
+	}
+	if len(prompts) != 3 {
+		t.Fatalf("应发出三轮 prompt，实际 %d 条", len(prompts))
+	}
+	if prompts[2] != u3.Content {
+		t.Fatalf("系统段补发放不下时应退回「只发最新一轮」，实际 %q", prompts[2])
 	}
 }
