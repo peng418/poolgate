@@ -82,7 +82,7 @@ M="$PKG/manifest"
   printf 'service_port          = %s\n'   "$PORT"
   printf 'desktop_uidir         = ui\n'
   printf 'desktop_applaunchname = %s.main\n' "$APPNAME"
-  printf 'changelog = DeepSeek 手机号+短信验证码登录（打通数美人机校验）：① 面板内嵌数美验证控件完成「空间点选」人机校验——用户在 PoolGate 自己的界面里点一下图（题目形如「点击图中最小的蓝色三棱锥」），控件给的凭据由服务端原样转发，走的是真实登录流程 ② 新增 channel.StageWidget / WidgetShumei / FieldWidgetResult 通用「交互控件」接口（核心层与前端都不认识数美，参数由渠道给出并原样透传）③ 短信登录从 0.8.0 的「默认关闭」改为默认开启并作为主推路径（密码全程不落盘）④ 授权流程改为「填手机号 → 过人机校验 → 发码 → 填验证码 → 登录」⑤ 修复控件回调误判（initSMCaptcha 第 2 个参数是控件实例、不是成功回调，之前每次挂载都被判「没通过」）⑥ 控件结果被上游拒时留在原地换一题重试，不把用户弹回开头 ⑦ 短信路径若凭据失效，错误文案给出可执行动作（重新点一次题目） | FPK %s\n' "$VERSION"
+  printf 'changelog = 修 0.9.0 真机暴露的四个问题（DeepSeek 短信登录）：① 登录那一步报「上游原话：Missing Header」——根因是登录类接口（login_by_mobile_sms / create_sms_verification_code）在没登录时还必须带一个「游客 PoW」头 X-DS-Guest-PoW-Response，0.9.0 没带；现在按官方白名单为这几个接口逐个取挑战（POST /users/create_guest_challenge）并用内置 WASM 解出来再带上，发码那一步之前是「碰巧」过的（它的挑战难度只有 20，登录那一步是 80000，必挂）② 「点完图验要等很久才跳下一屏」——过校验后立刻把控件压暗并显示「校验已通过，正在发送验证码…」+ 转圈，不再让用户对着一个不动的题干瞪眼 ③ 验证码倒计时以前是写死在文案里的假数字；现在按上游给的重发窗口（send_window_secs）真每秒倒数，按钮上显示「N 秒后可重新获取」，归零才可点；点「重新获取」会退回人机校验那一屏重新签一个凭据（数美凭据是一次性的）④ 两屏样式重做（标题强调条 / 统一行距 / 按钮层级 / 纯 CSS 转圈 / 验证码字距）⑤ 修「换一题」按钮从来点不动（控件加载完成后状态一直停在 loading，按钮恒被禁用）⑥ 取不到或解不出 PoW 时，错误里直接说明真因（而不是把上游的 Missing Header 原样丢给用户）⑦ 上游说被拒的原因现在常驻在屏幕上，不再只在 toast 里闪一下 | FPK %s\n' "$VERSION"
 } >> "$M"
 chmod 0644 "$M"
 sed -n '1,20p' "$M" | sed 's/^/  /'

@@ -225,6 +225,29 @@ func (s *solver) powHeader(ctx context.Context, ch powChallenge) (string, error)
 	return base64.StdEncoding.EncodeToString(raw), nil
 }
 
+// guestPowHeader 计算出 `X-DS-Guest-PoW-Response` 的值：**base64(只含 salt/answer 的 JSON)**。
+//
+// 与 powHeader 唯一的区别就是载荷形状 —— 上游对「还没登录时的登录类接口」只收这两个
+// 字段（算法/挑战/签名它按 salt 自己反查）。但**难度一样是真难度**：实测
+// login_by_mobile_sms 的 difficulty=80000（发码接口只有 20），所以还是得老实跑 WASM，
+// 随便塞一个 answer 会被回 40301 INVALID_POW_RESPONSE。
+//
+// 编码与官方前端一致：bundle 里这一层是 `encoder: btoa` → 标准 base64（带 padding）。
+func (s *solver) guestPowHeader(ctx context.Context, ch powChallenge) (string, error) {
+	answer, ok, err := s.solve1(ctx, ch)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("PoW 无解（挑战参数可能已过期）")
+	}
+	raw, err := json.Marshal(map[string]any{"salt": ch.Salt, "answer": answer})
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(raw), nil
+}
+
 // loadWASM 下载并缓存 PoW WASM（失败要给可读原因：拿不到就没法对话，不能静默）。
 type wasmCache struct {
 	mu   sync.Mutex

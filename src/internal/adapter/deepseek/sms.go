@@ -62,6 +62,18 @@ const (
 	fieldAreaCode = "area_code"
 )
 
+// fieldStepAction / actionResend 是「重新获取验证码」用的保留键值。
+//
+// 面板把「用户点了个按钮」当普通表单值交上来，服务端按**当前步骤**决定它的含义 ——
+// 这样核心层的步骤协议不必为「重发」再多一种消息类型（红线三：新能力由渠道声明，
+// 不动核心也不动前端）。别的渠道不认识这个键，自然看不到这个按钮的语义，互不影响。
+//
+// 值固定为 1 而不是 true：表单值一路是 map[string]string，别引入第二种类型。
+const (
+	fieldStepAction = "step_action"
+	actionResend    = "1"
+)
+
 // smsScenario 是发码场景。官方前端用的字面量就是 "login"。
 const smsScenario = "login"
 
@@ -186,14 +198,14 @@ func (f *smsFlow) viewLocked() channel.StepView {
 			Message:     warn,
 		}
 	case stageCode:
-		hint := "验证码已发出，请查看手机短信。"
-		if f.resendAfter > 0 {
-			hint += fmt.Sprintf("（%d 秒内不要重复获取）", f.resendAfter)
-		}
+		// 这里**故意不写死秒数**。以前是「（%d 秒内不要重复获取）」把 60 硬贴在文案上，
+		// 那个数字在页面上不会变 —— 用户一眼就看出来是假的倒计时。
+		// 真正的倒计时由前端按 ResendAfterSecs 每秒刷新（按钮上显示「N 秒后可重新获取」）。
 		return channel.StepView{
 			Stage: channel.StageInput,
 			Title: "输入短信验证码",
-			Hint:  hint,
+			Hint: "验证码已发出，请查看手机短信。" +
+				"没收到可以点「重新获取」——重发要先再过一次人机校验（凭据是一次性的）。",
 			Fields: []channel.LoginField{
 				{Name: fieldSMSCode, Label: "验证码", Type: "text",
 					Placeholder: "6 位数字", Required: true},
@@ -237,6 +249,10 @@ func (f *smsFlow) Submit(values map[string]string) error {
 	case stageShumei:
 		return f.submitShumei(values)
 	case stageCode:
+		// 用户点的是「重新获取」而不是「登录」：交上来的不是验证码，是一个动作。
+		if values[fieldStepAction] == actionResend {
+			return f.resendCode()
+		}
 		return f.submitCode(values)
 	case stageDone:
 		return errs.New(errs.Parse, "这次登录已经完成过了").WithChannel(string(channel.DeepSeek))
@@ -346,6 +362,26 @@ func (f *smsFlow) submitShumei(values map[string]string) error {
 	f.mu.Lock()
 	f.resendAfter = window
 	f.step = stageCode
+	f.mu.Unlock()
+	return nil
+}
+
+// resendCode 处理「重新获取验证码」。
+//
+// 为什么是退回人机校验那一屏，而不是原地再调一次发码接口：
+// 数美的凭据**一次性**，而发码必须带一个新凭据 —— 所以「重发」在这条链路上的真实含义
+// 就是「再点一次题」。硬着头皮用旧凭据重发只会换来 RECAPTCHA_VERIFY_FAILED，
+// 让用户以为是自己手机号有问题。
+//
+// 退回之后面板不需要知道这层原因：它只按服务端回的 view 重绘，看到 widget 那一屏
+// 就把控件再挂一次（前端已有这条通用逻辑）。
+func (f *smsFlow) resendCode() error {
+	f.mu.Lock()
+	f.verify = nil
+	f.code = ""
+	f.message = ""
+	f.resendAfter = 0
+	f.step = stageShumei
 	f.mu.Unlock()
 	return nil
 }
@@ -518,6 +554,26 @@ func (a *Adapter) authCall(ctx context.Context, s smsSnapshot, path string, body
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
+	// 登录类接口必须先带「游客 PoW」头，否则上游一律回 40300 Missing Header。
+	//
+	// 这是真机踩出来的：不带时 login_by_mobile_sms 100% 失败，而错误文案
+	// 「Missing Header」看着像我们少传了字段，其实是少了一个请求头（详见 guestpow.go）。
+	// 挑战必须**每个接口现取现解**：难度是按接口定的（登录 80000 / 发码 20）。
+	//
+	// 取不到时不硬拦，但把原因留着：上游对难度低的接口（发码 20）有时仍会放行，
+	// 白丢一次机会不划算；万一真被 40300/40301 拒了，下面会把「其实是我们没带上 PoW」
+	// 的真相说出来 —— 只把 Missing Header 原样抛给用户，等于让他对着一个看不懂的英文
+	// 发呆（红线一：失败必须能解释自己）。
+	var powErr error
+	if needsGuestPow(path) {
+		h, perr := a.guestPow(ctx, s, path)
+		if perr != nil {
+			powErr = perr
+		} else {
+			req.Header.Set("X-DS-Guest-PoW-Response", h)
+		}
+	}
+
 	resp, err := a.clientFor(tmp).Do(req)
 	if err != nil {
 		return nil, 0, errs.New(errs.Transport, "上游请求失败").
@@ -525,6 +581,16 @@ func (a *Adapter) authCall(ctx context.Context, s smsSnapshot, path string, body
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+
+	// 上游说「缺 PoW 头 / PoW 结果不认」，而我们这边确实没带上 → 把真因说出来。
+	// （它能回 40300 说明请求本身没问题、就是少了那个头；此时不给真因，用户只会看到
+	// 一句 "Missing Header"，既不知道是谁的错也不知道下一步该做什么。）
+	if powErr != nil && powHeaderRejected(raw) {
+		return raw, resp.StatusCode, errs.New(errs.AuthFailed,
+			"上游要求 PoW 请求头（它回的是 Missing Header / POW_HEADER_ERROR），"+
+				"但这一步没能取到或解出挑战："+powErr.Error()).
+			WithChannel(string(channel.DeepSeek)).WithUpstream(truncate(string(raw), 200))
+	}
 
 	switch {
 	case resp.StatusCode == http.StatusUnprocessableEntity:
@@ -734,6 +800,12 @@ func smsMessage(code int, msg string) string {
 		return "这个号码被上游限制了登录"
 	case code == 40002:
 		return "上游要求先带令牌（Missing Token）"
+	case code == 40300:
+		// 这个码上游给的文案是 "Missing Header"，光看它完全猜不到是哪个头。
+		// 实测真身是缺 `X-DS-Guest-PoW-Response`（POW_HEADER_ERROR），见 guestpow.go。
+		return "上游说缺请求头（Missing Header / POW_HEADER_ERROR）：这一步必须先解一个 PoW 挑战再带上，请重试；若一直这样请把日志发我"
+	case code == 40301:
+		return "上游不认这次的 PoW 结果（INVALID_POW_RESPONSE），请重试"
 	case code == 40003:
 		return "上游拒绝了这次请求（Authorization Failed）"
 	case code == 40029:

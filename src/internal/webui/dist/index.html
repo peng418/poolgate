@@ -62,22 +62,42 @@
 .cb-paste{max-width:100%;margin-top:12px;border:1px solid var(--border);border-radius:9px;padding:10px 12px;background:var(--surface-2)}
 .cb-paste summary{cursor:pointer;font-size:12.5px;color:var(--ink-2)}
 .cb-paste[open] summary{color:var(--ink)}
-/* 账号密码直登表单：与粘贴区视觉同级，入口更靠前（推荐路径） */
-.direct-login{max-width:100%;margin-top:12px;border:1px solid var(--border);border-radius:9px;padding:12px;background:var(--surface-2)}
-.direct-login .dl-title{font-size:12.5px;font-weight:600;color:var(--ink);margin-bottom:10px}
+/* 账号密码直登 / 多步验证码登录：与粘贴区视觉同级，入口更靠前（推荐路径）。
+   2026-09-26 重做：加了标题强调条、统一的行距/间距、真正的倒计时按钮、发码中的转圈，
+   并把「说明文字」从按钮旁边挪成独立一行（挤在按钮右边既难读又占宽度）。 */
+.direct-login{max-width:100%;margin-top:12px;border:1px solid var(--border);border-radius:10px;padding:14px;background:var(--surface-2)}
+.direct-login .dl-title{display:flex;align-items:center;gap:7px;font-size:13px;font-weight:600;color:var(--ink);margin-bottom:10px}
+.direct-login .dl-title::before{content:"";flex:0 0 3px;width:3px;height:13px;border-radius:2px;background:var(--ink-2)}
+.direct-login .dl-hint{font-size:12.5px;line-height:1.65;color:var(--ink-2);margin:0 0 11px}
+.direct-login .dl-hint-quiet{opacity:.75;margin:9px 0 0}
+.direct-login .dl-hint-bad{color:var(--danger,#c0392b);margin:9px 0 0}
 .direct-login .dl-row{display:flex;align-items:center;gap:10px;margin-bottom:8px}
 .direct-login .dl-row>label:first-child{flex:0 0 92px;font-size:12.5px;color:var(--ink-2)}
 .direct-login .dl-row input[type=text],.direct-login .dl-row input[type=password]{flex:1 1 auto;min-width:0}
+/* 验证码输入：字距稍微拉开 + 等宽数字，一眼看出「这里填 6 位数字」。
+   注意字距会作用到 placeholder 上，所以别拉太开（拉太开 placeholder 会变成「6 位 数 字」）。 */
+.direct-login .dl-row input#st-sms_verification_code{letter-spacing:.18em;font-variant-numeric:tabular-nums}
 .direct-login .dl-check{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--ink-2);cursor:pointer}
 .direct-login .dl-check input{width:auto}
+/* 按钮行：一律换行不挤压（窄屏上两个按钮并排会把文字折成两行）。 */
+.direct-login .dl-actions{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-top:12px}
+.direct-login .dl-actions .btn{white-space:nowrap}
+.direct-login .dl-status{display:flex;align-items:center;gap:8px;font-size:12.5px;line-height:1.6;color:var(--ink-2);margin-top:11px}
+/* 纯 CSS 转圈，不引图标库（自带资源越少越好）。 */
+.direct-login .spinner{flex:0 0 12px;width:12px;height:12px;border:2px solid var(--border);
+  border-top-color:var(--ink-2);border-radius:50%;animation:dl-spin .8s linear infinite}
+@keyframes dl-spin{to{transform:rotate(360deg)}}
 /* 图片验证码：图片按原始尺寸显示，不拉伸（拉糊了用户就看不清字符了） */
 .direct-login .captcha-img{display:block;margin:0 0 10px;max-width:100%;height:auto;
   border:1px solid var(--border);border-radius:6px;background:#fff;image-rendering:crisp-edges}
-/* 交互控件（数美人机校验）的挂载点。控件自己会往里插 DOM 并设宽度，
-   这里只保证：有最小高度（不然加载过程中面板会抖）、超宽能横向滚动（窄屏手机上
-   控件按固定像素布局，不给滚动会被裁掉右边的图形，用户就点不全了）。 */
+/* 交互控件（数美人机校验）的挂载点。控件自己会往里插 DOM 并设宽度，这里只保证：
+   （1）有最小高度（不然加载过程中面板会抖）；
+   （2）超宽能横向滚动（窄屏手机上控件按固定像素布局，不给滚动会被裁掉右边的图形，用户就点不全了）；
+   （3）「提交中」把它压暗，让「已经过了、正在发码」这件事立刻看得见 ——
+        这一步要等我们→上游一个来回（含 PoW 求解），没有反馈用户会以为点空了。 */
 .direct-login .widget-host{min-height:60px;overflow-x:auto;overflow-y:hidden;
-  display:flex;justify-content:center}
+  display:flex;justify-content:center;transition:opacity .15s ease}
+.direct-login .widget-host.submitting{opacity:.35;pointer-events:none}
 
 /* 覆盖层自己滚：内容高过视口时不该把整页撑长（否则背后页面能被滑出来）。 */
 .auth-main{padding:22px 18px 40px}
@@ -288,20 +308,30 @@
                加一步、减一步、插一步图片验证码，都是服务端说了算 —— 前端不用改。 -->
           <div class="direct-login" v-if="authStep && authStep.stage==='input'">
             <div class="dl-title">{{ authStep.title || '验证' }}</div>
-            <div class="sub" v-if="authStep.hint" style="margin:0 0 10px">{{ authStep.hint }}</div>
+            <div class="dl-hint" v-if="authStep.hint">{{ authStep.hint }}</div>
+            <!-- 上一次为什么被拒：必须留在屏幕上（红线一），不能只在 toast 里闪一下 ——
+                 用户还没看清就没了，然后对着一个空输入框猜自己错在哪。 -->
+            <div class="dl-hint dl-hint-bad" v-if="authStep.message">{{ authStep.message }}</div>
             <div class="dl-row" v-for="f in (authStep.fields||[])" :key="f.name">
               <label :for="'st-'+f.name">{{ f.label }}</label>
               <input :id="'st-'+f.name" type="text" v-model="stepForm[f.name]"
                 :placeholder="f.placeholder||''" autocomplete="off"
                 inputmode="numeric" @keyup.enter="submitStep">
             </div>
-            <div class="row" style="margin-top:10px;align-items:center;gap:10px">
+            <div class="dl-actions">
               <button class="btn primary" @click="submitStep" :disabled="busy">
                 {{ authStep.submit_label || '提交' }}</button>
-              <button class="btn" v-if="authStep.resend_after_secs>0" @click="submitStep"
-                :disabled="busy" title="重新获取验证码">重新获取</button>
-              <span class="hint" style="margin:0">验证码只用于登录，不会显示或保存在页面上。</span>
+              <!-- 「重新获取」：倒计时**真的在走**（秒数由服务端给的重发窗口驱动，每秒 -1），
+                   归零之前点不动。点了也不是原地重发，而是**退回人机校验那一屏** ——
+                   数美的凭据是一次性的，重发必须先重新签一个（服务端决定，面板照回显渲染）。 -->
+              <button class="btn" v-if="authStep.resend_after_secs>0" @click="resendStep"
+                :disabled="busy||resendLeft>0"
+                :title="resendLeft>0 ? ('还要等 '+resendLeft+' 秒（上游限制同号重复索取）') : '重新获取（要先再过一次人机校验）'">
+                <template v-if="resendLeft>0">{{ resendLeft }} 秒后可重新获取</template>
+                <template v-else>重新获取</template>
+              </button>
             </div>
+            <div class="dl-hint dl-hint-quiet">验证码只用于登录，不会显示或保存在页面上。</div>
           </div>
 
           <!-- 图片验证码（上游按风控开启）：把图直接显示出来，用户看图填字。
@@ -333,15 +363,20 @@
                合法凭据。挂控件才是原路走一遍真实登录，只是界面换成我们自己的。 -->
           <div class="direct-login" v-if="authStep && authStep.stage==='widget'">
             <div class="dl-title">{{ authStep.title || '人机校验' }}</div>
-            <div class="sub" v-if="authStep.hint" style="margin:0 0 10px">{{ authStep.hint }}</div>
-            <div id="shumei-host" class="widget-host"></div>
-            <div class="sub" v-if="widgetMsg" style="margin:8px 0 0">{{ widgetMsg }}</div>
-            <div class="sub" v-if="authStep.message" style="margin:8px 0 0;color:var(--danger,#c0392b)">{{ authStep.message }}</div>
-            <div class="row" style="margin-top:10px;align-items:center;gap:10px">
-              <button class="btn" @click="remountWidget" :disabled="busy||widgetState==='loading'">
-                {{ widgetState==='error' ? '重新加载校验' : '换一题' }}</button>
-              <span class="hint" style="margin:0">校验由上游的人机验证服务提供；点完自动继续。</span>
+            <div class="dl-hint" v-if="authStep.hint">{{ authStep.hint }}</div>
+            <div id="shumei-host" class="widget-host"
+              :class="{submitting: widgetState==='submitting'}"></div>
+            <div class="dl-status" v-if="widgetMsg">
+              <span class="spinner" v-if="widgetState==='loading'||widgetState==='submitting'"></span>
+              <span>{{ widgetMsg }}</span>
             </div>
+            <div class="dl-hint dl-hint-bad" v-if="authStep.message">{{ authStep.message }}</div>
+            <div class="dl-actions">
+              <button class="btn" @click="remountWidget"
+                :disabled="busy||widgetState==='loading'||widgetState==='submitting'">
+                {{ widgetState==='error' ? '重新加载校验' : '换一题' }}</button>
+            </div>
+            <div class="dl-hint dl-hint-quiet">校验由上游的人机验证服务提供；点完自动继续。</div>
           </div>
 
           <!-- 验证码已发出：显示等待/倒计时提示（真正的输入在下一屏）。 -->
@@ -1479,7 +1514,7 @@ createApp({
     // 值是 JSON 字符串（如 {"region":"CN","rid":"…"}），内容由渠道定义，面板只负责搬运。
     const widgetResultKey='captcha_result';
     // widget* 是人机校验控件的挂载状态：
-    //   widgetState: '' | 'loading' | 'ready' | 'error'
+    //   widgetState: '' | 'loading' | 'ready' | 'submitting' | 'error'
     //   widgetMsg   : 给用户看的一句话（加载中/已通过/为什么失败）
     //   widgetResult: 控件成功回调给的对象（含 rid）—— 只活在内存里，用完即弃，不写 localStorage
     const widgetState=ref('');
@@ -1488,6 +1523,42 @@ createApp({
     // widgetMountedFor 记录「已经为哪一屏挂过控件」，避免每次重绘都重挂
     // （重挂会换题，用户刚看清的题就没了）。
     let widgetMountedFor='';
+    // resendLeft 是「重新获取验证码」的剩余秒数。
+    //
+    // 为什么要有它：以前是把 60 直接写进提示文案（「60 秒内不要重复获取」），
+    // 那个数字在屏幕上一动不动 —— 用户一眼就看出是假的。现在秒数由服务端
+    // 回的重发窗口（resend_after_secs，上游给的 send_window_secs）启动，每秒真减，
+    // 归零才让按钮可点。上游没给窗口（0）时就不显示倒计时，**不自己编一个数**。
+    const resendLeft=ref(0);
+    let resendTimer=null;
+    // stopResendTimer 会连 resendLeft 一起清零，免得下一次进屏时残留上一轮的数字。
+    const stopResendTimer=()=>{if(resendTimer){clearInterval(resendTimer);resendTimer=null;}resendLeft.value=0;};
+    const startResendTimer=secs=>{
+      stopResendTimer();
+      if(!secs||secs<=0)return;
+      resendLeft.value=Math.floor(secs);
+      resendTimer=setInterval(()=>{
+        resendLeft.value-=1;
+        if(resendLeft.value<=0)stopResendTimer();
+      },1000);
+    };
+    // resendStep 点「重新获取」：把「用户点了这个按钮」当一个普通表单值交上去，
+    // 由**服务端按当前步骤**决定它的含义（DeepSeek 那边是退回人机校验那一屏，
+    // 因为数美凭据是一次性的，重发必须先重新签一个）。面板不认识这个语义，
+    // 只管把服务端回的下一屏渲染出来 —— 渠道换实现，这里不用改。
+    const resendStep=async()=>{
+      if(busy.value||resendLeft.value>0)return;
+      busy.value=true;
+      try{
+        const r=await post('/api/login/step',{values:{step_action:'1'}});
+        applyStep(r&&r.step);
+        toast('要重新获取，得先再过一次人机校验');
+      }catch(e){
+        toast((e&&e.message)?e.message:'重新获取失败');
+      }finally{
+        busy.value=false;
+      }
+    };
     let authTimer=null, authLeft=0;
 
     // ---------- 面板入口开关 ----------
@@ -1928,7 +1999,10 @@ createApp({
           const done=(fn,v)=>{if(settled)return;settled=true;fn(v);};
           try{
             if(typeof inst.onReady==='function'){
-              inst.onReady(()=>{if(!settled)widgetMsg.value='请在图中点一下题目要求的图形';});
+              // onReady 之后状态必须从 loading 落下来。以前一直停在 loading，
+              // 结果「换一题」按钮的条件（disabled 判 loading）永远是禁用的 ——
+              // 用户看到一个永远点不动的按钮。只有真机浏览器跑一遍才看得出来。
+              inst.onReady(()=>{if(!settled){widgetState.value='ready';widgetMsg.value='请在图中点一下题目要求的图形';}});
             }
             inst.onSuccess(r=>{
               if(r&&r.pass)done(resolve,r);
@@ -1944,7 +2018,11 @@ createApp({
         });
 
         widgetResult.value=res;
-        widgetState.value='ready';
+        // 状态用 submitting（不是 ready）：从「用户点对了」到「验证码屏出现」之间
+        // 还有一次我们→上游的往返（取挑战 + 解 PoW + 发码），几百毫秒到几秒。
+        // 这段时间必须让用户看见「已经过了、正在发码」—— 模板据此把控件压暗并转圈，
+        // 否则控件停在原地一动不动，用户会以为自己的那一下点空了。
+        widgetState.value='submitting';
         widgetMsg.value='校验已通过，正在发送验证码…';
         // 点完自动继续：用户点这一下就是为了发码，不该再让他多按一次。
         submitStep();
@@ -2014,14 +2092,24 @@ createApp({
     const applyStep=st=>{
       authStep.value=st&&st.stage?st:null;
       if(!authStep.value){
-        // 离开多步流程：把控件状态一并清干净，别让下一轮看到上一轮的痕迹。
+        // 离开多步流程：把控件状态与倒计时一并清干净，别让下一轮看到上一轮的痕迹。
         widgetMountedFor='';widgetState.value='';widgetMsg.value='';widgetResult.value=null;
+        stopResendTimer();
         return;
       }
       const keep={};
       for(const f of (authStep.value.fields||[]))if(stepForm[f.name]!=null)keep[f.name]=stepForm[f.name];
       for(const k of Object.keys(stepForm))delete stepForm[k];
       for(const k of Object.keys(keep))stepForm[k]=keep[k];
+      // 倒计时跟着「这一屏」走：验证码屏按服务端给的重发窗口开跑，离开这一屏就停。
+      // 注意「已经在跑就别重置」—— 验证码填错时服务端会把同一屏再回一次，
+      // 那时把倒计时跳回 60 秒就是在骗人（用户明明已经等了一会儿）。
+      const rs=authStep.value.resend_after_secs||0;
+      if(authStep.value.stage==='input'&&rs>0){
+        if(!resendTimer)startResendTimer(rs);
+      }else{
+        stopResendTimer();
+      }
       if(authStep.value.stage!=='widget'){
         // 离开控件屏（发码成功 → 验证码屏）：同样的清理，否则残留的 rid 会被
         // 误当成「已通过校验」，用户看到「校验已通过」却还没发码。
@@ -2638,8 +2726,9 @@ createApp({
       hasDirectLogin,loginFields,loginForm,submitPassword,
       authStep,stepForm,captchaField,submitStep,applyStep,
       // 交互控件（人机校验）的挂载状态：模板用它显示「正在加载 / 已通过 / 为什么失败」。
-      // 挂载与提交逻辑在内部，不必透出；这三个是模板直接读/点的。
-      widgetState,widgetMsg,remountWidget,
+      // 挂载与提交逻辑在内部，不必透出；这几个是模板直接读/点的。
+      // resendLeft/resendStep 是「重新获取验证码」的真倒计时与点击处理。
+      widgetState,widgetMsg,remountWidget,resendLeft,resendStep,
       channelName,channelClass,icoOf,pickChannels,statusPill,statusIcon,statusText,sevLabel,
       accountPill,accountIcon,accountText,checkinPill,checkinText,logPill,logIcon,logText,accountSections,catOf,
       srcLabel,humanCtx,capsText,shortUid,fmtNum,fmtTime,fmtDate,barPct,barColor,

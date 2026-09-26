@@ -34,9 +34,16 @@ type Adapter struct {
 	solver   powSolver // 可注入（测试用桩；生产是 wazero 实现）
 }
 
-// powSolver 解一次 PoW 并给出 X-Ds-Pow-Response 头值。
+// powSolver 解一次 PoW 并给出对应的请求头值。
+//
+// 两种载荷形状是上游定的，别合并：
+//   - powHeader      → `X-Ds-Pow-Response`（已登录的聊天接口，6 个字段）
+//   - guestPowHeader → `X-DS-Guest-PoW-Response`（**没登录时的登录类接口**，只有 salt/answer）
+//
+// 哈希算法是同一种（DeepSeekHashV1），所以求解本身共用；差别只在往头里塞哪些字段。
 type powSolver interface {
 	powHeader(ctx context.Context, ch powChallenge) (string, error)
+	guestPowHeader(ctx context.Context, ch powChallenge) (string, error)
 }
 
 func New() *Adapter {
@@ -263,22 +270,25 @@ func (a *Adapter) powChallenge(ctx context.Context, c *channel.Credential) (powC
 	return out.Data.BizData.Challenge, nil
 }
 
-// solvePow 解挑战并返回 X-Ds-Pow-Response 头（求解器按需下载 WASM 并缓存）。
-func (a *Adapter) solvePow(ctx context.Context, c *channel.Credential, ch powChallenge) (string, error) {
+// ensureSolver 保证求解器就绪（WASM 按需下载并缓存；并发下只初始化一次）。
+//
+// 抽出来是因为现在有两个入口要解挑战：聊天（已登录，powHeader）和
+// 登录类接口（游客，guestPowHeader）。WASM 只该下载一份。
+func (a *Adapter) ensureSolver(ctx context.Context, c *channel.Credential) (powSolver, error) {
 	a.solverMu.Lock()
 	haveSolver := a.solver != nil
 	a.solverMu.Unlock()
 	if !haveSolver {
 		raw, err := a.wasm.get(ctx, a.clientFor(c), a.wasmURL)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 		a.solverMu.Lock()
 		if a.solver == nil {
 			s, err := newSolver(ctx, raw)
 			if err != nil {
 				a.solverMu.Unlock()
-				return "", errs.New(errs.Parse, "初始化 PoW 求解器失败："+err.Error()).
+				return nil, errs.New(errs.Parse, "初始化 PoW 求解器失败："+err.Error()).
 					WithChannel(string(channel.DeepSeek))
 			}
 			a.solver = s
@@ -288,6 +298,15 @@ func (a *Adapter) solvePow(ctx context.Context, c *channel.Credential, ch powCha
 	a.solverMu.Lock()
 	s := a.solver
 	a.solverMu.Unlock()
+	return s, nil
+}
+
+// solvePow 解挑战并返回 X-Ds-Pow-Response 头（求解器按需下载 WASM 并缓存）。
+func (a *Adapter) solvePow(ctx context.Context, c *channel.Credential, ch powChallenge) (string, error) {
+	s, err := a.ensureSolver(ctx, c)
+	if err != nil {
+		return "", err
+	}
 
 	powCtx, cancel := context.WithTimeout(ctx, powTimeout)
 	defer cancel()

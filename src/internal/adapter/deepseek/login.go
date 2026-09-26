@@ -67,11 +67,12 @@ type session struct {
 // StartLogin 返回「去这儿登录」的地址（粘贴路径用），并按可用性决定默认路径。
 //
 // 路径优先级：
-//  ① 短信验证码（SMSLoginAvailable 时）—— 最省事：只需手机号 + 收一条短信，
-//     **密码全程不落盘**。中间那道数美人机校验由面板挂控件完成（见 sms.go），
-//     用户点一下就过。**这是当前主推**；
-//  ② 账号密码直登 —— 不想收短信时用；勾「记住密码」可自动续期，代价是密码留存；
-//  ③ 粘贴 userToken —— 既不想给密码、也不想收短信时的兜底。
+//
+//	① 短信验证码（SMSLoginAvailable 时）—— 最省事：只需手机号 + 收一条短信，
+//	   **密码全程不落盘**。中间那道数美人机校验由面板挂控件完成（见 sms.go），
+//	   用户点一下就过。**这是当前主推**；
+//	② 账号密码直登 —— 不想收短信时用；勾「记住密码」可自动续期，代价是密码留存；
+//	③ 粘贴 userToken —— 既不想给密码、也不想收短信时的兜底。
 func (a *Adapter) StartLogin(context.Context, channel.LoginOptions) (channel.LoginSession, error) {
 	s := &session{a: a}
 	if SMSLoginAvailable {
@@ -504,9 +505,10 @@ func shortHash(s string) string {
 }
 
 // 编译期断言：三条登录路径的能力都必须在。
-//   ① StepAcceptor     —— 手机号 + 短信验证码（默认路径，含图验那一屏）
-//   ② PasswordAcceptor —— 账号 + 密码（可选）
-//   ③ CallbackAcceptor —— 粘贴 userToken（可选兜底）
+//
+//	① StepAcceptor     —— 手机号 + 短信验证码（默认路径，含图验那一屏）
+//	② PasswordAcceptor —— 账号 + 密码（可选）
+//	③ CallbackAcceptor —— 粘贴 userToken（可选兜底）
 var (
 	_ channel.StepAcceptor     = (*session)(nil)
 	_ channel.PasswordAcceptor = (*session)(nil)

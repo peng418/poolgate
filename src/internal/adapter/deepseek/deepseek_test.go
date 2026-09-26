@@ -25,6 +25,13 @@ func (s *stubSolver) powHeader(_ context.Context, ch powChallenge) (string, erro
 	return "c3R1Yi1wb3c=", nil
 }
 
+// guestPowHeader 是游客 PoW 的桩：返回一个可识别的固定值，测试据此断言
+// 「登录类请求确实带上了 X-DS-Guest-PoW-Response」。
+func (s *stubSolver) guestPowHeader(_ context.Context, ch powChallenge) (string, error) {
+	s.got = ch
+	return "c3R1Yi1ndWVzdA==", nil
+}
+
 // patch 协议：初始快照 + APPEND 文本 + THINK/RESPONSE 分流 + status 收尾。
 func TestPatchStateMachine(t *testing.T) {
 	state := &patchState{}

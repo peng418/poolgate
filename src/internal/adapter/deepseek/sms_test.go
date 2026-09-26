@@ -46,18 +46,28 @@ const sendOK = `{"code":0,"msg":"","data":{"biz_code":0,"biz_msg":"","biz_data":
 // loginOK 是短信登录成功的上游信封（token 在 data.biz_data.user_token，与密码路径同形）。
 const loginOK = `{"code":0,"msg":"","data":{"biz_code":0,"biz_msg":"","biz_data":{"user_token":"tok-from-sms-abcdefghijklmnop"}}}`
 
-// smsServer 起一个「发码必成功、登录必成功」的桩上游，并把收到的请求体记下来。
-func smsServer(t *testing.T) (*httptest.Server, *[]map[string]any, *[]string) {
+// guestChallengeOK 是游客 PoW 挑战的桩响应（形状与真上游一致，数值随便取）。
+const guestChallengeOK = `{"code":0,"msg":"","data":{"biz_code":0,"biz_msg":"","biz_data":{"guest_challenge":{"algorithm":"DeepSeekHashV1","challenge":"3d7f80d6a5fe3a1aa05384d8599fb89df8438dcdf85c306e4ec2059888a0eb38","salt":"c19bfb47645d6f99e749","signature":"6529368e1b534e6a9679a513ae570a548ccdcb82f5b9be4eb25468ab9be2a149","difficulty":80000,"expire_at":1790426441746,"expire_after":300000,"target_path":"/v0/users/login_by_mobile_sms"}}}}`
+
+// smsServer 起一个「发码必成功、登录必成功」的桩上游，并把收到的请求体/路径/请求头记下来。
+//
+// 注意 paths 记的是**全部**请求，包括登录类接口前面那一步取游客 PoW 挑战
+// （/users/create_guest_challenge）—— 那是真实协议的一部分，不该在测试里藏起来。
+func smsServer(t *testing.T) (*httptest.Server, *[]map[string]any, *[]string, *[]http.Header) {
 	t.Helper()
 	bodies := &[]map[string]any{}
 	paths := &[]string{}
+	hdrs := &[]http.Header{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		var m map[string]any
 		_ = json.Unmarshal(raw, &m)
 		*bodies = append(*bodies, m)
 		*paths = append(*paths, r.URL.Path)
+		*hdrs = append(*hdrs, r.Header.Clone())
 		switch r.URL.Path {
+		case "/users/create_guest_challenge":
+			io.WriteString(w, guestChallengeOK)
 		case "/users/create_sms_verification_code":
 			io.WriteString(w, sendOK)
 		case "/users/login_by_mobile_sms":
@@ -69,7 +79,31 @@ func smsServer(t *testing.T) (*httptest.Server, *[]map[string]any, *[]string) {
 			http.NotFound(w, r)
 		}
 	}))
-	return srv, bodies, paths
+	return srv, bodies, paths, hdrs
+}
+
+// bodyFor 取出某个路径对应的请求体（测试里不按下标硬取，免得插一步就全错位）。
+func bodyFor(t *testing.T, paths *[]string, bodies *[]map[string]any, path string) map[string]any {
+	t.Helper()
+	for i, p := range *paths {
+		if p == path {
+			return (*bodies)[i]
+		}
+	}
+	t.Fatalf("调用序列 %v 里没有 %s", *paths, path)
+	return nil
+}
+
+// headerFor 取出某个路径对应的请求头。
+func headerFor(t *testing.T, paths *[]string, hdrs *[]http.Header, path string) http.Header {
+	t.Helper()
+	for i, p := range *paths {
+		if p == path {
+			return (*hdrs)[i]
+		}
+	}
+	t.Fatalf("调用序列 %v 里没有 %s", *paths, path)
+	return nil
 }
 
 // TestSMSShumeiWidgetBranch 人机校验那一屏必须是「挂数美控件」，不是「显示一张图」。
@@ -78,7 +112,7 @@ func smsServer(t *testing.T) (*httptest.Server, *[]map[string]any, *[]string) {
 // 服务端既拿不到唯一正确答案、也造不出合法凭据，所以只能把控件原样挂到面板里，
 // 把控件给的 rid 转发出去。这条测试把整条链路（控件屏 → rid → 发码）钉死。
 func TestSMSShumeiWidgetBranch(t *testing.T) {
-	srv, bodies, paths := smsServer(t)
+	srv, bodies, paths, hdrs := smsServer(t)
 	defer srv.Close()
 
 	a := newTestAdapter(t, srv.URL)
@@ -127,13 +161,19 @@ func TestSMSShumeiWidgetBranch(t *testing.T) {
 	if v = f.Step(); v.Stage != channel.StageInput || v.Fields[0].Name != fieldSMSCode {
 		t.Fatalf("过校验后应当到验证码屏，实际：stage=%q fields=%+v", v.Stage, v.Fields)
 	}
-	if len(*paths) != 1 || (*paths)[0] != "/users/create_sms_verification_code" {
-		t.Fatalf("应当只打了一次发码接口，实际 %v", *paths)
+	if !equalPaths(*paths, []string{"/users/create_guest_challenge", "/users/create_sms_verification_code"}) {
+		t.Fatalf("发码这一步的调用序列 = %v，想要先取游客 PoW 挑战再发码", *paths)
 	}
 	// 关键：发码请求里必须带着控件给的凭据。
-	verify, ok := (*bodies)[0]["shumei_verification"].(map[string]any)
+	verify, ok := bodyFor(t, paths, bodies, "/users/create_sms_verification_code")["shumei_verification"].(map[string]any)
 	if !ok {
-		t.Fatalf("发码请求里 shumei_verification 应当是对象，实际 %#v", (*bodies)[0]["shumei_verification"])
+		t.Fatalf("发码请求里 shumei_verification 应当是对象，实际 %#v",
+			bodyFor(t, paths, bodies, "/users/create_sms_verification_code")["shumei_verification"])
+	}
+	// 也必须带上 PoW 头：不带的话上游 100% 回 40300「Missing Header」
+	// （真机就是这么翻车的 —— 用户看到「验证码登录失败：上游原话：Missing Header」）。
+	if h := headerFor(t, paths, hdrs, "/users/create_sms_verification_code").Get("X-DS-Guest-PoW-Response"); h == "" {
+		t.Fatal("发码请求缺 X-DS-Guest-PoW-Response 头（上游会回 Missing Header）")
 	}
 	if verify["rid"] != rid {
 		t.Fatalf("shumei_verification.rid = %v, 想要 %q", verify["rid"], rid)
@@ -200,7 +240,7 @@ func TestSMSWidgetConfigIsComplete(t *testing.T) {
 // 而 shumei_verification 的**形状**（{region, rid} 对象，不是字符串、不是 null）
 // 也是实测出来的：传 null 过校验但被风控拦、传 {} 被 422 索要 rid/region。
 func TestSMSSendCarriesShumeiVerification(t *testing.T) {
-	srv, bodies, _ := smsServer(t)
+	srv, bodies, paths, _ := smsServer(t)
 	defer srv.Close()
 
 	a := newTestAdapter(t, srv.URL)
@@ -211,10 +251,17 @@ func TestSMSSendCarriesShumeiVerification(t *testing.T) {
 	if err := f.Submit(map[string]string{channel.FieldWidgetResult: widgetResult("RID-XYZ")}); err != nil {
 		t.Fatalf("提交控件结果失败：%v", err)
 	}
-	if len(*bodies) != 1 {
-		t.Fatalf("应当只发了一次码，实际 %d 次", len(*bodies))
+	// 发码只该发一次（取 PoW 挑战那一步不算发码）。
+	sent := 0
+	for _, p := range *paths {
+		if p == "/users/create_sms_verification_code" {
+			sent++
+		}
 	}
-	got := (*bodies)[0]
+	if sent != 1 {
+		t.Fatalf("应当只发了一次码，实际 %d 次（调用序列 %v）", sent, *paths)
+	}
+	got := bodyFor(t, paths, bodies, "/users/create_sms_verification_code")
 
 	if got["mobile_number"] != "13800138000" {
 		t.Errorf("mobile_number = %v, 想要 13800138000（官方字段名）", got["mobile_number"])
@@ -246,7 +293,7 @@ func TestSMSSendCarriesShumeiVerification(t *testing.T) {
 
 // TestSMSSubmitWidgetResultValidation 控件结果不合法时当场拦下，不打上游。
 func TestSMSSubmitWidgetResultValidation(t *testing.T) {
-	srv, _, paths := smsServer(t)
+	srv, _, paths, _ := smsServer(t)
 	defer srv.Close()
 
 	a := newTestAdapter(t, srv.URL)
@@ -314,7 +361,7 @@ func TestSMSStaleCredentialStaysOnWidgetStep(t *testing.T) {
 // TestSMSFlowStepProgression 走一遍完整正常流程：
 // 填手机号 → 人机校验 → 发码 → 验证码屏 → 填码 → 完成。
 func TestSMSFlowStepProgression(t *testing.T) {
-	srv, _, paths := smsServer(t)
+	srv, _, paths, _ := smsServer(t)
 	defer srv.Close()
 
 	a := newTestAdapter(t, srv.URL)
@@ -393,15 +440,14 @@ func TestSMSFlowStepProgression(t *testing.T) {
 		}
 	}
 
-	// ⑥ 上游调用序列正确：先发码，再登录（且各只一次）。
-	want := []string{"/users/create_sms_verification_code", "/users/login_by_mobile_sms"}
-	if len(*paths) != len(want) {
-		t.Fatalf("调用序列 = %v, 想要 %v", *paths, want)
+	// ⑥ 上游调用序列正确：每打一个登录类接口，前面都要先取一次游客 PoW 挑战
+	//    （挑战是「按接口 + 一次性」的，所以是 4 步而不是 2 步）。
+	want := []string{
+		"/users/create_guest_challenge", "/users/create_sms_verification_code",
+		"/users/create_guest_challenge", "/users/login_by_mobile_sms",
 	}
-	for i := range want {
-		if (*paths)[i] != want[i] {
-			t.Fatalf("调用序列 = %v, 想要 %v", *paths, want)
-		}
+	if !equalPaths(*paths, want) {
+		t.Fatalf("调用序列 = %v, 想要 %v", *paths, want)
 	}
 }
 
@@ -446,7 +492,7 @@ func TestSMSCodeErrorStaysOnSameStep(t *testing.T) {
 
 // TestSMSMobileValidation 手机号明显不对时当场拦下（不发请求）。
 func TestSMSMobileValidation(t *testing.T) {
-	srv, _, paths := smsServer(t)
+	srv, _, paths, _ := smsServer(t)
 	defer srv.Close()
 
 	a := newTestAdapter(t, srv.URL)
@@ -655,6 +701,160 @@ func TestDescribeValidationUnknownField(t *testing.T) {
 	// 已知字段给人话。
 	if got := describeValidation([]byte(`{"detail":[{"loc":"body.mobile_number"}]}`)); !strings.Contains(got, "手机号") {
 		t.Fatalf("手机号字段应当翻译，实际 %q", got)
+	}
+}
+
+// equalPaths 比较两条调用序列（测试里统一用它，避免散落的 len+下标断言）。
+func equalPaths(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestSMSLoginCarriesGuestPowHeader 短信登录那一步必须带「游客 PoW」头。
+//
+// 这条是**真机 Bug 的回归锁**：0.9.0 上线后用户实际登录时收到
+// 「验证码登录失败：上游原话：Missing Header」。
+// 上游的 40300 真名是 POW_HEADER_ERROR，缺的就是 `X-DS-Guest-PoW-Response`
+// —— 发码那一步当时「碰巧」过了（它的挑战难度只有 20，风控松），
+// 登录那一步（难度 80000）必挂。所以这里把登录这一步单独钉死，别再靠运气。
+func TestSMSLoginCarriesGuestPowHeader(t *testing.T) {
+	srv, bodies, paths, hdrs := smsServer(t)
+	defer srv.Close()
+
+	a := newTestAdapter(t, srv.URL)
+	f := a.startSMS()
+	if err := f.Submit(map[string]string{fieldMobile: "13800138000"}); err != nil {
+		t.Fatalf("提交手机号失败：%v", err)
+	}
+	if err := f.Submit(map[string]string{channel.FieldWidgetResult: widgetResult("RID-POW")}); err != nil {
+		t.Fatalf("提交控件结果失败：%v", err)
+	}
+	if err := f.Submit(map[string]string{fieldSMSCode: "123456"}); err != nil {
+		t.Fatalf("提交验证码失败：%v", err)
+	}
+
+	h := headerFor(t, paths, hdrs, "/users/login_by_mobile_sms").Get("X-DS-Guest-PoW-Response")
+	if h == "" {
+		t.Fatal("登录请求缺 X-DS-Guest-PoW-Response 头 —— 上游会直接回 40300 Missing Header")
+	}
+	// 桩求解器给的是固定值：能对上就证明走的是**游客**求解路径（不是聊天那条 6 字段载荷）。
+	if h != "c3R1Yi1ndWVzdA==" {
+		t.Fatalf("X-DS-Guest-PoW-Response = %q, 想要游客载荷的形状（见 pow.go guestPowHeader）", h)
+	}
+
+	// 取挑战时必须点名要调的接口：上游按 target_path 决定难度和用途，
+	// 传错了就是「难度对不上/用途不符」，白解一次。
+	var lastTarget string
+	for i, p := range *paths {
+		if p == "/users/create_guest_challenge" {
+			lastTarget, _ = (*bodies)[i]["target_path"].(string)
+		}
+	}
+	if lastTarget != "/api/v0/users/login_by_mobile_sms" {
+		t.Fatalf("最后一次取挑战的 target_path = %q，想要 /api/v0/users/login_by_mobile_sms", lastTarget)
+	}
+}
+
+// TestSMSPowFailureExplainsItself 取不到 PoW 挑战、而上游又因此拒绝时，错误里必须带真因。
+//
+// 对应红线一的一个具体痛点：上游只说 "Missing Header"，用户（和我们）根本看不出
+// 是哪个头、是谁的问题。所以只要是我们这边没带上 PoW，就必须把「为什么没带上」说出来。
+func TestSMSPowFailureExplainsItself(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/users/create_guest_challenge":
+			// 挑战接口坏掉：没有 guest_challenge（上游偶尔会这样回业务错误）。
+			io.WriteString(w, `{"code":0,"msg":"","data":{"biz_code":1001,"biz_msg":"SYSTEM_BUSY"}}`)
+		case "/users/login_by_mobile_sms":
+			// 真机就是这个形状：HTTP 200 + 信封 code=40300 + msg="Missing Header"。
+			io.WriteString(w, `{"code":40300,"msg":"Missing Header","data":null}`)
+		case "/users/create_sms_verification_code":
+			io.WriteString(w, sendOK)
+		}
+	}))
+	defer srv.Close()
+
+	a := newTestAdapter(t, srv.URL)
+	f := a.startSMS()
+	if err := f.Submit(map[string]string{fieldMobile: "13800138000"}); err != nil {
+		t.Fatalf("提交手机号失败：%v", err)
+	}
+	if err := f.Submit(map[string]string{channel.FieldWidgetResult: widgetResult("RID-1")}); err != nil {
+		t.Fatalf("提交控件结果失败：%v", err)
+	}
+	err := f.Submit(map[string]string{fieldSMSCode: "123456"})
+	if err == nil {
+		t.Fatal("上游回 40300 时必须报错（红线一：不静默）")
+	}
+	msg := err.Error()
+	// ① 必须说清是「PoW 请求头」的事，而不是把 Missing Header 原样丢出来。
+	if !strings.Contains(msg, "PoW") {
+		t.Fatalf("错误里应当点明是 PoW 请求头的问题，实际：%v", err)
+	}
+	// ② 也必须带上「为什么没带上」 —— 这正是用户拿去自查/报障的关键信息。
+	if !strings.Contains(msg, "SYSTEM_BUSY") {
+		t.Fatalf("错误里应当带上取挑战失败的原始原因，实际：%v", err)
+	}
+	// ③ 状态机不前进：用户原地重试即可。
+	if v := f.Step(); v.Stage != channel.StageInput {
+		t.Fatalf("失败后应当留在验证码屏，实际 stage=%q", v.Stage)
+	}
+}
+
+// TestSMSResendGoesBackToCaptcha 「重新获取」必须把用户带回人机校验那一步。
+//
+// 为什么不是「原地再调一次发码」：数美凭据是一次性的，发码必须带一个新凭据。
+// 所以重发的真实含义就是「再点一次题」。这条锁住这个语义 ——
+// 否则界面上的「重新获取」会变成一个点了没反应（或报错）的假按钮。
+func TestSMSResendGoesBackToCaptcha(t *testing.T) {
+	srv, _, paths, _ := smsServer(t)
+	defer srv.Close()
+
+	a := newTestAdapter(t, srv.URL)
+	f := a.startSMS()
+	if err := f.Submit(map[string]string{fieldMobile: "13800138000"}); err != nil {
+		t.Fatalf("提交手机号失败：%v", err)
+	}
+	if err := f.Submit(map[string]string{channel.FieldWidgetResult: widgetResult("RID-1")}); err != nil {
+		t.Fatalf("提交控件结果失败：%v", err)
+	}
+	if v := f.Step(); v.Stage != channel.StageInput || v.ResendAfterSecs != 60 {
+		t.Fatalf("应当先到验证码屏且带上重发窗口，实际 stage=%q resend=%d", v.Stage, v.ResendAfterSecs)
+	}
+
+	// 点「重新获取」：交上来的是一个动作，不是验证码。
+	if err := f.Submit(map[string]string{fieldStepAction: actionResend}); err != nil {
+		t.Fatalf("「重新获取」不该报错，实际：%v", err)
+	}
+	v := f.Step()
+	if v.Stage != channel.StageWidget {
+		t.Fatalf("「重新获取」后应当回到人机校验屏（凭据要重新签），实际 stage=%q", v.Stage)
+	}
+	if v.Widget != channel.WidgetShumei {
+		t.Fatalf("回到的应当是数美控件屏，实际 widget=%q", v.Widget)
+	}
+	// 而且**不该**在这一步打上游：重发是下一屏（过校验）才发生的事。
+	if !equalPaths(*paths, []string{"/users/create_guest_challenge", "/users/create_sms_verification_code"}) {
+		t.Fatalf("「重新获取」不该自己打上游，实际调用序列 %v", *paths)
+	}
+	// 重发窗口清掉，免得新一屏还挂着上一轮的倒计时。
+	if v.ResendAfterSecs != 0 {
+		t.Fatalf("回到控件屏后不该还带重发窗口，实际 %d", v.ResendAfterSecs)
+	}
+
+	// 重新过校验后应当还能正常发码（第二次发码，证明往回退没有把流程锁死）。
+	if err := f.Submit(map[string]string{channel.FieldWidgetResult: widgetResult("RID-2")}); err != nil {
+		t.Fatalf("重发路径上再过一次校验应当成功，实际：%v", err)
+	}
+	if v := f.Step(); v.Stage != channel.StageInput || v.ResendAfterSecs != 60 {
+		t.Fatalf("重发后应当回到验证码屏，实际 stage=%q resend=%d", v.Stage, v.ResendAfterSecs)
 	}
 }
 
