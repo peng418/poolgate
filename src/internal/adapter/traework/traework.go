@@ -104,13 +104,19 @@ func (a *Adapter) Refresh(ctx context.Context, c *channel.Credential) (*channel.
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
-		return nil, errs.New(errs.SessionDead, "刷新被拒，需重新授权").WithAccount(c.UID)
+		// 走 Classify 而不是一律 SessionDead（依据：wild-work traework/client.go doJSON ——
+		// >=400 时按 Classify 定类，并保留上游原话）。一律 SessionDead 会把上游 5xx/闸门
+		// 误判成「账号要重新授权」，违反「UpstreamFault 不计入账号健康」的解耦
+		// （errs.AccountBlamed）——一个 500 就会把好号踢下线。401 仍归 SessionDead。
+		return nil, errs.New(a.Classify(resp.StatusCode, data), "刷新失败").
+			WithAccount(c.UID).WithUpstream(truncate(string(data), 200))
 	}
 	var out struct {
 		Result struct {
-			Token         string `json:"Token"`
-			RefreshToken  string `json:"RefreshToken"`
-			TokenExpireAt int64  `json:"TokenExpireAt"`
+			Token               string `json:"Token"`
+			RefreshToken        string `json:"RefreshToken"`
+			TokenExpireAt       int64  `json:"TokenExpireAt"`
+			TokenExpireDuration int64  `json:"TokenExpireDuration"`
 		} `json:"Result"`
 	}
 	if err := json.Unmarshal(data, &out); err != nil || out.Result.Token == "" {
@@ -123,6 +129,17 @@ func (a *Adapter) Refresh(ctx context.Context, c *channel.Credential) (*channel.
 	}
 	if out.Result.TokenExpireAt > 0 {
 		nc.ExpiresAt = time.Unix(normalizeExpires(out.Result.TokenExpireAt), 0)
+	} else if out.Result.TokenExpireDuration > 0 {
+		// 上游有时只给「有效期」不给绝对到期时间（依据：wild-work client.go RefreshToken
+		// 的 TokenExpireDuration 分支）。漏掉它 ExpiresAt 会一直为 0，会话过期时间未知，
+		// 调度器无法判断该不该提前续期。上游通常是毫秒，用阈值区分毫秒/秒。
+		d := time.Duration(out.Result.TokenExpireDuration)
+		if out.Result.TokenExpireDuration > 1e9 {
+			d *= time.Millisecond
+		} else {
+			d *= time.Second
+		}
+		nc.ExpiresAt = time.Now().Add(d)
 	}
 	return &nc, nil
 }
@@ -231,12 +248,19 @@ func (a *Adapter) fetchModels(ctx context.Context, c *channel.Credential) ([]cha
 	soloHeaders(req, c, false)
 	resp, err := a.http.Do(req)
 	if err != nil {
-		return nil, err
+		// 连不通也要归一成 errs.Error（红线一 + errs 包契约：任何上游异常必须结构化，
+		// 否则 KindOf 只能落到兜底的 Parse，账号/渠道上下文也没了）。与同文件 Chat 的
+		// transport 分支保持一致。
+		return nil, errs.New(errs.Transport, "拉取模型目录失败").
+			WithChannel(string(channel.TraeWork)).WithAccount(c.UID).WithCause(err)
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
-		return nil, errs.New(a.Classify(resp.StatusCode, data), "目录失败")
+		// 带上游原话，便于定位（红线一：失败必带原因）。
+		return nil, errs.New(a.Classify(resp.StatusCode, data), "目录失败").
+			WithChannel(string(channel.TraeWork)).WithAccount(c.UID).
+			WithUpstream(truncate(string(data), 200))
 	}
 	var out struct {
 		ConfigInfoList []struct {
@@ -312,6 +336,19 @@ func buildBody(req channel.ChatRequest) []byte {
 		"stream":      true,
 		"function":    Function,
 		"messages":    msgs,
+	}
+	// 透传客户端的采样参数。依据：wild-work traework/payload.go PrepareBody 只在原始
+	// 请求体上覆写 stream/function/config_name/model，其余字段（max_tokens/temperature）
+	// 原样发给上游 —— 客户端给的值能到达上游。本适配器是从 ChatRequest 重建请求体，
+	// 若不显式带上就会被静默丢弃（客户端设了 max_tokens/temperature 却不起作用）。
+	// max_tokens 只在 >0 时发：客户端没写时网关给的是 0，而 "max_tokens":0 在 OpenAI
+	// 语义里是「一个 token 都不许生成」，会被上游当成非法参数（同 codebuddy/codebuddy.go、
+	// copilot/protocol.go 的守卫）。
+	if req.MaxTokens > 0 {
+		obj["max_tokens"] = req.MaxTokens
+	}
+	if req.Temperature != nil {
+		obj["temperature"] = *req.Temperature
 	}
 	if tools := soloTools(req.ForwardTools()); len(tools) > 0 {
 		obj["tools"] = tools
@@ -412,7 +449,11 @@ func soloHeaders(req *http.Request, c *channel.Credential, stream bool) {
 	req.Header.Set("Authorization", "Cloud-IDE-JWT "+c.AccessToken)
 	req.Header.Set("X-Cloudide-Token", c.AccessToken)
 	req.Header.Set("X-Ide-Token", c.AccessToken)
-	req.Header.Set("X-Uid", c.UID)
+	// UID 为空时不发这个头（依据：wild-work traework/headers.go SOLOHeaders 的
+	// `if a.UID != ""` 守卫）——避免发一个空的 X-Uid 让上游把账号认成空串。
+	if c.UID != "" {
+		req.Header.Set("X-Uid", c.UID)
+	}
 	req.Header.Set("X-App-Id", AppID)
 	req.Header.Set("X-App-Version", "default")
 	req.Header.Set("X-Ide-Version", IdeVersion)

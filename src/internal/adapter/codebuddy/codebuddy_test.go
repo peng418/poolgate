@@ -263,8 +263,11 @@ func TestRefreshUsesIdentitySource(t *testing.T) {
 	} {
 		t.Run(string(tc.ident), func(t *testing.T) {
 			var hdr http.Header
+			var body string
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				hdr = r.Header.Clone()
+				b, _ := io.ReadAll(r.Body)
+				body = string(b)
 				_, _ = io.WriteString(w, `{"code":0,"msg":"","data":{"accessToken":"new-at","refreshToken":"new-rt","expiresIn":3600}}`)
 			}))
 			defer srv.Close()
@@ -287,6 +290,12 @@ func TestRefreshUsesIdentitySource(t *testing.T) {
 			}
 			if got := hdr.Get("X-Enterprise-Id"); got != "ent-1" {
 				t.Fatalf("刷新也应带企业身份，实际 %q", got)
+			}
+			// 参考实现刷新时都发一个空 JSON 对象当 body（converter.py:156 `json={}` /
+			// wb_accounts.py:487 `data=b"{}"`）；空 body 与 Content-Type: application/json
+			// 的组合是不一致的形态，别再退回 nil。
+			if body != "{}" {
+				t.Fatalf("刷新请求体应为空 JSON 对象 {}，实际 %q", body)
 			}
 			if nc.AccessToken != "new-at" || nc.RefreshToken != "new-rt" {
 				t.Fatalf("刷新后凭证未轮换: %+v", nc)
@@ -347,6 +356,9 @@ func TestBuildBodyShape(t *testing.T) {
 	if obj["stream"] != true {
 		t.Fatal("必须强制 stream=true")
 	}
+	if obj["max_tokens"] != float64(128) {
+		t.Fatalf("客户端给了 max_tokens 应原样透传，实际 %v", obj["max_tokens"])
+	}
 	if obj["temperature"] != 0.3 {
 		t.Fatalf("temperature 应透传，实际 %v", obj["temperature"])
 	}
@@ -370,6 +382,12 @@ func TestBuildBodyShape(t *testing.T) {
 	})
 	var obj2 map[string]any
 	_ = json.Unmarshal(raw2, &obj2)
+	// 客户端没给 max_tokens（网关传 0）时**不能**发 `"max_tokens": 0`：
+	// 参考实现只透传客户端确实给了的字段（converter.py:332），0 在 OpenAI 语义里是
+	// 「一个 token 都不生成」，上游可能当非法参数拒。
+	if _, ok := obj2["max_tokens"]; ok {
+		t.Fatalf("客户端没给 max_tokens 时不应带该字段，实际 %v", obj2["max_tokens"])
+	}
 	msgs2 := obj2["messages"].([]any)
 	if len(msgs2) != 2 || msgs2[0].(map[string]any)["role"] != "system" {
 		t.Fatalf("缺 system 时应补一条: %#v", msgs2)
@@ -424,5 +442,43 @@ func TestStaticModelsSane(t *testing.T) {
 			t.Fatalf("模型 ID 重复: %s", m.ID)
 		}
 		seen[m.ID] = true
+	}
+	// 四份新参考交叉验证过的档位必须在表里（见 staticModels 注释的来源清单）。
+	for _, id := range []string{"auto", "hy3", "glm-5.3", "kimi-k3-1", "minimax-m3"} {
+		if !seen[id] {
+			t.Fatalf("交叉验证过的模型 %q 应在静态表里", id)
+		}
+	}
+}
+
+// 出站脱敏回归：CodeBuddy 与 WorkBuddy 同源、同一套上游内容审核黑名单，Claude Code /
+// Agent SDK 注入的身份句必须在上游**收到的 body** 里被改写（否则 HTTP 400 code=11128
+// "Illegal API invocation from an unapproved channel"）。断言改写发生，且消息条数与无关内容不变。
+func TestBuildBodySanitizesClaudeFingerprint(t *testing.T) {
+	const ccIdentity = "You are Claude Code, Anthropic's official CLI for Claude."
+	raw := buildBody(channel.ChatRequest{
+		Model: "glm-5.2",
+		Messages: []channel.Message{
+			{Role: "system", Content: ccIdentity},
+			{Role: "user", Content: "hi"},
+		},
+	})
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("请求体不是合法 JSON: %v", err)
+	}
+	msgs := obj["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("消息条数应保持 2 条，实际 %d", len(msgs))
+	}
+	sys, _ := msgs[0].(map[string]any)["content"].(string)
+	if strings.Contains(sys, ccIdentity) {
+		t.Fatalf("上游收到的 body 仍带指纹原文: %q", sys)
+	}
+	if !strings.Contains(sys, "official CLI tool for Claude.") {
+		t.Fatalf("身份句未被最小改写: %q", sys)
+	}
+	if got, _ := msgs[1].(map[string]any)["content"].(string); got != "hi" {
+		t.Fatalf("无关消息被改动: %q", got)
 	}
 }

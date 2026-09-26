@@ -36,6 +36,15 @@ type Adapter struct {
 	// key 用 refresh token 而不是账号 UID：同一账号重新登录后 refresh token 会变，
 	// 用旧 key 缓存到的东西必须作废。
 	tokens map[string]cachedToken
+
+	// catMu 保护模型目录的两样东西：给面板/网关的快照（catalog），
+	// 以及「模型名 → 档位参数」的表（specs，Chat 用）。
+	// specs 在建表时就用兜底表填了一遍（见 New），所以即使目录从来没拉成功过，
+	// 兜底表里那些档位也认得出、发得对。
+	catMu     sync.RWMutex
+	catalog   []channel.ModelInfo
+	catalogAt time.Time
+	specs     map[string]modelSpec
 }
 
 type cachedToken struct {
@@ -44,11 +53,17 @@ type cachedToken struct {
 }
 
 func New() *Adapter {
-	return &Adapter{
+	a := &Adapter{
 		clients: map[string]*http.Client{},
 		base:    apiBase,
 		tokens:  map[string]cachedToken{},
+		specs:   map[string]modelSpec{},
 	}
+	// 兜底表先入库：列表里下发的档位与 Chat 认得的档位保持一致（见 localModel 的说明）。
+	for _, m := range fallbackModels {
+		a.specs[m.ID] = m.Spec
+	}
+	return a
 }
 
 func (a *Adapter) clientFor(c *channel.Credential) *http.Client {
@@ -95,26 +110,31 @@ func (a *Adapter) Login(context.Context) (*channel.Credential, error) {
 		WithChannel(string(channel.Kimi))
 }
 
-// Models 返回网页端档位（本地清单，如实标注）。
+// Models 返回可用档位：**优先用凭证向上游问目录**（GetAvailableModels），
+// 拉不到才退到本地兜底表。上游目录是权威来源 —— 它按账号订阅给出真正可用的档位，
+// 而且 id 是上游自己那套开关组合（见 models.go 的说明）。
 //
-// 上游确实有模型目录接口（GetAvailableModels），但它的**响应结构在我们参考的几份实现里
-// 都不一致**（各家按自己的猜测解析），照着猜会产出不存在的模型名 —— 那比不列更糟。
-// 所以这里只列形态确定的档位，并把「模型名认不出时会回落到默认档」写清楚。
-func (a *Adapter) Models(context.Context, *channel.Credential) ([]channel.ModelInfo, error) {
-	out := make([]channel.ModelInfo, 0, len(webModels))
-	for _, m := range webModels {
-		out = append(out, channel.ModelInfo{
-			ID:          m.ID,
-			DisplayName: m.Name,
-			// 上下文长度：上游没给，不猜数字（F4.2）。
-			ContextWindow: 0,
-			Source:        channel.SourceLocal,
-			Tools:         channel.CapYes, // 客户端可用（由网关模拟）
-			Reasoning:     capOf(m.Think),
-			Images:        channel.CapNo,
-		})
+// 为什么失败也不返回 error：这个函数在面板、boot 探针、/v1/models 三处被调用，
+// 返回错误会让「模型列表」整块消失（网关只在取不到时回退快照，快照也没有就下发空）。
+// 退到兜底表并如实标注 SourceLocal，比空着好；真正的失败由对话请求暴露。
+func (a *Adapter) Models(ctx context.Context, c *channel.Credential) ([]channel.ModelInfo, error) {
+	if cached, ok := a.cachedCatalog(); ok {
+		return cached, nil
 	}
-	return out, nil
+	if models, specs, err := a.fetchModelCatalog(ctx, c); err == nil && len(models) > 0 {
+		a.storeCatalog(models, specs)
+		return models, nil
+	}
+	return toModelInfos(fallbackModels, channel.SourceLocal), nil
+}
+
+// ModelsSnapshot 返回上次成功拉取的目录快照（网关 /v1/models 取不到时兜底用）；
+// 一次都没成功过就返回兜底表 —— 与 WorkBuddy/CodeBuddy 那边的做法一致。
+func (a *Adapter) ModelsSnapshot() []channel.ModelInfo {
+	if cached, ok := a.cachedCatalog(); ok {
+		return cached
+	}
+	return toModelInfos(fallbackModels, channel.SourceLocal)
 }
 
 func capOf(b bool) channel.Cap {
@@ -197,7 +217,7 @@ func (a *Adapter) forgetToken(refresh string) {
 // 注意上游这里**不轮换 refresh token**（同一个 refresh token 可以一直换），
 // 所以换回来的只有 access token；这一点对我们的凭证存储很关键：不需要回写凭证。
 func (a *Adapter) exchangeRefresh(ctx context.Context, c *channel.Credential, refresh string) (string, time.Time, error) {
-	resp, err := a.send(ctx, c, http.MethodGet, epRefresh, refresh, nil, false)
+	resp, err := a.send(ctx, c, http.MethodGet, epRefresh, refresh, nil, false, nil)
 	if err != nil {
 		return "", time.Time{}, err
 	}
@@ -268,8 +288,12 @@ func (a *Adapter) checkCredential(ctx context.Context, c *channel.Credential) er
 	if err != nil {
 		return err
 	}
-	body, _ := encodeConnect(map[string]any{})
-	resp, err := a.send(ctx, c, http.MethodPost, epSubscription, token, body, true)
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	// 订阅校验是**普通 JSON 调用**，不是 Connect 信封：参考实现传 json={}（client.py:255-261），
+	// 只有 Connect-Protocol-Version 这个头照旧由统一的头构造函数带上（client.py:207-210）。
+	resp, err := a.send(ctx, c, http.MethodPost, epSubscription, token, []byte("{}"), false,
+		map[string]string{"Connect-Protocol-Version": "1"})
 	if err != nil {
 		return err
 	}
@@ -289,7 +313,13 @@ func (a *Adapter) checkCredential(ctx context.Context, c *channel.Credential) er
 
 // Chat 发一次对话：把内部契约拼成上游要的单轮文本 + Connect 信封，响应按帧流式解析。
 func (a *Adapter) Chat(ctx context.Context, c *channel.Credential, req channel.ChatRequest) (channel.Stream, error) {
-	spec := specOf(req.Model)
+	// 档位参数（scenario / 思考 / 联网 / agent 的两个产品字段）先查模型表 ——
+	// 表里的 id 是上游目录给的，参数也是照目录生成的，不会出现「名字是 agent 档、
+	// 发出去却是普通场景」这种错配。表里没有的名字再走语法解析。
+	spec, ok := a.specFor(req.Model)
+	if !ok {
+		spec = specOf(req.Model)
+	}
 	if !spec.known {
 		// 不认识的模型名：按默认档走，但**不静默**——日志与流水里能看到用的是哪一档
 		// （与 DeepSeek 渠道同一个处理原则：宁可给默认档，也不让请求失败，但要留痕）。
@@ -305,7 +335,7 @@ func (a *Adapter) Chat(ctx context.Context, c *channel.Credential, req channel.C
 		return nil, errs.New(errs.Parse, "构造请求失败").WithChannel(string(channel.Kimi)).WithCause(err)
 	}
 
-	resp, err := a.send(ctx, c, http.MethodPost, epChat, token, body, true)
+	resp, err := a.send(ctx, c, http.MethodPost, epChat, token, body, true, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -316,11 +346,14 @@ func (a *Adapter) Chat(ctx context.Context, c *channel.Credential, req channel.C
 		if token, err = a.accessToken(ctx, c); err != nil {
 			return nil, err
 		}
-		if resp, err = a.send(ctx, c, http.MethodPost, epChat, token, body, true); err != nil {
+		if resp, err = a.send(ctx, c, http.MethodPost, epChat, token, body, true, nil); err != nil {
 			return nil, err
 		}
 	}
-	if resp.StatusCode >= 400 {
+	// 非 200 一律当错误：参考实现的对话路径就是这么判的（只有 200 才当流读，
+	// 其余交给 _raise_for_response，client.py:340-351）。若把 204/3xx 当流读，
+	// 客户端看到的是「转圈到最后空回复」，而真正的问题是响应根本不是流。
+	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		return nil, errs.New(a.Classify(resp.StatusCode, raw), "上游返回错误").
@@ -344,12 +377,21 @@ func buildChatPayload(req channel.ChatRequest, spec modelSpec) map[string]any {
 	if spec.search {
 		tools = append(tools, map[string]any{"type": "TOOL_TYPE_SEARCH", "search": map[string]any{}})
 	}
-	return map[string]any{
+	payload := map[string]any{
 		"scenario": spec.scenario,
 		"tools":    tools,
 		"message":  message,
 		"options":  map[string]any{"thinking": spec.thinking},
 	}
+	// agent 档多两个产品字段，且**只在非空时才写**（参考实现 client.py:332-335）：
+	// 普通档带上它们上游会当成别的产品请求。
+	if spec.kimiPlusID != "" {
+		payload["kimiplusId"] = spec.kimiPlusID
+	}
+	if spec.agentMode != "" {
+		payload["agentMode"] = spec.agentMode
+	}
+	return payload
 }
 
 // Classify 把上游错误归一成有限枚举（D4）。
@@ -398,8 +440,9 @@ func (a *Adapter) Classify(status int, body []byte) errs.Kind {
 // send 发一个请求，带上伪装头与设备号。
 //
 // connectFramed=true 时按 Connect 协议设置 Content-Type（请求体也是信封形态）；
-// false 用于普通的 JSON 接口（换令牌）。
-func (a *Adapter) send(ctx context.Context, c *channel.Credential, method, path, token string, body []byte, connectFramed bool) (*http.Response, error) {
+// false 用于普通的 JSON 接口（换令牌、订阅校验、模型目录）。
+// extra 是逐调用覆盖的头（参考实现也是这么分层的：统一头 + 每处 extra，protocol.py:117-132）。
+func (a *Adapter) send(ctx context.Context, c *channel.Credential, method, path, token string, body []byte, connectFramed bool, extra map[string]string) (*http.Response, error) {
 	var rdr io.Reader
 	if body != nil {
 		rdr = bytes.NewReader(body)
@@ -418,11 +461,13 @@ func (a *Adapter) send(ctx context.Context, c *channel.Credential, method, path,
 	if connectFramed {
 		req.Header.Set("Content-Type", "application/connect+json")
 		req.Header.Set("Connect-Protocol-Version", "1")
-	} else {
+	} else if body != nil {
+		// 无 body 的 GET（换令牌）不带 Content-Type：参考实现那条路也是裸 GET
+		// （token_manager.py:135-147，头里没有 Content-Type）。
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if body != nil {
-		req.Header.Set("Accept", "*/*")
+	for k, v := range extra {
+		req.Header.Set(k, v)
 	}
 
 	resp, err := a.clientFor(c).Do(req)

@@ -466,6 +466,166 @@ POST https://gateway.qwenwork.cn/api/v1/deviceToken/refresh
 实测：deviceToken 端点仍可用（垃圾 refresh_token → `401 {"errorCode":"INVALID_REFRESH_TOKEN",...}`），
 503 闸门只影响推理端点。协议说明同步写进了 `docs/03-渠道能力矩阵.md` 与适配器包头注释。
 
+### 0.6.4 — 面板只留「能用的那几个」（接入源 + 聊天模型都先屏蔽，代码不删）
+
+用户裁定：接入源（API Key 式来源）他后面还要改；豆包 / ChatGPT / 元宝 / Kimi / 智谱清言 / 通义 /
+DeepSeek 网页 / Gemini / iFlow / Antigravity 这些「聊天模型」他现在不用。做法沿用**最小改动、一行恢复**：
+
+- `internal/webui/dist/index.html` 里两个开关：
+  - `const SHOW_PROVIDERS=false;` —— 导航项被 `.filter()` 摘掉，视图写成
+    `v-if="SHOW_PROVIDERS && view==='providers'"`；
+  - `const VISIBLE_CHANNELS=['qodercn','qodercom','traework','workbuddy','workbuddyai','qwenwork'];`
+    —— 白名单之外一律不显示。应用到：总览的渠道健康表与「可用渠道 N/6」计数、
+    账号页的 `accountSections`、「添加账号」的 `pickChannels`、模型与费率页的 `filteredModels`、
+    日志/诊断的渠道下拉（`visChannels`）、设置页的签到能力表。
+- **两个标识符都必须加进 `setup()` 的返回列表**：生产 Vue 对「模板里用了、setup 没透出」的标识符
+  是**静默**的（渲染成 undefined，v-if 永远不成立），由 `tools/audit-vue.mjs`（dev 构建）兜住。
+- 刻意**没有**动的地方：后端 `/api/providers*`、`internal/adapter/openaiup`、17 个预设、
+  各渠道适配器与凭证、渠道 `Status`。「设置 → 渠道开关」表仍列**全部**渠道 —— 那是管理面，
+  以后暂停/恢复渠道仍在这里，也是把聊天渠道放回来的入口。
+- **边界（写进 README 与面板注释）**：这次只改显示，**网关行为没变**，被隐藏渠道的模型仍会下发；
+  要让客户端也选不到，得在「设置 → 渠道开关」把那些渠道暂停 —— 那是运行状态，与这里的显示独立。
+  把这一点写清楚，是因为「面板看不见但接口还在发」正是本项目红线一要防的那种不一致。
+- `tools/audit-ui.mjs` / `tools/audit-vue.mjs` 改成「导航里没有这个入口就跳过并打印」：
+  审计跟着面板入口走，恢复入口后那一屏自动重新被覆盖。
+
+验证：`check.sh` 全绿；双端审计 0 问题；Vue 告警审计 0 条 0 报错；截图核对总览渠道表只剩白名单 6 个
+（豆包 / ChatGPT / 元宝 / Kimi / 智谱 都不出现在总览、账号、模型三页）。
+
+### 0.6.3 — 三个网页渠道的真 bug（ChatGPT / DeepSeek / 豆包）
+
+用户实测：三个新接入的渠道在 Studio 里「gpt 报错、豆包读不到上下文/记忆、deepseek 回一堆乱码」。
+三种病根完全不同，逐条修掉并留了回归用例：
+
+**一、ChatGPT 网页渠道（一律 502「第 3 道门」）—— 三个 bug 叠在一起**
+- **turnstile 的密钥传错了**：`dx` 是「与本次请求发出去的 requirements token（`p`）逐码点异或后 base64」
+  的 opcode 程序，旧代码传空串（注释还写着「参考实现如此」，但 gpt4free `process_turnstile_new` 与
+  ChatGPT2API-GO `solveTurnstileToken` 传的都是 `p`）。空串解出 22K 乱码 → 程序永远跑不出结果，
+  而错误文案把「密钥用错」谎报成「解释器覆盖不到上游指令集」。现网挑战核对：换 `p` 立刻得到合法的
+  88 条指令程序，597 步跑出 token。
+- **寄存器必须按 JS 属性名存**（`map[string]any`）：上游把 opcode 重绑到**随机小数槽位**做混淆
+  （实测程序里有 `[84.18, 9.23, 7]`），旧的 `map[int]any` 把 `9.23` 截断成 `9` —— 正好砸中程序队列
+  寄存器，队列被换成别的值、程序当场停摆。参考实现是 Python dict（原始键）与 Go 的 `map[string]any`
+  （`ChatGPT2API-GO/internal/app/turnstile.go:15`），我们那一版移植成了 int 键。
+- **上游换了 SSE 帧形态**：现在把消息**直接摊在顶层**（`{"message":{author:assistant,content:{parts:[…]}}}`，
+  没有外层 `v`），旧 `walk` 见不到 `v` 就 `return` → 三道门都过、上游正常出字、客户端拿到**空回复**。
+  定位手法：临时给适配器加 `POOLGATE_DEBUG_SSE=<file>` 的 tee 抓原始帧（用完即删）。
+- 错误文案改成说真话：`solveTurnstileToken` 现在返回区分三种原因的错误（解不开 / 程序显式拒绝 /
+  跑完没产出），不再用一句「解释器覆盖 1–35 号指令」把密钥错误盖过去。
+
+**二、工具调用模拟层（toolshim）两处改进 —— 对所有 shim 渠道生效**
+- **格式提醒挪到对话末尾**：把工具说明只写在系统提示词里时，豆包 4/4 次都用自然语言回答、一个工具
+  都不调；同一份请求只在最后一条消息末尾补一句格式提醒 → doubao-pro 4/4、doubao 2/3 正确调用。
+  系统提示词一长，那里的约定就被淹没，紧挨生成位置的那句话才起作用（两份都留）。
+- **认模型自己的原生语法**：请求一大，DeepSeek 会改用它的 DSML（`｜｜DSML｜｜ invoke name="…"`），
+  旧的解析层只认 `<tool_call>` → 整段标记当正文泄漏。现在 DSML 与 `<function_calls><invoke>` 两家族
+  共用一套家族无关的抽取器，另认复数 `<tool_calls>` 外壳（含外壳里嵌多个单数调用）。
+  抽不出来照样把原文（连标记）交出去 —— 红线一。
+
+**三、网关：把「有帧、没内容」判成失败**
+上游换了帧形态而适配器没认出来时，流里照样有帧、照样正常结束，以前会回一个 `content:""` + `stop`
+的 200（客户端以为模型没话说）。现在流式与非流式都判失败并说明原因。顺带修掉 TTFT：原先只有
+「第一个 chunk 带内容」才记首字，而上游普遍先发一个 role 空帧 → TTFT 一直记成 0。
+
+**验证**：`check.sh` 全绿；新增回归用例（小数槽位、错密钥的错误文本、顶层消息帧、DSML 分片、
+复数标记、空帧判失败、末尾提醒落位）。真上游实测：ChatGPT 流式/非流式真出字，豆包 30 工具请求
+返回 `tool_calls`，deepseek 用抓包到的原始 DSML 验证解析。
+**已知边界**：ChatGPT 网页模型**明确拒绝**文本协议的工具调用（原话大意「你列出的 Read/Bash/Grep
+并没有挂载到我的可调用工具列表」），三种措辞实测 0/4 —— 该渠道可作聊天后端，作 coding agent 后端
+需要它的原生工具通道（或 OAuth/Codex 路径）。
+
+### 0.6.2 — 每个渠道 / 来源都带自己的品牌图标
+
+22 个渠道 + 17 个接入源预设，各配一张**平台自己的图标**（favicon / 站点 logo），落在
+`internal/webui/dist/brands/`；来源 URL 与商标归属逐条记在 `brands/SOURCES.md`。
+实现上有几条刻意的选择：
+
+- **有就显示、没有就退回**：模板里是 `v-if="icoOf(kind)"` + `v-else` 保留原来的身份色方块。
+  删掉任何一个图标文件都不会让页面报错或留白 —— 这条对「某个平台方要求撤下图标」是必需的。
+- **图标垫在一块固定浅色底板上**（`.ch .logo`，20×20 + 2px padding + 白底 + 细边）。
+  原因有二：不少品牌标是深色透明底（Kimi、xAI、OpenRouter、Perplexity…），直接放暗色主题上等于看不见；
+  各家留白差异极大，垫同一种底板，一列图标才像一套。
+- **路径必须是 `./brands/…` 相对形式**：飞牛应用网关会剥掉 `/app/poolgate` 前缀，
+  根绝对路径在网关下 404（同 `src/README` 顶部那条「前端资源前缀铁律」）。
+- **同一家的多个来源共用一份文件**：QoderCOM 用 `qodercn.svg`、WorkBuddyCN 用 `codebuddy.svg`、
+  DeepSeek 官方 API 用 `deepseek.png` —— 表在 JS 里（`BRANDS`），文件不重复放。
+
+顺带按同一思路把「添加账号」的渠道选择页也分了模块：只列登录式渠道，API Key 式来源不再混在里面
+（它们本来就是"点了没反应"的卡片，面板授权对 key 式来源不适用）。
+
+**两个只有跑审计才能发现的坑**（都实测踩到）：
+1. 类名撞车：先取的名字 `brand` 在样式表里**已被侧栏 logo 占用**（`.brand{display:flex;padding:4px 8px 18px}`），
+   用在 `<img>` 上会把图标撑变形。改名 `.ch .logo`（作用域限定在 `.ch` 下）。
+2. `:alt=""` 会被 Vue 当成**绑定表达式**去实例上找 `alt` 属性，`audit-vue` 报
+   `Property "alt" was accessed during render but is not defined on instance`。装饰性图片用**静态** `alt=""`。
+
+验证：`audit-ui`（16 视图 × 双端）0 问题、`audit-vue` 0 告警；playwright 实跑确认
+总览 23 / 账号 22 / 设置 46 / 选择页 23 个图标**全部真实加载**（`naturalWidth>0`）、0 个 404。
+
+### 0.6.1 — 「接入源」与「账号」两个模块彻底分开
+
+用户 2026-09-26 的裁定：**接入源 = 只放「去官网注册拿 key 就能用」的来源；账号 = 我们本来就支持调用的那些渠道**
+（QoderCN / 千问办公 / 豆包 …）。以前接入源页把两类**混排在同一张表**里（靠「类型」列 + 左侧色块区分），
+「添加接入源」向导第一步还摆着「登录授权式」这张卡 —— 点它只是把你送去账号页，那一步的存在本身就在
+暗示「接入源里也有登录式渠道」。现在：
+
+- 接入源页的表格删掉登录式渠道行与「类型」列，只列 `providers`（API Key 式）；空态文案改成引导去加来源。
+- 向导从三步变两步（去掉「选类型」），填参数 → 连通性测试后保存；`providerChannelRows` 这个 computed 连根删掉。
+- 页面副标题、banner、「两类来源的区别」表全部改写：不再描述"混排"，改成两个模块的分工表 + 「去『账号』页」入口。
+
+**顺带修掉向导里一个会静默改行为的 bug**（HEAD 里就在）：`resetProviderForm` 与 `editProvider` 组装的 `cfg`
+都漏了 `tools_mode` —— ①新建时「工具调用能力」下拉是**空白**的（看不出当前是哪一档）；
+②更糟的是编辑一个「工具调用靠网关模拟（shim）」的来源：它的 `supports_tools` 本就是 false，
+保存时 `tools_mode` 空 → 后端按 `supports_tools` 推导 → **被静默降级成「不用工具（none）」**。
+现在两处都回填 `tools_mode`，`applyPreset` 也让两档同步。
+验证：playwright 真开一遍向导（新建显示 `native`、编辑 shim 显示 `shim`）+ 直接保存后读 `providers.json`
+确认 `tools_mode` 仍是 `shim`；`audit-ui`（16 个视图 × 双端）0 问题、`audit-vue` 0 告警。
+
+### 0.6.0 — 逐渠道与开源参考实现核对（真上游实测驱动）
+
+**做法**：把 22 个渠道**逐个**与公开开源参考实现（以及上一代 wild-work 实现）逐字段核对 ——
+端点 / URL query / 请求头（含伪装版本号）/ 请求体每个字段的名字与形态 / 流帧解析 / 结束条件 /
+错误归一 / 模型表。每处改动都在代码注释里写明依据（参考实现文件名 + 行号）。
+核对前先确认参考实现的时效性（逐个与上游 HEAD 比对），并从 GitHub 扫到更近的实现做交叉验证
+（`AIClient2API` 8.8k★、新版 `doubao2api`、`codebuddy2api`、`Qoder-2API-Go`、`Orchids-2api`、
+`workbuddy-openai-proxy`、`BYOKEY` 等）；其中几家独立实现互相印证时，才把结论写进代码。
+
+**真实凭证实测（现网账号，2026-09-26）**：`doubao` / `qodercn` / `workbuddy` / `qwenwork`
+四家真出字（含原生工具调用），`traework`（`code=4008` 额度耗尽）与 `workbuddyai`
+（`14018 Credits exhausted`）是账号额度问题，错误如实带上游原话。
+
+**核对出来的真问题（按影响排序）**：
+
+1. **请求体字段形态不对 → 整条渠道不可用**
+   - 豆包：`local_conversation_id` / `local_message_id` / `block_id` 是空串、缺
+     `is_finish` / `patch_type` / `icon_url` → 上游 `710020202 common invalid param`。
+     补齐后同一条 Cookie **真出字**（流式 / 深度思考 / 工具调用三条路径都验过）。
+   - Gemini（Code Assist）：外层信封多发 `user_prompt_id`、内层多发 `session_id` ——
+     三份参考实现都没有这两个字段，Google 对未知字段直接 400（`Cannot find field`）。
+2. **「移植丢失」：wild-work 里有、重做时整块没搬过来的三道防线**
+   - **`internal/sanitize`（新补）**：上游对请求体里 Claude Code / Codex CLI 的模板句做
+     **逐字精确黑名单匹配**，命中回 `HTTP 400 code=11128 "Illegal API invocation from an
+     unapproved channel"` —— 即**从 Claude Code / Studio 调 CodeBuddy / WorkBuddy 会被挡掉**。
+     **真上游 A/B**：脱敏前 `ContentBlocked / 11128`，脱敏后正常出字「你好」。
+     接到 `workbuddy` / `workbuddyai` / `codebuddy` 三处请求体组装。
+   - **孤儿 `tool_call` ↔ `tool` 结果配对清理**：工具执行失败时客户端常把 tool_calls 存进历史
+     却写不回结果，坏历史每次重放都 400 → **整条会话报废**。网关发请求前剔除无法配对的条目。
+   - **工具调用残缺参数检测**：流被截断时 `arguments` 只剩半截 JSON，原样给客户端会卡死会话。
+3. **静默丢字**：ChatGPT 网页版的 patch 流里有「只有 `v`、没有 `p`/`o`」的省略路径增量帧，
+   三份参考实现都专门处理，我们原来直接忽略 → 正文缺词断句且日志无痕。
+4. **上游原话被吞**：适配器流内错误抛的是普通 error，被网关换成通用的「上游请求失败」
+   （TraeWork 额度耗尽就是这么变成「解析失败」的）。现在流内错误一律归一成
+   `errs.Error`（Kind + 上游原话），网关对非结构化错误也会把原话带出去。
+5. **端点 / 域名打错**：QoderCOM 的模型目录打到了推理网关（COM 是双域名：模型表 api2 / 推理 api1）；
+   Gemini 的开通轮询走了一个没有任何参考实现用过的 `GET /v1/internal/{name}`（三份参考都是重发 `onboardUser`）。
+6. **等待上游期间连接静默**：思考型档位出字前可能静默几十秒，会被中间的 nginx / 飞牛网关按空闲
+   超时掐断 → 网关每 15 秒发一次 SSE 保活注释帧（`: keep-alive`，按 SSE 规范客户端会忽略）。
+7. **Windsurf 改走原生工具调用**：参考实现已用**付费实弹**标定 ToolDef 的内部 tag
+   （外层 #10、`name=1 / description=2 / parameters=3`，2026-07-04 opus-4-8 实弹确认）。
+
+**仍未真上游验证**：13 家登录式渠道里只有豆包在本机有可用凭证并完成了真上游验证，其余仍需
+用户粘一次凭证确认；第一次失败时错误信息会带上游原话。
+
 ### 0.5.0 — 「全部走登录式」：Kimi / 智谱清言 / 豆包 / 腾讯元宝
 
 按用户裁定：**不要 API Key 式接入，所有来源都用登录实现**（0.4.3 的「接入源」保持可用，

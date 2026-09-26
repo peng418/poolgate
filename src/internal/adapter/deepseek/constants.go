@@ -9,7 +9,10 @@
 //     伪造会被判 `RISK_DEVICE_DETECTED`，所以二维码那条路给不了 —— 但我们**不存用户密码**。
 package deepseek
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // 端点与客户端常量（2026-09 抓包对齐的公开客户端标识）。
 const (
@@ -36,7 +39,12 @@ const (
 	clientLocale        = "zh_CN"
 	clientBundleID      = "com.deepseek.chat"
 	clientTimezoneOfset = "28800"
-	deviceModel         = "Pixel 7"
+
+	// deviceModel 是 X-Device-Model 头与 check_device 请求体里的 device_model。
+	// 参考实现的默认值是**空串**（config.example.toml:76「真实 Web 客户端发空串」、
+	// src/config.rs:480 client_device_model: String::new()），不是任何具体机型。
+	// 之前填的 "Pixel 7" 是我们臆造的（上游并未要求机型），对齐回空串。
+	deviceModel = ""
 )
 
 // defaultMinIntervalSec 是每账号最小请求间隔出厂默认（秒）。
@@ -52,10 +60,14 @@ const powTimeout = 90 * time.Second
 
 // webModels 是网页端可选档位。
 //
-// 上游其实只有 `default`（快速模式）稳定可用，`expert`（专家模式）在上游被标 disabled、
-// 仍可调用但不稳 —— 列表里如实写清楚，别让用户以为它和 default 一样可靠。
-// `deepseek-chat` / `deepseek-reasoner` 是给习惯官方叫法的人用的别名（映射到同一档，
-// 用 thinking_enabled 区分要不要思考）。
+// 上游只有 `default`（快速模式）稳定可用；`expert`（专家模式）在上游
+// `/api/v0/client/settings` 里被标 enabled=false/switchable=false（参考实现
+// src/config.rs:220-229 因此默认不暴露它），仍可调用但不稳 —— 我们保留它但如实标注，
+// 别让用户以为它和 default 一样可靠。
+//
+// 每个档位同时给出**参考实现的标准 ID `deepseek-<type>` 和裸 model_type 名**：
+// 参考实现 src/openai_adapter/models.rs:43-64 就是这么生成模型 ID 的
+// （先 `deepseek-{ty}` 再裸 `{ty}`），客户端用任一种都能命中。
 var webModels = []struct {
 	ID    string
 	Name  string
@@ -64,16 +76,32 @@ var webModels = []struct {
 	Note  string
 }{
 	{ID: "default", Name: "DeepSeek 默认（快速模式）", Type: "default", Think: true},
-	{ID: "deepseek-chat", Name: "DeepSeek Chat（官方叫法，同默认档，不开思考）", Type: "default"},
-	{ID: "deepseek-reasoner", Name: "DeepSeek Reasoner（官方叫法，同默认档，开思考）", Type: "default", Think: true},
+	{ID: "deepseek-default", Name: "DeepSeek 默认（快速模式，参考实现标准 ID）", Type: "default", Think: true},
 	{ID: "expert", Name: "DeepSeek 专家模式", Type: "expert", Think: true, Note: "上游标为 disabled，实测可用但不稳"},
+	{ID: "deepseek-expert", Name: "DeepSeek 专家模式（参考实现标准 ID）", Type: "expert", Think: true, Note: "上游标为 disabled"},
+	// deepseek-chat / deepseek-reasoner 是 PoolGate 自有的 OpenAI 习惯别名，**参考实现没有这两个 ID**
+	// （它用 reasoning_effort 控制开关思考，见 src/openai_adapter/request/resolver.rs:48-49）。
+	// 保留是为了兼容习惯官方叫法、且用模型名表达「要不要思考」的客户端，映射到同一个 default 档。
+	{ID: "deepseek-chat", Name: "DeepSeek Chat（本渠道别名，同默认档，不开思考）", Type: "default"},
+	{ID: "deepseek-reasoner", Name: "DeepSeek Reasoner（本渠道别名，同默认档，开思考）", Type: "default", Think: true},
 }
 
 // modelOf 按客户端模型名找档位；找不到就用 default（宁可给默认档，也不失败 —— 但要能看出来）。
+//
+// 匹配忽略大小写，且接受参考实现那两套写法：精确 ID（含 `deepseek-default` 等）与
+// `deepseek-<type>` 前缀 + 裸 model_type（models.rs:43-64）。
 func modelOf(id string) (typ string, think bool, ok bool) {
+	key := strings.ToLower(strings.TrimSpace(id))
 	for _, m := range webModels {
-		if m.ID == id {
+		if strings.ToLower(m.ID) == key {
 			return m.Type, m.Think, true
+		}
+	}
+	if bare, found := strings.CutPrefix(key, "deepseek-"); found {
+		for _, m := range webModels {
+			if m.Type == bare {
+				return m.Type, m.Think, true
+			}
 		}
 	}
 	return "default", true, false

@@ -2,15 +2,18 @@ package chatgpt
 
 // stream.go SSE 帧 → 标准 OpenAI chunk 流。
 //
-// 上游是标准 SSE（`data: <json>`，结束 `data: [DONE]`），但**同一条增量有两种形态**，
+// 上游是标准 SSE（`data: <json>`，结束 `data: [DONE]`），但**同一条增量有三种形态**，
 // 所以不能简单地「见到 v 就当正文」：
 //
 //	形态一（patch）：{"p":"/message/content/parts/0","o":"append","v":"tok"}
 //	                 路径决定它算正文还是思考，o 是 append/replace；
 //	形态二（整条消息）：{"v":{"conversation_id":…,"message":{author,content,status,…}}}
-//	                 一次给全文快照，还带 status/end_turn 这些结束信号。
+//	                 一次给全文快照，还带 status/end_turn 这些结束信号；
+//	形态三（省略路径的增量）：{"v":"tok"}
+//	                 只有 v 没有 p —— 上游把「接着上一段的续写」直接放进 v 里。
+//	                 这不是可有可无的兜底：三份参考实现都专门处理了它，漏掉它会**静默丢字**。
 //
-// 两种形态**可能同时出现**（上游既发增量也发快照）。照搬参考实现的做法：
+// 三种形态**可能同时出现**（上游既发增量也发快照）。照搬参考实现的做法：
 // 每条事件都算出「到目前为止的完整文本」，与本地的做**前缀差分**，只把多出来的部分
 // 发出去。这样重复的快照自然变成空增量，不需要额外去重逻辑 —— 手写去重几乎都会
 // 在「快照比本地长一点」这类边界上把正文吞掉。
@@ -193,11 +196,7 @@ func (st *streamState) apply(payload string) ([]emitted, error) {
 	// 1) 帧内错误：身分类 → 凭证要重登；其余 → 上游故障。
 	//    分错的代价很实际：判成凭证问题会**禁用账号**（SessionDead 的策略是 Disable），
 	//    而真·凭证过期判成上游故障只会白重试几轮。
-	if e, ok := ev["error"].(map[string]any); ok {
-		msg := strAny(e["message"], "")
-		if strings.TrimSpace(msg) == "" {
-			msg = truncate(payload, 200)
-		}
+	if msg, ok := errorFrameMessage(ev["error"], payload); ok {
 		kind := errs.UpstreamFault
 		if looksLikeAuthError(msg) {
 			kind = errs.SessionDead
@@ -233,6 +232,17 @@ func (st *streamState) walk(ev map[string]any, out *[]emitted) {
 	}
 	v, hasV := ev["v"]
 	if !hasV {
+		// 没有外层 v 的帧：把消息**直接摊在顶层**的形态（实测 chatgpt.com 现在就是这么发的：
+		// {"message":{author:assistant,content:{parts:[…]},status:…},"conversation_id":…,"error":null}）。
+		// 之前这里直接 return，于是「挑战过了、上游也在正常出字，客户端却拿到空回复」——
+		// 2026-09-26 用 POOLGATE_DEBUG_SSE 抓到原始帧才定位到。
+		if _, ok := ev["message"]; ok {
+			st.applySnapshot(ev, out)
+			return
+		}
+		if _, ok := ev["author"]; ok {
+			st.applySnapshot(ev, out)
+		}
 		return
 	}
 	switch val := v.(type) {
@@ -277,8 +287,29 @@ func (st *streamState) applyPatch(path, op, value string, out *[]emitted) {
 		st.pushText(&st.rawReason, &st.cleanReason, value, op, out, false)
 	case path == "/message/content/thoughts/summary":
 		st.pushText(&st.rawSummary, &st.cleanSummary, value, op, out, false)
+	case path == "" && op == "":
+		// 形态三：省略路径的文本增量 `{"v":"tok"}` —— 接在**当前正文**后面。
+		//
+		// 依据：三份参考实现都专门处理这个形态 ——
+		//   - chatgpt2api-basketikun/services/protocol/conversation.py:502-503
+		//     （`isinstance(operations, str) and ... not p and not o` → `current_text + operations`），
+		//     其 docs/upstream-sse-conversation.md:88-107 给出的真实序列就是
+		//     `{"p":"/message/content/parts/0","o":"append","v":"Hello"}` 后面紧跟 `{"v":" world"}`；
+		//   - gpt4free/g4f/Provider/needs_auth/OpenaiChat.py:1290-1291（`"p" not in line` 也算正文）；
+		//   - ChatGPT2API-GO/internal/app/upstream.go:1365（无 p / 无 o 的字符串 v 追加到当前文本）。
+		//
+		// 漏掉它的后果是**静默丢字**：正文会被切成「Hello」+「!」这种残缺句子，
+		// 而错误信息里一个字节都不会提到 —— 正是红线一（禁止静默丢弃）要挡的那类。
+		//
+		// 两处刻意的选择（都与「不丢内容」一致）：
+		//   1. 只认「既没有 p 也没有 o」的字符串 v。带 o 的（如 `{"o":"add","v":{…}}`）
+		//      走上面的快照分支或忽略，不会误吞。
+		//   2. 不抄 Go/basketikun 的 `current != ""` 前置条件（那会在「正文还没开始、
+		//      首片就是省略路径增量」时把内容丢掉）；gpt4free 也是无条件追加。
+		//      多算一次增量最多是重复，丢一次就是缺字 —— 这两种代价在本渠道里不对等。
+		st.pushText(&st.raw, &st.clean, value, "append", out, true)
 	}
-	// 其余路径（metadata/*、asset_pointer、status…）不是给用户看的文本，忽略。
+	// 其余路径（metadata/*、asset_pointer、status、end_turn…）不是给用户看的文本，忽略。
 }
 
 // applySnapshot 处理「整条消息」形态。
@@ -504,6 +535,38 @@ func isEntityType(v string) bool {
 		}
 	}
 	return true
+}
+
+// errorFrameMessage 从帧内的 error 字段取出可读的错误文本。
+//
+// error 的形态上游并不固定：对象（{"message":…}）、字符串、甚至标量都出现过。
+// 只认对象的话，`{"error":"…"}` 这类帧会被当成「没有 v 的普通事件」跳过 ——
+// 客户端拿到一个「正常结束的空回复」，把上游的明确报错静默吞掉。
+// gpt4free 对任何真值的 error 都直接抛（OpenaiChat.py:1452-1453），这里按同样口径取文本。
+func errorFrameMessage(raw any, payload string) (string, bool) {
+	switch v := raw.(type) {
+	case nil:
+		return "", false
+	case bool:
+		if !v {
+			return "", false
+		}
+		return truncate(payload, 200), true
+	case string:
+		if strings.TrimSpace(v) == "" {
+			return "", false
+		}
+		return v, true
+	case map[string]any:
+		if msg := strings.TrimSpace(strAny(v["message"], "")); msg != "" {
+			return msg, true
+		}
+		// 对象里没有 message（有的是 {"type":…,"code":…}）→ 退回整帧文本，
+		// 至少让用户看到上游原话。
+		return truncate(payload, 200), true
+	default:
+		return truncate(payload, 200), true
+	}
 }
 
 // looksLikeAuthError 判断帧内错误是不是「凭证问题」。

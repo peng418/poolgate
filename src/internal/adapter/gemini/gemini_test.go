@@ -3,6 +3,7 @@ package gemini
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,6 +22,90 @@ func testAdapter(srv *httptest.Server) *Adapter {
 	a.tokenURL = srv.URL + "/token"
 	a.userInfoURL = srv.URL + "/userinfo"
 	return a
+}
+
+// 长任务没做完时应当**重发同一个 onboardUser**，不是去 GET 操作名 ——
+// 那个 GET 路径没有任何参考实现用过（geminicli2api auth.py:497-510 等三份都是重发）。
+func TestOnboardPollsByReposting(t *testing.T) {
+	posts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/token":
+			fmt.Fprint(w, `{"access_token":"at","refresh_token":"rt","expires_in":3600}`)
+		case "/userinfo":
+			fmt.Fprint(w, `{"email":"u@example.test"}`)
+		case "/v1internal:loadCodeAssist":
+			fmt.Fprint(w, `{"allowedTiers":[{"id":"free-tier","isDefault":true}]}`)
+		case "/v1internal:onboardUser":
+			posts++
+			if posts < 2 {
+				fmt.Fprint(w, `{"done":false}`)
+				return
+			}
+			fmt.Fprint(w, `{"done":true,"response":{"cloudaicompanionProject":{"id":"proj-late"}}}`)
+		default:
+			t.Errorf("不该请求这个路径：%s", r.URL.Path)
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+	a := testAdapter(srv)
+	sess, _ := a.StartLogin(context.Background(), channel.LoginOptions{})
+	sess.(channel.CallbackAcceptor).AcceptCallback("code-abcdefghijklmnop")
+	cred, err := sess.Poll(context.Background())
+	if err != nil {
+		t.Fatalf("Poll 失败：%v", err)
+	}
+	if cred.Extra["project"] != "proj-late" {
+		t.Fatalf("重发轮询没拿到 project：%+v", cred.Extra)
+	}
+	if posts != 2 {
+		t.Fatalf("应当重发 onboardUser 直到 done，实际 POST %d 次", posts)
+	}
+}
+
+// 流内错误（HTTP 200 但帧里带 error 对象）必须归一成 errs.Error 并把上游原话传出来。
+// 这是红线一：过去这一支被当成「没有 candidates 的普通帧」静默跳过，客户端只看到空回复。
+func TestChatStreamErrorSurfaces(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: "+`{"response":{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"好的"}]}}]}}`+"\n\n")
+		fmt.Fprint(w, "data: "+`{"error":{"code":429,"message":"Resource has been exhausted (quota).","status":"RESOURCE_EXHAUSTED"}}`+"\n\n")
+	}))
+	defer srv.Close()
+	a := testAdapter(srv)
+	st, err := a.Chat(context.Background(), &channel.Credential{
+		UID: "u", AccessToken: "at", Extra: map[string]string{"project": "p"},
+	}, channel.ChatRequest{Model: "gemini-2.5-pro", Messages: []channel.Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatalf("Chat 失败：%v", err)
+	}
+	defer st.Close()
+
+	var gotErr error
+	for {
+		_, err := st.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			gotErr = err
+			break
+		}
+	}
+	if gotErr == nil {
+		t.Fatal("流内错误必须暴露给调用方，不能静默跳过")
+	}
+	var ee *errs.Error
+	if !errors.As(gotErr, &ee) {
+		t.Fatalf("流内错误必须是 errs.Error：%T", gotErr)
+	}
+	if !strings.Contains(ee.Upstream, "Resource has been exhausted") {
+		t.Fatalf("上游原话必须留在 Upstream：%+v", ee)
+	}
+	if ee.Kind != errs.HardCredit {
+		t.Fatalf("429 + 额度耗尽应归为 HardCredit，实际 %v", ee.Kind)
+	}
 }
 
 // 授权流：生成的授权地址要带对参数；用户粘回码之后能换到凭证并完成「开通」。
@@ -285,15 +370,25 @@ func TestBuildRequestConversion(t *testing.T) {
 		}},
 		ToolChoice: "required",
 	}
-	raw, err := buildRequest(req, "proj", "sess-1")
+	raw, err := buildRequest(req, "proj")
 	if err != nil {
 		t.Fatalf("buildRequest 失败：%v", err)
 	}
 	var obj map[string]any
 	json.Unmarshal(raw, &obj)
+	// 外层信封只允许 {model, project, request} —— 参考实现三份都只有这三个，
+	// 多发 Google 会按未知字段 400。
+	for k := range obj {
+		if k != "model" && k != "project" && k != "request" {
+			t.Fatalf("外层信封出现参考实现没有的字段 %q：%v", k, obj)
+		}
+	}
 	inner, _ := obj["request"].(map[string]any)
 	if inner == nil {
 		t.Fatalf("缺内层：%v", obj)
+	}
+	if _, has := inner["session_id"]; has {
+		t.Fatal("内层不应带 session_id（参考实现没有此字段）")
 	}
 	// system 走 systemInstruction，不进 contents
 	if si, _ := inner["systemInstruction"].(map[string]any); si == nil {

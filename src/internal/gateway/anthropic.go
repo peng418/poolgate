@@ -161,6 +161,10 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		creq = toolshim.BuildRequest(creq)
 	}
 
+	// 网关侧最后一道防线（见 pairing.go）：发出上游前清理孤儿 tool 配对。
+	// Anthropic 入口同样归一成 channel.ChatRequest，与 chat.completions 走同一套清理。
+	creq.Messages = sanitizeToolPairing(creq.Messages)
+
 	// 路由。
 	res, err := s.router.Route(r.Context(), ch, kind, r.Header.Get("X-Poolgate-Session"), creq)
 	if err != nil {
@@ -227,6 +231,11 @@ func aggregate(st channel.Stream, model string) aggMessage {
 				a.Finish = ch.FinishReason
 			}
 		}
+	}
+	// 流被截断（finish_reason==length）时丢弃 arguments 残缺的工具调用（见 truncation.go）：
+	// buildAnthropicMessage 会把它转成 input 非法 JSON 的 tool_use 块，客户端据此解析会卡死。
+	if truncatedFinish(a.Finish) {
+		a.ToolCalls = dropTruncatedToolCalls(a.ToolCalls)
 	}
 	return a
 }

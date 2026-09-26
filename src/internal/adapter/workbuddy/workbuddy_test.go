@@ -190,6 +190,73 @@ func TestBuildBodyShape(t *testing.T) {
 	}
 }
 
+func TestBuildBodyShapeNoMaxTokensNoTemperature(t *testing.T) {
+	// 客户端没给 max_tokens（网关传 0）时不能发 `"max_tokens":0`：
+	// OpenAI 语义里那是「一个 token 都不许生成」，上游可能直接拒（豆包 710020202 同类的教训）。
+	raw := buildBody(channel.ChatRequest{Model: "glm-5.2", Messages: []channel.Message{{Role: "user", Content: "u"}}})
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("请求体不是合法 JSON: %v", err)
+	}
+	if _, ok := obj["max_tokens"]; ok {
+		t.Fatalf("客户端没给 max_tokens 时不应带该字段，实际 %v", obj["max_tokens"])
+	}
+	if _, ok := obj["temperature"]; ok {
+		t.Fatalf("客户端没给 temperature 时不应带该字段，实际 %v", obj["temperature"])
+	}
+
+	// 给了就原样透传。
+	temp := 0.3
+	raw2 := buildBody(channel.ChatRequest{Model: "m", MaxTokens: 64, Temperature: &temp,
+		Messages: []channel.Message{{Role: "user", Content: "u"}}})
+	var obj2 map[string]any
+	_ = json.Unmarshal(raw2, &obj2)
+	if obj2["max_tokens"] != float64(64) {
+		t.Fatalf("客户端给的 max_tokens 应原样透传，实际 %v", obj2["max_tokens"])
+	}
+	if obj2["temperature"] != 0.3 {
+		t.Fatalf("客户端给的 temperature 应原样透传，实际 %v", obj2["temperature"])
+	}
+}
+
+// tool_choice 必须归一成字符串再发：上游把该字段声明为 string，发对象会 400 code=11101
+// （wild-work payload.go normalizeToolChoice / hub v1.5.8 normalize_tool_choice）。
+func TestBuildBodyNormalizesToolChoice(t *testing.T) {
+	tools := []map[string]any{{"type": "function", "function": map[string]any{"name": "f"}}}
+	msgs := []channel.Message{{Role: "user", Content: "u"}}
+
+	// 对象形态 {"type":"function","function":{"name":"f"}} → 字符串 "f"
+	raw := buildBody(channel.ChatRequest{Model: "m", Messages: msgs, Tools: tools,
+		ToolChoice: map[string]any{"type": "function", "function": map[string]any{"name": "f"}}})
+	var obj map[string]any
+	_ = json.Unmarshal(raw, &obj)
+	if obj["tool_choice"] != "f" {
+		t.Fatalf("function 型 tool_choice 应归一成函数名字符串，实际 %#v", obj["tool_choice"])
+	}
+
+	// "auto" 原样；tools 一并转发。
+	raw2 := buildBody(channel.ChatRequest{Model: "m", Messages: msgs, Tools: tools, ToolChoice: "auto"})
+	var obj2 map[string]any
+	_ = json.Unmarshal(raw2, &obj2)
+	if obj2["tool_choice"] != "auto" {
+		t.Fatalf("auto 应原样透传，实际 %#v", obj2["tool_choice"])
+	}
+	if _, ok := obj2["tools"]; !ok {
+		t.Fatal("给了 tools 就应转发")
+	}
+
+	// "none"：channel.ForwardTools() 丢弃 tools；tool_choice 也不发。
+	raw3 := buildBody(channel.ChatRequest{Model: "m", Messages: msgs, Tools: tools, ToolChoice: "none"})
+	var obj3 map[string]any
+	_ = json.Unmarshal(raw3, &obj3)
+	if _, ok := obj3["tools"]; ok {
+		t.Fatal("tool_choice:none 时不应带 tools")
+	}
+	if _, ok := obj3["tool_choice"]; ok {
+		t.Fatalf("未知/none 的 tool_choice 不应转发，实际 %#v", obj3["tool_choice"])
+	}
+}
+
 // 刷新：拿 X-Refresh-Token 走专用头，成功后轮换 dt/rt；响应无 token → SessionDead。
 func TestRefreshRotationAndFailure(t *testing.T) {
 	var gotHeader string
@@ -287,5 +354,100 @@ func TestStaticModelsSane(t *testing.T) {
 	}
 	if !spec.SSEOnly {
 		t.Fatal("WorkBuddyCN 上游只有流式，SSEOnly 必须为 true")
+	}
+}
+
+// 余额请求必须打账单域（a.billing，替身里即 srv.URL）并带上参考实现固定要求的
+// PackageEndTimeRange* 字段 —— 此前缺这两项，且账单域与 chat 域混用。
+func TestBalanceUsesBillingEndpointAndRanges(t *testing.T) {
+	var gotPath, gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		_, _ = io.WriteString(w, `{"code":0,"msg":"","data":{"Response":{"Data":{"Accounts":[]}}}}`)
+	}))
+	defer srv.Close()
+
+	a := NewWithBase(srv.URL, srv.Client())
+	if _, err := a.Balance(context.Background(), &channel.Credential{UID: "u1", AccessToken: "t"}); err != nil {
+		t.Fatalf("余额查询失败: %v", err)
+	}
+	if gotPath != EpUserRes {
+		t.Fatalf("账单路径应为 %s，实际 %s", EpUserRes, gotPath)
+	}
+	for _, k := range []string{"PackageEndTimeRangeBegin", "PackageEndTimeRangeEnd"} {
+		if !strings.Contains(gotBody, k) {
+			t.Fatalf("账单请求体应带 %s，实际 %s", k, gotBody)
+		}
+	}
+
+	// 周期总量为 0 但周期剩余 > 0 的中间档：应取周期剩余，而不是常为 0 的容量剩余。
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"code":0,"msg":"","data":{"Response":{"Data":{"Accounts":[
+			{"CycleCapacitySize":0,"CycleCapacityRemain":77,"CycleCapacityUsed":23,"CapacitySize":100,"CapacityRemain":0}
+		]}}}}`)
+	}))
+	defer srv2.Close()
+	a2 := NewWithBase(srv2.URL, srv2.Client())
+	b, err := a2.Balance(context.Background(), &channel.Credential{UID: "u1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Credits != 77 {
+		t.Fatalf("中间档应取周期剩余 77，实际 %d", b.Credits)
+	}
+}
+
+// 错误归一补全：402 → HardCredit、会话失效标记 → SessionDead、内容拦截/超长/模型不可用各有专属类别。
+func TestClassifyExtraMarkers(t *testing.T) {
+	cases := []struct {
+		status int
+		body   string
+		want   errs.Kind
+	}{
+		{402, `payment required`, errs.HardCredit},
+		{200, `{"code":12153,"msg":"Offline user session not found"}`, errs.SessionDead},
+		{403, `{"msg":"blocked by security policy"}`, errs.ContentBlocked},
+		{400, `{"code":11115,"msg":"prompt is too long"}`, errs.PromptTooLong},
+		{400, `{"code":11102,"msg":"service info not found"}`, errs.ModelUnavailable},
+	}
+	for _, c := range cases {
+		if got := Classify(c.status, c.body); got != c.want {
+			t.Fatalf("Classify(%d, %q) 期望 %s，实际 %s", c.status, c.body, c.want, got)
+		}
+	}
+}
+
+// 出站脱敏回归：Claude Code / Agent SDK 注入的身份句必须在上游**收到的 body** 里被改写。
+// 上游对其逐字精确匹配，命中即 HTTP 400 code=11128
+// （"Illegal API invocation from an unapproved channel"）——从 Claude Code / Studio 调本渠道
+// 会被原样挡掉。断言改写发生，且消息条数与无关内容不变。
+func TestBuildBodySanitizesClaudeFingerprint(t *testing.T) {
+	const ccIdentity = "You are Claude Code, Anthropic's official CLI for Claude."
+	raw := buildBody(channel.ChatRequest{
+		Model: "glm-5.2",
+		Messages: []channel.Message{
+			{Role: "system", Content: ccIdentity},
+			{Role: "user", Content: "hi"},
+		},
+	})
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("请求体不是合法 JSON: %v", err)
+	}
+	msgs := obj["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("消息条数应保持 2 条，实际 %d", len(msgs))
+	}
+	sys, _ := msgs[0].(map[string]any)["content"].(string)
+	if strings.Contains(sys, ccIdentity) {
+		t.Fatalf("上游收到的 body 仍带指纹原文: %q", sys)
+	}
+	if !strings.Contains(sys, "official CLI tool for Claude.") {
+		t.Fatalf("身份句未被最小改写: %q", sys)
+	}
+	if got, _ := msgs[1].(map[string]any)["content"].(string); got != "hi" {
+		t.Fatalf("无关消息被改动: %q", got)
 	}
 }

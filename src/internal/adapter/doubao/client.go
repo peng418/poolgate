@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -264,6 +265,20 @@ func randHex16() string {
 	var b [16]byte
 	_, _ = rand.Read(b[:])
 	return hex.EncodeToString(b[:])
+}
+
+// randUUID4 生成一个 UUIDv4 串。
+//
+// 上游对 local_message_id / block_id / unique_key 这几个字段要的是**UUID 形态**的字面量，
+// 参考实现（doubao2api `_build_completion_payload`）就是 `str(uuid.uuid4())`，
+// 空串会让上游把这次请求当成非法客户端。形态必须是带连字符的 8-4-4-4-12。
+func randUUID4() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 func truncate(s string, n int) string {

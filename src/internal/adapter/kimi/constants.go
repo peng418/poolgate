@@ -22,7 +22,8 @@ const (
 
 	// epChat 是对话端点。注意路径里的 `apiv2/<service>/<Method>` 是 Connect 的形态。
 	epChat = "/apiv2/kimi.gateway.chat.v1.ChatService/Chat"
-	// epModels 是模型目录（上游的可用模型清单）。
+	// epModels 是模型目录（上游的可用模型清单）。**不是 Connect 信封**：
+	// 参考实现用普通 JSON 调它（kimi2api app/kimi/model_catalog.py:253-265，body `{}`）。
 	epModels = "/apiv2/kimi.gateway.config.v1.ConfigService/GetAvailableModels"
 	// epRefresh 用 refresh token 换 access token（GET，Bearer 传 refresh token）。
 	epRefresh = "/api/auth/token/refresh"
@@ -32,6 +33,18 @@ const (
 	// scenario 是对话场景标识。参考实现只有一个常量（SCENARIO_K2D5），
 	// 所有模型档位都用它 —— 上游按 models 里的模型名与 scenario 共同决定路由。
 	scenario = "SCENARIO_K2D5"
+
+	// scenarioOKComputer 是 agent 档（`-agent` / `-agent-swarm`）的场景。
+	// 参考实现按目录响应里的 scenario 走（model_catalog.py:126-141），
+	// 已知的 agent 档就是 SCENARIO_OK_COMPUTER（tests/test_model_catalog.py:23-36）。
+	scenarioOKComputer = "SCENARIO_OK_COMPUTER"
+
+	// kimiPlusIDAgent / agentMode* 是 agent 档要带的产品参数：
+	// 参考实现只在 model_spec 里非空时才写进请求体（client.py:332-335），
+	// 值取自目录响应（`kimiPlusId: "ok-computer"`、`agentMode: TYPE_NORMAL/TYPE_ULTRA`）。
+	kimiPlusIDAgent = "ok-computer"
+	agentModeNormal = "TYPE_NORMAL"
+	agentModeUltra  = "TYPE_ULTRA"
 
 	// defaultModel 是模型名认不出来时的兜底档（宁可给默认档，也不让请求失败，
 	// 但要能在日志里看出来 —— 与 DeepSeek 渠道同一个处理原则）。
@@ -53,6 +66,10 @@ const (
 // 为什么必须有：这些头在 kimi2api 里是硬编码的实测结论（Accept-Language、R-Timezone、
 // Sec-Ch-Ua 一套），缺了会被当成非浏览器客户端。UA 版本号会随上游放宽/收紧而失效 ——
 // 换 UA 时只改这里一处。
+//
+// **故意不抄**参考实现里的 `Accept-Encoding: gzip, deflate, br, zstd`（protocol.py:17）：
+// Go 只在「自己加 Accept-Encoding」时才透明解压 gzip，一旦我们手动声明，就得自己解 br/zstd —
+// 而这个渠道的响应是二进制帧流，解压错一层会变成「一直转圈」。让 Go 自己协商 gzip 最稳。
 var fakeHeaders = map[string]string{
 	"Accept":             "*/*",
 	"Accept-Language":    "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -68,25 +85,44 @@ var fakeHeaders = map[string]string{
 	"Sec-Fetch-Site":     "same-origin",
 	"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 		"(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+	// Priority 在参考实现里是硬编码的伪装头（kimi2api app/kimi/protocol.py:34），
+	// 属于 Chrome 指纹的一部分，漏掉就是「少一个头」的客户端。
+	"Priority":       "u=1, i",
 	"X-Msh-Platform": "web",
 }
 
-// webModels 是面板下发的模型清单（Kimi 的档位不是「模型不同」，而是**同一模型的开关组合**：
-// 开不开思考、开不开联网搜索。后缀就是这个意思，别把它当成不同的模型去理解）。
+// fallbackModels 是模型目录拉不到时的兜底清单（正常情况下以**上游目录为准**，见 models.go）。
 //
-// 上游还有 `-agent` / `-agent-swarm` 这类智能体档，协议形态与普通对话不同（超出本适配器范围），
-// 故意不列 —— 不下发不存在的档位，比下发一个点了就报错的档位好。
-var webModels = []struct {
-	ID    string
-	Name  string
-	Think bool
-	// Search 是「开联网搜索」：请求体里 tools 带 TOOL_TYPE_SEARCH 即开。
-	Search bool
-}{
-	{ID: "kimi-k2.6", Name: "Kimi K2.6"},
-	{ID: "kimi-k2.6-thinking", Name: "Kimi K2.6（思考）", Think: true},
-	{ID: "kimi-k2.6-search", Name: "Kimi K2.6（联网搜索）", Search: true},
-	{ID: "kimi-k2.6-thinking-search", Name: "Kimi K2.6（思考 + 联网搜索）", Think: true, Search: true},
+// 来源：参考实现公开列出的档位 —— kimi2api README「模型和参数」一节，以及
+// tests/test_model_catalog.py 里对目录响应生成规则的断言。Kimi 的档位不是「不同模型」，
+// 而是**同一模型的开关组合**（开不开思考、开不开联网搜索）+ agent 档的产品 id，别当成不同模型理解。
+//
+// 为什么 fallback 也把 agent 档列上：拉目录失败（网络/凭证/上游改版）时若只列基础档，
+// 客户端就再也点不到 agent 档；而 agent 档的请求形态与普通档**没有区别**，
+// 只是多带 kimiplusId/agentMode 两个字段（client.py:332-335）。能否用是账号订阅的问题，
+// 由上游目录回答；兜底表只保证「名字认得出、请求发得对」。
+var fallbackModels = []localModel{
+	{ID: "kimi-k2.6", Name: "Kimi K2.6",
+		Spec: modelSpec{scenario: scenario, known: true}},
+	{ID: "kimi-k2.6-thinking", Name: "Kimi K2.6（思考）",
+		Spec: modelSpec{scenario: scenario, thinking: true, known: true}},
+	{ID: "kimi-k2.6-search", Name: "Kimi K2.6（联网搜索）",
+		Spec: modelSpec{scenario: scenario, search: true, known: true}},
+	{ID: "kimi-k2.6-thinking-search", Name: "Kimi K2.6（思考 + 联网搜索）",
+		Spec: modelSpec{scenario: scenario, thinking: true, search: true, known: true}},
+	{ID: "kimi-k2.6-agent", Name: "Kimi K2.6（Agent）",
+		Spec: modelSpec{scenario: scenarioOKComputer, kimiPlusID: kimiPlusIDAgent, agentMode: agentModeNormal, known: true}},
+	{ID: "kimi-k2.6-agent-swarm", Name: "Kimi K2.6（Agent Swarm）",
+		Spec: modelSpec{scenario: scenarioOKComputer, kimiPlusID: kimiPlusIDAgent, agentMode: agentModeUltra, known: true}},
+}
+
+// localModel 是模型表的一项：面板形态（ID/Name）+ 对话时要用的档位参数。
+// 目录拉回来的和兜底表用的是同一个结构 —— 这样「列表里有的档位」与「Chat 认得出来的档位」
+// 天然一致，不会出现「面板能选但发出去是别的档」这种最糟的组合。
+type localModel struct {
+	ID   string
+	Name string
+	Spec modelSpec
 }
 
 // modelSpec 是一个模型档位解析后的形态。
@@ -94,14 +130,20 @@ type modelSpec struct {
 	scenario string
 	thinking bool
 	search   bool
-	known    bool
+	// kimiPlusID / agentMode 只有 agent 档非空：参考实现在非空时才写进请求体
+	// （client.py:332-335，键名是 kimiplusId / agentMode）。
+	kimiPlusID string
+	agentMode  string
+	known      bool
 }
 
-// specOf 解析客户端给的模型名。
+// specOf 解析客户端给的模型名（**兜底路径**：目录里的档位先查 specFor 的表，见 models.go）。
 //
 // 后缀可以叠加且顺序不定（`-thinking-search` 与 `-search-thinking` 等价），逐个剥掉即可。
 // 版本号段不参与判断：上游用什么 scenario 由版本决定，我们现在只知道 K2D5 这一个 ——
 // 所以**只对认得出的形态放行**，认不出就回落到默认档并由调用方记一笔（不假装认识）。
+// agent 档不在这里识别：它的 scenario/kimiPlusId/agentMode 只能从上游目录（或兜底表）知道，
+// 光看名字猜会发出一个「agent 名 + 普通场景」的错请求。
 func specOf(id string) modelSpec {
 	base := strings.ToLower(strings.TrimSpace(id))
 	thinking, search := false, false

@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"math"
 	"net/http"
@@ -65,6 +66,22 @@ func respMetaFrame(prompt, completion, cacheRead uint64) []byte {
 
 func respFinishFrame(v uint64) []byte {
 	return frame(0x00, appendVarintField(nil, respFieldFinish, v))
+}
+
+// respToolCallFrame 造一帧带一个原生 ChatToolCall（#6）的响应。空串字段不写，
+// 便于模拟「第一帧给 id、后续帧只给参数碎片」的分片形态。
+func respToolCallFrame(id, name, args string) []byte {
+	var sub []byte
+	if id != "" {
+		sub = appendStringField(sub, callFieldID, id)
+	}
+	if name != "" {
+		sub = appendStringField(sub, callFieldName, name)
+	}
+	if args != "" {
+		sub = appendStringField(sub, callFieldArguments, args)
+	}
+	return frame(0x00, appendBytesField(nil, respFieldToolCalls, sub))
 }
 
 func trailerFrame(jsonStr string) []byte {
@@ -272,7 +289,7 @@ func TestBuildChatRequestWireShape(t *testing.T) {
 		{Role: "assistant", Content: "好"},
 		{Role: "tool", ToolCallID: "call_1", Content: "晴"},
 	}
-	raw := buildChatRequest(token, "swe-1-6-slow", "", msgs, 0, &temp)
+	raw := buildChatRequest(token, "swe-1-6-slow", "", msgs, nil, 0, &temp)
 
 	top, err := parseFields(raw)
 	if err != nil {
@@ -316,8 +333,9 @@ func TestBuildChatRequestWireShape(t *testing.T) {
 		t.Fatalf("system 应上提到 #2，得到 %q", got)
 	}
 
-	// 对话序列 #3：user 甲+乙 合并且 system 不在其中，另加 assistant、tool 降级成 user。
+	// 对话序列 #3：user 甲+乙 合并且 system 不在其中，另加 assistant、原生 tool_result。
 	var chatTexts []string
+	var lastMsg []pfield
 	for _, f := range top {
 		if f.field != reqFieldChatMessage {
 			continue
@@ -327,15 +345,20 @@ func TestBuildChatRequestWireShape(t *testing.T) {
 			t.Fatalf("ChatMessage 解析失败：%v", err)
 		}
 		chatTexts = append(chatTexts, getString(cf, cmFieldText))
+		lastMsg = cf
 	}
 	if len(chatTexts) != 3 {
-		t.Fatalf("对话序列应有 3 条（合并后的 user / assistant / tool 降级），得到 %d：%v", len(chatTexts), chatTexts)
+		t.Fatalf("对话序列应有 3 条（合并后的 user / assistant / 原生 tool_result），得到 %d：%v", len(chatTexts), chatTexts)
 	}
 	if chatTexts[0] != "甲\n\n乙" {
 		t.Fatalf("连续同角色轮应合并，得到 %q", chatTexts[0])
 	}
-	if !strings.Contains(chatTexts[2], "[tool result for call_1]") {
-		t.Fatalf("role=tool 应降级成带 id 的 user 文本，得到 %q", chatTexts[2])
+	// role=tool 带 id → 原生 source=4 + #7 tool_call_id（不再降级成 user 文本）。
+	if v, _ := getVarint(lastMsg, cmFieldSource); v != sourceToolResult {
+		t.Fatalf("带 id 的 tool 轮应是 source=4，得到 %d", v)
+	}
+	if got := getString(lastMsg, cmFieldToolCallID); got != "call_1" {
+		t.Fatalf("#7 tool_call_id 应为 call_1，得到 %q", got)
 	}
 
 	// CompletionConfig #8：默认输出上限 + 温度夹到 0.001。
@@ -352,6 +375,214 @@ func TestBuildChatRequestWireShape(t *testing.T) {
 	}
 	if d := math.Float64frombits(binary.LittleEndian.Uint64(cf6.bytes)); d != minTemperature {
 		t.Fatalf("temperature=0 应夹到 %v，得到 %v", minTemperature, d)
+	}
+}
+
+// 原生工具定义：ToolDef 内部 tag 照参考实现（name=1 / description=2 / parameters=3），
+// 且必须做 MCP 指纹中和（顶层描述=工具名、参数 schema 去掉 description）。
+func TestBuildToolDefsWireShape(t *testing.T) {
+	tools := []map[string]any{{
+		"type": "function",
+		"function": map[string]any{
+			"name":        "get_weather",
+			"description": "Get the weather for a city (this text trips the MCP gate)",
+			"parameters": map[string]any{
+				"type":    "object",
+				"$schema": "http://json-schema.org/draft-07/schema#",
+				"properties": map[string]any{
+					"city":        map[string]any{"type": "string", "description": "city name"},
+					"description": map[string]any{"type": "string"},
+				},
+				"required": []any{"city", "not_a_real_prop"},
+			},
+		},
+	}}
+	// 故意不给 system：有 tools 但无 system 应触发兜底（上游对 Claude 系会回 internal）。
+	raw := buildChatRequest("tok", "swe-1-6-slow", "", []channel.Message{{Role: "user", Content: "hi"}}, tools, 0, nil)
+	top, err := parseFields(raw)
+	if err != nil {
+		t.Fatalf("解析失败：%v", err)
+	}
+	if got := getString(top, reqFieldSystem); got != toolsGuardSystem {
+		t.Fatalf("有 tools 无 system 时应补兜底 system，得到 %q", got)
+	}
+	// #10 是追加在最后的（参考实现的字节序）。
+	if len(top) == 0 || top[len(top)-1].field != reqFieldTools {
+		t.Fatalf("#10 ToolDefs 应追加在最后，得到末字段 #%d", top[len(top)-1].field)
+	}
+	defs := 0
+	var def []pfield
+	for _, f := range top {
+		if f.field == reqFieldTools {
+			defs++
+			def, _ = parseFields(f.bytes)
+		}
+	}
+	if defs != 1 {
+		t.Fatalf("应恰好 1 个 ToolDef，得到 %d", defs)
+	}
+	if got := getString(def, toolDefFieldName); got != "get_weather" {
+		t.Fatalf("ToolDef #1 name 不对：%q", got)
+	}
+	// ★ 顶层描述必须是工具名（MCP 指纹中和），不是真实描述。
+	if got := getString(def, toolDefFieldDescription); got != "get_weather" {
+		t.Fatalf("ToolDef #2 description 应被中和成工具名，得到 %q", got)
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(getBytes(def, toolDefFieldParameters), &schema); err != nil {
+		t.Fatalf("ToolDef #3 parameters 应是合法 JSON：%v", err)
+	}
+	if _, has := schema["$schema"]; has {
+		t.Fatal("$schema 应被丢掉")
+	}
+	if schema["type"] != "object" {
+		t.Fatalf("schema.type 应为 object，得到 %v", schema["type"])
+	}
+	props, _ := schema["properties"].(map[string]any)
+	if props == nil || props["city"] == nil {
+		t.Fatalf("schema.properties 丢了 city：%v", schema)
+	}
+	if _, has := props["city"].(map[string]any)["description"]; has {
+		t.Fatal("参数 schema 里的 description 注解应被去掉（MCP 指纹中和）")
+	}
+	if _, has := props["description"]; !has {
+		t.Fatal("名叫 description 的属性必须保留（它是真实参数，不是注解）")
+	}
+	req, _ := schema["required"].([]any)
+	if len(req) != 1 || req[0] != "city" {
+		t.Fatalf("required 应只保留真实属性 city，得到 %v", schema["required"])
+	}
+}
+
+// 原生工具调用：响应 #6 是**跨帧分片**的 —— 第一帧给 id，后续帧只给参数碎片，必须
+// 按 id 合并成一条；name 解不到时用本轮唯一工具反查；结束原因翻成 tool_calls。
+func TestChatNativeToolCalls(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var all []byte
+		all = append(all, respToolCallFrame("call_1", "", "{\"ci")...)  // 首帧：id + 参数碎片，无 name
+		all = append(all, respToolCallFrame("", "", "ty\":\"SF\"}")...) // 后续帧：只有参数碎片
+		all = append(all, respMetaFrame(10, 5, 0)...)
+		all = append(all, respFinishFrame(2)...)
+		all = append(all, trailerFrame("{}")...)
+		writeChunks(w, all, 5)
+	}))
+	defer srv.Close()
+
+	a := New()
+	a.base = srv.URL
+	st, err := a.Chat(context.Background(), &channel.Credential{AccessToken: "tok"}, channel.ChatRequest{
+		Model:    "swe-1-6-slow",
+		Messages: []channel.Message{{Role: "user", Content: "天气"}},
+		Tools:    []map[string]any{{"type": "function", "function": map[string]any{"name": "get_weather"}}},
+	})
+	if err != nil {
+		t.Fatalf("Chat 失败：%v", err)
+	}
+	defer st.Close()
+
+	var calls []channel.ToolCall
+	finish := ""
+	for {
+		c, err := st.Next()
+		if err != nil {
+			break
+		}
+		for _, ch := range c.Choices {
+			calls = append(calls, ch.Delta.ToolCalls...)
+			if ch.FinishReason != "" {
+				finish = ch.FinishReason
+			}
+		}
+	}
+	if len(calls) != 1 {
+		t.Fatalf("分片应合并成 1 条工具调用，得到 %d：%+v", len(calls), calls)
+	}
+	if calls[0].ID != "call_1" {
+		t.Fatalf("工具调用 id 不对：%q", calls[0].ID)
+	}
+	if calls[0].Function.Name != "get_weather" {
+		t.Fatalf("name 解不到时应用唯一工具反查，得到 %q", calls[0].Function.Name)
+	}
+	if calls[0].Function.Arguments != `{"city":"SF"}` {
+		t.Fatalf("参数碎片应拼回完整 JSON，得到 %q", calls[0].Function.Arguments)
+	}
+	if calls[0].Type != "function" || calls[0].Index != 0 {
+		t.Fatalf("工具调用形状不对：%+v", calls[0])
+	}
+	if finish != "tool_calls" {
+		t.Fatalf("有工具调用时结束原因应为 tool_calls，得到 %q", finish)
+	}
+}
+
+// utf8Stream：多字节字符被切在帧边界时必须扣下半字符、下一批拼回来。
+func TestUTF8StreamHoldsSplitRune(t *testing.T) {
+	var u utf8Stream
+	if got := u.write([]byte{0xE4}); got != "" {
+		t.Fatalf("只收到 3 字节字符的第 1 字节时不应输出，得到 %q", got)
+	}
+	if got := u.write([]byte{0xBD}); got != "" {
+		t.Fatalf("第 2 字节到达时仍不完整，不应输出，得到 %q", got)
+	}
+	if got := u.write([]byte{0xA0}); got != "你" {
+		t.Fatalf("第 3 字节到达后应拼出「你」，得到 %q", got)
+	}
+	if got := u.write([]byte("abc")); got != "abc" {
+		t.Fatalf("ASCII 应立即输出，得到 %q", got)
+	}
+	// 尾部孤立续字节是非法输入：不能被无限扣下，write 必须原样交出。
+	if got := u.write([]byte{0x80, 0x80}); len(got) != 2 {
+		t.Fatalf("非法续字节应原样输出、不挂起，得到 %q", got)
+	}
+	// 上游在字符中途断流：flush 必须交出被扣下的残留字节，不能吞掉。
+	var v utf8Stream
+	if got := v.write([]byte{0xE4}); got != "" {
+		t.Fatalf("半字符不应输出，得到 %q", got)
+	}
+	if got := v.flush(); len(got) != 1 {
+		t.Fatalf("flush 应交出残留字节，得到 %q", got)
+	}
+}
+
+// 端到端：上游把「你」切成 1+2 字节分两帧发（真实 TCP 切帧常态），
+// 我们不能解出 U+FFFD，必须拼回完整的「你好世界」。
+func TestChatAssemblesSplitMultibyte(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		full := []byte("你好世界")
+		var all []byte
+		all = append(all, frame(0x00, appendBytesField(nil, respFieldContent, full[:1]))...)
+		all = append(all, frame(0x00, appendBytesField(nil, respFieldContent, full[1:3]))...)
+		all = append(all, frame(0x00, appendBytesField(nil, respFieldContent, full[3:]))...)
+		all = append(all, trailerFrame("{}")...)
+		writeChunks(w, all, 3)
+	}))
+	defer srv.Close()
+
+	a := New()
+	a.base = srv.URL
+	st, err := a.Chat(context.Background(), &channel.Credential{AccessToken: "tok"}, channel.ChatRequest{
+		Model:    "swe-1-6-slow",
+		Messages: []channel.Message{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Chat 失败：%v", err)
+	}
+	defer st.Close()
+
+	var content strings.Builder
+	for {
+		c, err := st.Next()
+		if err != nil {
+			break
+		}
+		for _, ch := range c.Choices {
+			content.WriteString(ch.Delta.Content)
+		}
+	}
+	if got := content.String(); got != "你好世界" {
+		t.Fatalf("跨帧多字节字符应拼回完整文本，得到 %q", got)
+	}
+	if strings.ContainsRune(content.String(), '�') {
+		t.Fatal("不得出现 U+FFFD（说明半字符被逐帧解码了）")
 	}
 }
 
@@ -619,16 +850,16 @@ func TestClassify(t *testing.T) {
 	}
 }
 
-func TestSpecDeclaresShimNotNativeTools(t *testing.T) {
+func TestSpecDeclaresNativeTools(t *testing.T) {
 	sp := New().Spec()
 	if sp.Kind != channel.Windsurf {
 		t.Fatalf("Kind 不对：%v", sp.Kind)
 	}
-	if sp.Tools {
-		t.Fatal("不得声明原生工具调用（ToolDef 内部 tag 未标定，猜错静默失败）")
+	if !sp.Tools {
+		t.Fatal("ToolDef 内部 tag 已由参考实现付费实弹标定，应声明原生工具调用")
 	}
-	if !sp.ToolsShim {
-		t.Fatal("必须声明 ToolsShim=true（工具调用由网关模拟）")
+	if sp.ToolsShim {
+		t.Fatal("走原生透传时不得再声明 ToolsShim（它与 Tools 互斥）")
 	}
 	if !sp.Reasoning {
 		t.Fatal("上游原生分流思考（#9），应声明 Reasoning")
@@ -657,7 +888,7 @@ func TestModelsListFreeSelector(t *testing.T) {
 		if m.ID == defaultModel {
 			found = true
 			if m.Tools != channel.CapYes {
-				t.Fatal("客户端侧应可用工具（由网关模拟）")
+				t.Fatal("客户端侧应可用工具（原生透传）")
 			}
 			if m.Source != channel.SourceLocal {
 				t.Fatalf("本地清单来源应标 local，得到 %v", m.Source)

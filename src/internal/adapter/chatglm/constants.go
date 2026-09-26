@@ -48,10 +48,15 @@ const (
 	defaultMinIntervalSec = 3
 )
 
-// fakeHeaders 是伪装成智谱清言网页前端的固定头（照参考实现抄）。
+// fakeHeaders 是伪装成智谱清言网页前端的固定头（照参考实现 chat.ts:36-64 的 FAKE_HEADERS 抄）。
 //
 // 其中 X-Exp-Groups 是一长串实验分组标记：看着像噪声，但它是网页客户端身份的一部分，
 // 少了对不上官网的形态。X-App-Fr 写 browser_extension 也是网页插件客户端的真实取值。
+//
+// 唯一**故意不抄**的是参考实现里的 `Accept-Encoding: gzip, deflate, br, zstd`：
+// Go 的传输层只在请求头里没有 Accept-Encoding 时才自动加 gzip 并自动解压；
+// 手工写上 br/zstd 会让上游回压缩体而标准库不解压，流解析直接读到乱码。
+// 「少一个编码头」不影响请求语义，比「收下一堆读不懂的字节」划算。
 var fakeHeaders = map[string]string{
 	"Accept":             "text/event-stream",
 	"Accept-Language":    "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
@@ -59,6 +64,7 @@ var fakeHeaders = map[string]string{
 	"Cache-Control":      "no-cache",
 	"Origin":             "https://chatglm.cn",
 	"Pragma":             "no-cache",
+	"Priority":           "u=1, i",
 	"Sec-Ch-Ua":          `"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"`,
 	"Sec-Ch-Ua-Mobile":   "?0",
 	"Sec-Ch-Ua-Platform": `"Windows"`,
@@ -93,9 +99,14 @@ var userAgents = []string{
 
 // webModels 是面板下发的档位。
 //
+// 基础清单来自参考实现 `src/api/routes/models.ts` 的 SUPPORTED_MODELS（glm-4.7 / glm-4.6v / glm-4.6，
+// 该文件里 DEFAULT_MODEL="glm-4.6"，README「更新模型列表，添加 GLM-4.7、GLM-4.6v、GLM-4.6」也印证）。
+// 上游其实**没有目录接口**，名字只是给我们自己区分档位用的（README 原话：「模型名称实际上并没啥用……随便填都可以」），
+// 真正起作用的是 assistant_id 与 chat_mode —— 见 specOf。
+//
 // 上游的「思考 / 沉思」不是不同的模型，而是请求体里的 chat_mode（zero / deep_research）——
-// 参考实现靠**模型名里带不带 think/zero/deepresearch** 来判定。我们把这个约定显式列出来，
-// 让用户在客户端里能直接选到（否则他只能猜该写什么名字）。
+// 参考实现 chat.ts:262-269 靠**模型名里带不带 think/zero/deepresearch** 来判定。我们把这个约定
+// 显式列成 -think / -deepresearch 后缀，让用户在客户端里能直接选到（否则他只能猜该写什么名字）。
 var webModels = []struct {
 	ID    string
 	Name  string

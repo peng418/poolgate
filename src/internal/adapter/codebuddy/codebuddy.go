@@ -44,6 +44,7 @@ import (
 
 	"poolgate/internal/channel"
 	"poolgate/internal/errs"
+	"poolgate/internal/sanitize"
 )
 
 // 上游域名与端点。BaseCN / EpChat 等与 WorkBuddy 完全相同 —— 同一套后端。
@@ -171,20 +172,37 @@ func noFollowClient(src *http.Client) *http.Client {
 
 // staticModels CodeBuddy 静态兜底模型表。
 //
-// 与 WorkBuddy 共用同一后端，因此目录同源；这里取参考实现 codebuddy2openai 的
-// DEFAULT_MODELS 作为基线（含 `auto` 路由档）。国内版没有可用的动态目录端点，
-// 静态表是唯一来源 —— 认不出的模型名仍原样透传，由上游判定。
+// 与 WorkBuddy 共用同一后端，因此目录同源；基线取参考实现 codebuddy2openai 的
+// DEFAULT_MODELS（含 `auto` 路由档）。在四份新参考上交叉验证后又补了四个模型
+// （hy3 / glm-5.3 / kimi-k3-1 / minimax-m3）：
+//
+//	Buddy-2API-Go/internal/upstream/models.go:14-18 —— `builtinCraftModels["cn"]` 内置国内版 craft 档；
+//	codebuddy2api-new/converter.py:1741 DEFAULT_MODELS（注释写明是「legacy domestic deployments」兜底档）；
+//	workbuddy-openai-proxy/src/config.mjs:124 DEFAULT_MODELS（cn-cli 站点）；
+//	本仓 internal/adapter/workbuddy/workbuddy.go:90 的 staticModels（该渠道已真上游出字）。
+//
+// 仍保留的 kimi-k2.5 / minimax-m3-pay / hy3-preview-agent 只见于 2026-09-22 那版旧参考，
+// 四份新参考都没有 —— 疑似过时档，但删掉会顶掉用户已配好的模型名，故保留（认不出的模型名
+// 一律原样透传，由上游判定）。
+//
+// 注：新版参考显示国内版**已经有动态目录端点** `GET {base}/v3/config`（codebuddy2api-new
+// app/credits.py:33 `CONFIG_PATH = "/v3/config"`，注释 "Official cloud model catalog"；
+// Buddy-2API-Go 也从同一端点读 modelPromotions）。要不要改走动态目录是另一件事，本轮不动。
 var staticModels = []channel.ModelInfo{
 	{ID: "auto", DisplayName: "Auto", ContextWindow: 131072},
+	{ID: "hy3", DisplayName: "Hy3", ContextWindow: 131072},
+	{ID: "glm-5.3", DisplayName: "GLM-5.3", ContextWindow: 131072},
 	{ID: "glm-5.2", DisplayName: "GLM-5.2", ContextWindow: 131072},
 	{ID: "glm-5.1", DisplayName: "GLM-5.1", ContextWindow: 131072},
 	{ID: "glm-5v-turbo", DisplayName: "GLM-5V-Turbo", ContextWindow: 131072},
+	{ID: "kimi-k3-1", DisplayName: "Kimi-K3-1", ContextWindow: 131072},
 	{ID: "kimi-k2.7", DisplayName: "Kimi-K2.7", ContextWindow: 131072},
 	{ID: "kimi-k2.6", DisplayName: "Kimi-K2.6", ContextWindow: 131072},
 	{ID: "kimi-k2.5", DisplayName: "Kimi-K2.5", ContextWindow: 131072},
+	{ID: "minimax-m3", DisplayName: "MiniMax-M3", ContextWindow: 131072},
+	{ID: "minimax-m3-pay", DisplayName: "MiniMax-M3-Pay", ContextWindow: 131072},
 	{ID: "deepseek-v4-pro", DisplayName: "DeepSeek-V4-Pro", ContextWindow: 131072},
 	{ID: "deepseek-v4-flash", DisplayName: "DeepSeek-V4-Flash", ContextWindow: 131072},
-	{ID: "minimax-m3-pay", DisplayName: "MiniMax-M3-Pay", ContextWindow: 131072},
 	{ID: "hy3-preview-agent", DisplayName: "Hy3-Preview-Agent", ContextWindow: 131072},
 }
 
@@ -300,7 +318,13 @@ func (a *Adapter) Refresh(ctx context.Context, c *channel.Credential) (*channel.
 	if strings.TrimSpace(c.RefreshToken) == "" {
 		return nil, errs.New(errs.SessionDead, "缺少 refresh token，需重新授权").WithAccount(c.UID)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.base+EpRefresh, nil)
+	// 刷新必须带一个空的 JSON 对象当请求体（不是空 body）：两份参考实现都这么做 ——
+	// codebuddy2openai/converter.py:156 `c.post(url, headers=headers, json={})`、
+	// workbuddy2api-hub/wb_accounts.py:487 `http_json(url, data=b"{}", method="POST", …)`。
+	// 配合 authHeaders 已经设好的 Content-Type: application/json，缺了 body 会让
+	// 「Content-Type 声明 JSON 但一个字节都没有」这个形态与参考实现不一致（豆包那次的教训：
+	// 请求体形态不对，上游直接判非法客户端；这里同理，宁可按参考实现抄准）。
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.base+EpRefresh, bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return nil, errs.New(errs.Transport, "构造刷新请求失败").WithAccount(c.UID).WithCause(err)
 	}
@@ -486,6 +510,12 @@ func (a *Adapter) doJSON(req *http.Request) (json.RawMessage, error) {
 //
 // 关键约束：**后端只接受流式**，所以 stream 恒为 true（非流式由网关聚合）；
 // stream_options.include_usage 一并带上，让用量帧能回传。
+//
+// 字段形态照参考实现抄准（豆包那次的教训）：参考实现只透传客户端**确实给了**的字段
+// （codebuddy2openai/converter.py:332-337 —— `body = {k: payload[k] for k in PASSTHROUGH_BODY_KEYS if k in payload}`，
+// max_tokens 只在客户端给了才出现）。所以 max_tokens 也只在 >0 时才发：客户端没写
+// max_tokens 时网关给的是 0，而 `"max_tokens": 0` 在 OpenAI 语义里是「一个 token 都不许生成」，
+// 上游可能当成非法参数直接拒（本仓 openaiup/body.go:36、copilot/protocol.go:47 同款守卫）。
 func buildBody(req channel.ChatRequest) []byte {
 	msgs := make([]map[string]any, len(req.Messages))
 	for i, m := range req.Messages {
@@ -511,8 +541,10 @@ func buildBody(req channel.ChatRequest) []byte {
 		"model":          req.Model,
 		"messages":       msgs,
 		"stream":         true,
-		"max_tokens":     req.MaxTokens,
 		"stream_options": map[string]any{"include_usage": true},
+	}
+	if req.MaxTokens > 0 {
+		obj["max_tokens"] = req.MaxTokens
 	}
 	if req.Temperature != nil {
 		obj["temperature"] = *req.Temperature
@@ -527,7 +559,12 @@ func buildBody(req channel.ChatRequest) []byte {
 		obj["messages"] = append([]map[string]any{{"role": "system", "content": "You are a helpful assistant."}}, msgs...)
 	}
 	raw, _ := json.Marshal(obj)
-	return raw
+	// 出站脱敏（body 组装完、发出去之前）：CodeBuddy 与 WorkBuddy 是同一套插件后端
+	//（同源，见包注释），同一份上游内容审核黑名单同样按逐字精确匹配拦截，命中即回
+	// HTTP 400 code=11128 "Illegal API invocation from an unapproved channel"。因此同样
+	// 剥掉 Claude Code / Codex CLI 注入的模板句、billing header、裸 11128 等指纹；
+	// 落点与 wild-work internal/upstream/payload.go PrepareBody 一致，见 internal/sanitize 文件头依据。
+	return sanitize.Messages(raw)
 }
 
 func truncate(s string, n int) string {

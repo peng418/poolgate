@@ -180,7 +180,7 @@ func (a *Adapter) accessToken(ctx context.Context, c *channel.Credential) (strin
 		}
 	}
 
-	access, exp, err := a.exchange(ctx, c, refresh)
+	access, _, exp, err := a.exchange(ctx, c, refresh)
 	if err != nil {
 		return "", err
 	}
@@ -204,21 +204,24 @@ func (a *Adapter) forget(refresh string) {
 	a.tokMu.Unlock()
 }
 
-// exchange 用 refresh token 换 access token。
+// exchange 用 refresh token 换 access token，返回 (access, 轮换后的 refresh, 过期时间)。
 //
-// 注意：上游会**轮换** refresh token（返回值里有新的），所以我们要把它一起带上 ——
-// 只留 access token 的话，下一次刷新就用旧 refresh token，迟早失效。
-// 参考实现丢掉了新 refresh token（只缓存在内存里），那是它的缺陷，我们照实存。
-func (a *Adapter) exchange(ctx context.Context, c *channel.Credential, refresh string) (string, time.Time, error) {
+// 注意：上游会**轮换** refresh token（返回值里带 refresh_token，参考实现 chat.ts:143-148 明确解构了
+// `const { access_token, refresh_token } = _result`；网页端也是靠 Set-Cookie 覆盖
+// chatglm_refresh_token 来持久化新值）。所以要把新值一起带上 —— 只留 access token 的话，
+// 下一次刷新还用旧 refresh token，迟早失效。参考实现把新值丢掉了（只把整个 result 缓存在内存里），
+// 那是它的缺陷；凡是把凭证写回账号缓存的地方（Refresh / checkCredential）都必须用新值。
+// 返回空串表示上游没给新值（此时调用方保留原 refresh token）。
+func (a *Adapter) exchange(ctx context.Context, c *channel.Credential, refresh string) (string, string, time.Time, error) {
 	sign := makeSign(secretOf(c))
-	resp, err := a.do(ctx, c, http.MethodPost, epRefresh, refresh, []byte("{}"), sign)
+	resp, err := a.do(ctx, c, http.MethodPost, epRefresh, refresh, []byte("{}"), sign, "")
 	if err != nil {
-		return "", time.Time{}, err
+		return "", "", time.Time{}, err
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
-		return "", time.Time{}, errs.New(a.Classify(resp.StatusCode, raw), "换 access token 失败").
+		return "", "", time.Time{}, errs.New(a.Classify(resp.StatusCode, raw), "换 access token 失败").
 			WithChannel(string(channel.ChatGLM)).WithAccount(uidOf(c)).
 			WithUpstream(truncate(string(raw), 200))
 	}
@@ -229,18 +232,18 @@ func (a *Adapter) exchange(ctx context.Context, c *channel.Credential, refresh s
 		} `json:"result"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return "", time.Time{}, errs.New(errs.Parse, "上游没有返回可解析的令牌").
+		return "", "", time.Time{}, errs.New(errs.Parse, "上游没有返回可解析的令牌").
 			WithChannel(string(channel.ChatGLM)).WithUpstream(truncate(string(raw), 200))
 	}
 	access := strings.TrimSpace(out.Result.AccessToken)
 	if access == "" {
 		// 200 但没有令牌 = 凭证无效（上游习惯用业务码表达）。绝不能当成功。
-		return "", time.Time{}, errs.New(errs.SessionDead,
+		return "", "", time.Time{}, errs.New(errs.SessionDead,
 			"上游没有返回 access token：chatglm_refresh_token 可能已失效，请重新粘贴").
 			WithChannel(string(channel.ChatGLM)).WithAccount(uidOf(c)).
 			WithUpstream(truncate(string(raw), 200))
 	}
-	return access, time.Now().Add(accessTokenTTL), nil
+	return access, strings.TrimSpace(out.Result.RefreshToken), time.Now().Add(accessTokenTTL), nil
 }
 
 // Refresh 是账号级续期：拿 refresh token 再换一次 access token。
@@ -253,25 +256,36 @@ func (a *Adapter) Refresh(ctx context.Context, c *channel.Credential) (*channel.
 	if refresh == "" {
 		return nil, nil
 	}
-	access, exp, err := a.exchange(ctx, c, refresh)
+	access, rotated, exp, err := a.exchange(ctx, c, refresh)
 	if err != nil {
 		return nil, err
 	}
 	nc := *c
 	nc.AccessToken = access
-	nc.RefreshToken = refresh
+	if rotated != "" {
+		// 上游换了新 refresh token：写回凭证，否则重登时用的还是旧的。
+		nc.RefreshToken = rotated
+	} else {
+		nc.RefreshToken = refresh
+	}
 	nc.ExpiresAt = exp
 	a.remember(refresh, access, exp)
+	if rotated != "" && rotated != refresh {
+		a.remember(rotated, access, exp)
+	}
 	return &nc, nil
 }
 
 // checkCredential 当场验一次凭证（登录用）：能换出 access token 就算有效。
 func (a *Adapter) checkCredential(ctx context.Context, c *channel.Credential) error {
-	access, exp, err := a.exchange(ctx, c, refreshOf(c))
+	access, rotated, exp, err := a.exchange(ctx, c, refreshOf(c))
 	if err != nil {
 		return err
 	}
 	c.AccessToken = access
+	if rotated != "" {
+		c.RefreshToken = rotated
+	}
 	c.ExpiresAt = exp
 	a.remember(refreshOf(c), access, exp)
 	return nil
@@ -289,6 +303,26 @@ func (a *Adapter) Chat(ctx context.Context, c *channel.Credential, req channel.C
 	if err != nil {
 		return nil, err
 	}
+	meta := map[string]any{
+		"channel":             "",
+		"draft_id":            "",
+		"if_plus_model":       true,
+		"input_question_type": "xxxx",
+		// is_networking 照参考实现开着：上游的联网检索结果会被它塞进 parts 的
+		// tool_result/quote_result 里，我们把这些结果**只放进思考流**（不污染正文）。
+		"is_networking": true,
+		"is_test":       false,
+		"platform":      "pc",
+		"quote_log_id":  "",
+		"cogview":       map[string]any{"rm_label_watermark": false},
+	}
+	// chat_mode 在「非思考、非沉思」档位上**不能出现**（连空串都不行）。
+	// 依据参考实现 chat.ts:285 `chat_mode: chatMode || undefined` —— JS 里 || 会把空串变成 undefined，
+	// JSON.stringify 随后把整个键删掉；也就是说默认档位请求体里根本没有 chat_mode 这个字段。
+	// 我们先前发的是 `"chat_mode":""`，形态与参考实现不一致，这里改成「有值才带」。
+	if spec.chatMode != "" {
+		meta["chat_mode"] = spec.chatMode
+	}
 	body, _ := json.Marshal(map[string]any{
 		"assistant_id":    spec.assistantID,
 		"conversation_id": "",
@@ -298,23 +332,10 @@ func (a *Adapter) Chat(ctx context.Context, c *channel.Credential, req channel.C
 			"role":    "user",
 			"content": []any{map[string]any{"type": "text", "text": packMessages(req.Messages)}},
 		}},
-		"meta_data": map[string]any{
-			"channel":             "",
-			"chat_mode":           spec.chatMode,
-			"draft_id":            "",
-			"if_plus_model":       true,
-			"input_question_type": "xxxx",
-			// is_networking 照参考实现开着：上游的联网检索结果会被它塞进 parts 的
-			// tool_result/quote_result 里，我们把这些结果**只放进思考流**（不污染正文）。
-			"is_networking": true,
-			"is_test":       false,
-			"platform":      "pc",
-			"quote_log_id":  "",
-			"cogview":       map[string]any{"rm_label_watermark": false},
-		},
+		"meta_data": meta,
 	})
 
-	resp, err := a.do(ctx, c, http.MethodPost, epStream, token, body, makeSign(secretOf(c)))
+	resp, err := a.do(ctx, c, http.MethodPost, epStream, token, body, makeSign(secretOf(c)), streamReferer(spec.assistantID))
 	if err != nil {
 		return nil, err
 	}
@@ -325,7 +346,7 @@ func (a *Adapter) Chat(ctx context.Context, c *channel.Credential, req channel.C
 		if token, err = a.accessToken(ctx, c); err != nil {
 			return nil, err
 		}
-		if resp, err = a.do(ctx, c, http.MethodPost, epStream, token, body, makeSign(secretOf(c))); err != nil {
+		if resp, err = a.do(ctx, c, http.MethodPost, epStream, token, body, makeSign(secretOf(c)), streamReferer(spec.assistantID)); err != nil {
 			return nil, err
 		}
 	}
@@ -340,12 +361,29 @@ func (a *Adapter) Chat(ctx context.Context, c *channel.Credential, req channel.C
 	return newStream(resp.Body, resp.Header.Get("Content-Type"), req.Model), nil
 }
 
+// streamReferer 给出对话请求的 Referer（照参考实现 chat.ts:424-428 写）。
+//
+// 网页端是从「通用对话页」或「某个智能体页」发起请求的，Referer 随 assistant_id 变：
+// 默认智能体走 alltoolsdetail，接进来的智能体走 gdetail/{id}。少了它，请求头就不像网页端。
+func streamReferer(assistantID string) string {
+	if assistantID == defaultAssistantID {
+		return "https://chatglm.cn/main/alltoolsdetail"
+	}
+	return "https://chatglm.cn/main/gdetail/" + assistantID
+}
+
 // Classify 把上游错误归一成有限枚举（D4）。
 //
 // 智谱的习惯是把错误塞在**业务码**里（HTTP 可能是 200），所以 40102（refresh_token 过期）
 // 这类只能靠报文关键词认；HTTP 状态码那条路留给网关/CDN 层。
 func (a *Adapter) Classify(status int, body []byte) errs.Kind {
 	s := strings.ToLower(string(body))
+	// 「refresh_token 已过期」的判据在参考实现里是**报文文本含 40102**
+	// （chat.ts:1031 checkResult `if (message.includes('40102'))`），与 HTTP 状态码无关 ——
+	// 上游可能用 200、400 或别的码回它，所以这条要在状态码分支之前先认。
+	if strings.Contains(s, "40102") {
+		return errs.SessionDead
+	}
 	switch {
 	case status == 401 || status == 403:
 		return errs.SessionDead
@@ -383,7 +421,8 @@ func (a *Adapter) Classify(status int, body []byte) errs.Kind {
 // do 发一个带伪装的请求。
 //
 // token 为空表示这是「用 refresh token 换 access token」的调用（Authorization 就是 refresh token）。
-func (a *Adapter) do(ctx context.Context, c *channel.Credential, method, path, token string, body []byte, sign requestSign) (*http.Response, error) {
+// referer 为空表示不设 Referer（换令牌那条路参考实现也没设，只留了一行注释）。
+func (a *Adapter) do(ctx context.Context, c *channel.Credential, method, path, token string, body []byte, sign requestSign, referer string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, a.base+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, errs.New(errs.Transport, "构造请求失败").WithChannel(string(channel.ChatGLM)).WithCause(err)
@@ -394,6 +433,9 @@ func (a *Adapter) do(ctx context.Context, c *channel.Credential, method, path, t
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", userAgents[rand.IntN(len(userAgents))])
 	req.Header.Set("Authorization", "Bearer "+token)
+	if referer != "" {
+		req.Header.Set("Referer", referer)
+	}
 	// 签名三件套 + 每请求新的设备/请求 id（参考实现就是每请求新生成）。
 	req.Header.Set("X-Sign", sign.sign)
 	req.Header.Set("X-Timestamp", sign.timestamp)

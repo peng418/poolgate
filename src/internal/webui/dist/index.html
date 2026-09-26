@@ -228,10 +228,10 @@
 
           <!-- 桌面端两列、手机端单列：六张卡竖排在手机上要滑很久。 -->
           <div class="pick-grid">
-            <div class="pick-item" v-for="c in channels" :key="'pick'+c.kind">
+            <div class="pick-item" v-for="c in pickChannels" :key="'pick'+c.kind">
               <div class="pick-head">
                 <div class="ch" :class="channelClass(c.kind,c.status)">
-                  <span class="k"></span><b>{{ c.display_name }}</b>
+                  <img class="logo" v-if="icoOf(c.kind)" :src="icoOf(c.kind)" alt=""><span class="k" v-else></span><b>{{ c.display_name }}</b>
                 </div>
                 <span class="pill" :class="c.panel_auth?'good':'plain'">
                   <span class="i">{{ c.panel_auth?'✓':'–' }}</span><span class="swatch"></span>
@@ -386,7 +386,7 @@
 
           <table class="kv-t">
             <tbody>
-              <tr><td>渠道</td><td><span class="ch" :class="channelClass(auth.channel)"><span class="k"></span>{{ auth.channelName }}</span></td></tr>
+              <tr><td>渠道</td><td><span class="ch" :class="channelClass(auth.channel)"><img class="logo" v-if="icoOf(auth.channel)" :src="icoOf(auth.channel)" alt=""><span class="k" v-else></span>{{ auth.channelName }}</span></td></tr>
               <tr><td>账号</td><td><b>{{ auth.account && (auth.account.nickname || auth.account.uid) }}</b>
                 <div class="hint mono" v-if="auth.account">{{ shortUid(auth.account.uid) }}</div></td></tr>
               <tr><td>可用模型</td><td class="num">{{ auth.modelCount || '—' }}</td></tr>
@@ -502,8 +502,8 @@
             <table>
               <thead><tr><th>渠道</th><th>状态</th><th class="num">账号</th><th class="num">余额</th><th class="num">模型通过</th></tr></thead>
               <tbody>
-                <tr v-for="c in overview.channels" :key="c.kind">
-                  <td><span class="ch" :class="channelClass(c.kind,c.status)"><span class="k"></span>{{ c.display_name }}</span></td>
+                <tr v-for="c in visChannels" :key="c.kind">
+                  <td><span class="ch" :class="channelClass(c.kind,c.status)"><img class="logo" v-if="icoOf(c.kind)" :src="icoOf(c.kind)" alt=""><span class="k" v-else></span>{{ c.display_name }}</span></td>
                   <td><span class="pill" :class="statusPill(c)"><span class="i">{{ statusIcon(c) }}</span><span class="swatch"></span>{{ statusText(c) }}</span></td>
                   <td class="num">{{ c.total_accounts }}</td>
                   <td class="num">{{ channelCredits(c.kind) }}</td>
@@ -596,7 +596,7 @@
           <p class="hint" style="margin:-6px 0 12px">{{ sec.note }}</p>
         <div class="card" style="margin-bottom:14px" v-for="g in sec.active" :key="g.kind">
           <h2>
-            <span class="ch" :class="channelClass(g.kind)"><span class="k"></span>{{ g.name }}</span>
+            <span class="ch" :class="channelClass(g.kind)"><img class="logo" v-if="icoOf(g.kind)" :src="icoOf(g.kind)" alt=""><span class="k" v-else></span>{{ g.name }}</span>
             <span class="pill warn" style="margin-left:6px" v-if="g.degraded">
               <span class="i">!</span><span class="swatch"></span>降级 · {{ g.degraded }} 个模型挂死</span>
           </h2>
@@ -665,17 +665,19 @@
       </template>
 
       <!-- ================= 模型与费率 ================= -->
-      <!-- ==================== 接入源：登录授权式渠道 + API Key 式来源 ==================== -->
-      <!-- 两类来源混排在一张表里，靠「类型」列与最左侧色块区分（登录式用渠道身份色、
-           key 式用中性方块）。调用入口永远只有一个，分开的只是管理界面。 -->
-      <template v-if="view==='providers'">
+      <!-- ==================== 接入源：只有 API Key 式来源 ==================== -->
+      <!-- 与「账号」页的分工：这一页只放**去官网注册拿 key**那类来源（官方 API / 中转站）；
+           扫码或授权码登录的渠道一律在「账号」页 —— 两个模块各管一件事，不混排。
+           调用入口仍然只有一个：模型名带来源前缀区分（qodercn/glm-5.3 · google/gemini-3.8-flash）。 -->
+      <!-- 入口先藏起来（见脚本里的 SHOW_PROVIDERS）：代码保留，随时可恢复。 -->
+      <template v-if="SHOW_PROVIDERS && view==='providers'">
         <div class="banner" style="margin-bottom:14px">
           <span class="ico">◎</span>
           <div style="min-width:0">
-            <b>客户端只认一个地址 + 一个 API Key</b>
-            <p>不管模型来自扫码授权的渠道，还是你填 key 的官方 API —— 都从这一个入口调用；
-              模型名带来源前缀区分：<span class="mono">qodercn/glm-5.3</span> ·
-              <span class="mono">google/gemini-3.8-flash</span>。</p>
+            <b>这一页只放「填 key 就能用」的来源</b>
+            <p>去官网注册后创建一串 key（Google AI Studio · 阿里百炼 · OpenRouter · DeepSeek …），
+              填进来立刻可用。<b>扫码 / 授权码登录</b>的那类渠道（QoderCN · 千问办公 · 豆包 …）
+              在「账号」页管理。两类都从同一个入口调用，模型名带来源前缀区分。</p>
           </div>
         </div>
 
@@ -685,37 +687,17 @@
           <div style="overflow-x:auto">
           <table>
             <thead><tr>
-              <th>接入源</th><th>类型</th><th>状态</th><th>额度 / 凭证</th><th class="num">模型</th><th>操作</th>
+              <th>接入源</th><th>状态</th><th>额度 / 凭证</th><th class="num">模型</th><th>操作</th>
             </tr></thead>
             <tbody>
-              <tr v-for="c in providerChannelRows" :key="'ch-'+c.kind">
-                <td>
-                  <span class="ch" :class="channelClass(c.kind)"><span class="k"></span><b>{{ c.display_name }}</b></span>
-                  <div class="hint">{{ c.account_count }} 个账号<span v-if="c.checkin_cap"> · 可签到</span></div>
-                </td>
-                <td><span class="source-type">登录授权</span>
-                  <div class="hint">{{ c.category === 'chat' ? '聊天平台类' : '编程助手类' }}</div></td>
-                <td>
-                  <span class="pill" :class="c.downstream?'good':'pause'"><span class="i">{{ c.downstream?'✓':'‖' }}</span><span class="swatch"></span>{{ c.downstream?'正常':'已暂停' }}</span>
-                  <div class="hint" v-if="!c.downstream">暂停：保留账号但不向客户端下发模型</div>
-                </td>
-                <td>
-                  <template v-if="c.account_count===0"><span class="muted">还没有账号</span></template>
-                  <template v-else><span>{{ channelCredits(c) }}</span></template>
-                </td>
-                <td class="num">{{ modelCountOf(c.kind) }}</td>
-                <td>
-                  <button class="btn sm" @click="go('accounts')">管理账号</button>
-                  <button class="btn sm" @click="startAddAccount(c.kind)" v-if="c.panel_auth">添加账号</button>
-                </td>
-              </tr>
-
+              <!-- 登录授权式渠道**不在这里列**（两个模块分开）：它们只在「账号」页，
+                   本页只列「填 key 就能用」的来源。以前两类混排在一张表里，
+                   用户得靠「类型」列和色块去分辨，页面上还有一行是同一个来源被列了两次。 -->
               <tr v-for="p in providers" :key="'pv-'+p.name">
                 <td>
-                  <span class="ch k-key"><span class="k"></span><b>{{ p.display_name || p.name }}</b></span>
+                  <span class="ch k-key"><img class="logo" v-if="icoOf(p.preset||p.name)" :src="icoOf(p.preset||p.name)" alt=""><span class="k" v-else></span><b>{{ p.display_name || p.name }}</b></span>
                   <div class="hint mono">{{ p.base_url }}</div>
                 </td>
-                <td><span class="source-type">API Key</span></td>
                 <td>
                   <span v-if="p.conflict" class="pill warn"><span class="i">!</span><span class="swatch"></span>未挂载</span>
                   <span v-else class="pill" :class="p.status==='paused'?'pause':'good'">
@@ -735,8 +717,8 @@
                 </td>
               </tr>
 
-              <tr v-if="providerChannelRows.length===0 && providers.length===0">
-                <td colspan="6" class="muted">还没有任何接入源</td>
+              <tr v-if="providers.length===0">
+                <td colspan="5" class="muted">还没有接入源 —— 点下面「＋ 添加接入源」，选一个预设、填上 key 即可</td>
               </tr>
             </tbody>
           </table>
@@ -745,21 +727,23 @@
 
         <div class="grid g2">
           <div class="card">
-            <h2>两类来源的区别</h2>
-            <div class="sub">同一张表里混着放，语义完全不同</div>
+            <h2>扫码授权的渠道在「账号」页</h2>
+            <div class="sub">两个模块分工明确，别再翻错地方</div>
             <table>
-              <thead><tr><th></th><th>登录授权式</th><th>API Key 式</th></tr></thead>
+              <thead><tr><th></th><th>接入源（本页）</th><th>账号</th></tr></thead>
               <tbody>
-                <tr><td>怎么来</td><td>扫码 / 浏览器授权一次</td><td>去官网注册后创建 key</td></tr>
-                <tr><td>凭证</td><td>cookie / JWT，可自动续期</td><td>一串 key（等于密码，落盘 0600）</td></tr>
-                <tr><td>额度恢复</td><td>签到、等冷却、换账号</td><td>等限速窗口、充值、换 key</td></tr>
-                <tr><td>工具调用</td><td>协议原生支持（IDE 类）</td><td>看上游；不支持会被明确拒绝</td></tr>
+                <tr><td>放什么</td><td>填 key 就能用的官方 API / 中转站</td><td>扫码或授权码登录的渠道</td></tr>
+                <tr><td>怎么来</td><td>去官网注册后创建 key</td><td>扫码 / 浏览器授权一次</td></tr>
+                <tr><td>凭证</td><td>一串 key（等于密码，落盘 0600）</td><td>cookie / JWT，可自动续期</td></tr>
+                <tr><td>额度恢复</td><td>等限速窗口、充值、换 key</td><td>签到、等冷却、换账号</td></tr>
+                <tr><td>工具调用</td><td>看上游；不支持会被明确拒绝</td><td>多数渠道协议原生支持</td></tr>
               </tbody>
             </table>
+            <div style="margin-top:10px"><button class="btn sm" @click="go('accounts')">去「账号」页</button></div>
           </div>
           <div class="card">
             <h2>添加接入源</h2>
-            <div class="sub">向导三步：选类型 → 填参数 → 连通性测试后保存</div>
+            <div class="sub">向导两步：选预设填参数 → 连通性测试后保存</div>
             <p class="hint" style="margin:0 0 10px">测试那一步会真发一条**带工具定义**的请求：拿到结构化 tool_calls 才说明它能给 Studio / Claude Code 当后端。</p>
             <button class="btn primary" @click="openProviderWizard">＋ 添加接入源</button>
           </div>
@@ -770,42 +754,15 @@
           <div class="modal" style="max-width:760px">
             <h3>{{ provWiz.editing ? '编辑接入源：' + provWiz.cfg.name : '添加接入源' }}</h3>
             <div class="steps" style="margin:10px 0 14px">
-              <span class="step-tab" :class="{on:provWiz.step===1,done:provWiz.step>1}"><span class="n">{{ provWiz.step>1?'✓':'1' }}</span>选类型</span>
+              <span class="step-tab" :class="{on:provWiz.step===1,done:provWiz.step>1}"><span class="n">{{ provWiz.step>1?'✓':'1' }}</span>选预设填参数</span>
               <span class="step-line"></span>
-              <span class="step-tab" :class="{on:provWiz.step===2,done:provWiz.step>2}"><span class="n">{{ provWiz.step>2?'✓':'2' }}</span>填参数</span>
-              <span class="step-line"></span>
-              <span class="step-tab" :class="{on:provWiz.step===3}"><span class="n">3</span>测试并保存</span>
+              <span class="step-tab" :class="{on:provWiz.step===2}"><span class="n">2</span>测试并保存</span>
             </div>
 
+            <!-- 这里不再有「选类型」这一步：本模块只做 API Key 式来源（2026-09-26 起与「账号」页
+                 分工）。以前第一步摆着「登录授权式」和「API Key 式」两张卡，点前者只是把你送去
+                 账号页 —— 那一步的存在本身就在暗示「接入源里也有登录式渠道」。 -->
             <div v-if="provWiz.step===1">
-              <div class="grid g2">
-                <div class="card" style="cursor:pointer" @click="provWiz.type='auth';provWiz.step=2">
-                  <h2>登录授权式</h2>
-                  <div class="sub">扫码 / 浏览器授权一次，凭证自动续期</div>
-                  <p class="hint">适用：QoderCN · TraeWork · WorkBuddy · 腾讯 CodeBuddy · GitHub Copilot …<br>
-                    好处：不用 key，协议原生支持工具调用</p>
-                </div>
-                <div class="card" style="cursor:pointer" @click="provWiz.type='key';provWiz.step=2">
-                  <h2>API Key 式</h2>
-                  <div class="sub">去官网注册后创建一串 key，填进来即可</div>
-                  <p class="hint">适用：Google AI Studio · 阿里百炼 · OpenRouter · DeepSeek · 智谱 GLM · 火山方舟 …<br>
-                    好处：配置级、立刻可用、免费额度明确</p>
-                </div>
-              </div>
-              <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
-                <button class="btn" @click="provWiz.open=false">取消</button>
-              </div>
-            </div>
-
-            <div v-else-if="provWiz.step===2 && provWiz.type==='auth'">
-              <p class="hint" style="margin:0 0 12px">登录授权式渠道在「账号」页添加：点某个渠道的「添加账号」，按提示扫码或授权即可 —— 不需要填 key。</p>
-              <div style="display:flex;gap:8px;justify-content:flex-end">
-                <button class="btn" @click="provWiz.step=1">返回</button>
-                <button class="btn primary" @click="provWiz.open=false;go('accounts')">去「账号」页</button>
-              </div>
-            </div>
-
-            <div v-else-if="provWiz.step===2">
               <div class="field"><label>预设（选中自动带出 base_url）</label>
                 <select v-model="provWiz.preset" @change="applyPreset">
                   <option value="">自定义（自己填 base_url）</option>
@@ -841,7 +798,7 @@
                 </p>
               </div>
               <div style="display:flex;gap:8px;justify-content:flex-end">
-                <button class="btn" @click="provWiz.step=1" v-if="!provWiz.editing">返回</button>
+                <button class="btn" @click="provWiz.open=false">取消</button>
                 <button class="btn primary" @click="runProviderTest" :disabled="provWiz.testing">下一步：测试连通性</button>
               </div>
             </div>
@@ -866,7 +823,7 @@
                 </tbody>
               </table>
               <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
-                <button class="btn" @click="provWiz.step=2">返回上一步</button>
+                <button class="btn" @click="provWiz.step=1">返回上一步</button>
                 <button class="btn" @click="runProviderTest" :disabled="provWiz.testing">重测</button>
                 <button class="btn primary" @click="saveProvider" :disabled="provWiz.testing">保存并启用</button>
               </div>
@@ -915,7 +872,7 @@
         </div>
 
         <div class="card" style="margin-bottom:14px" v-for="g in modelGroups" :key="'mg'+g.kind">
-          <h2><span class="ch" :class="channelClass(g.kind)"><span class="k"></span>{{ g.name }}</span>
+          <h2><span class="ch" :class="channelClass(g.kind)"><img class="logo" v-if="icoOf(g.kind)" :src="icoOf(g.kind)" alt=""><span class="k" v-else></span>{{ g.name }}</span>
             <span class="hint">{{ g.hint }}</span></h2>
           <table>
             <thead><tr>
@@ -985,7 +942,7 @@
           <div class="bars" v-if="lastResults.length">
             <div class="bar-row" v-for="r in lastResults" :key="'b'+r.channel+r.model"
               :data-tip="'<b>'+r.channel+' / '+r.model+'</b><br>'+(r.ok?'首字 '+(r.ttft_ms/1000).toFixed(1)+'s · 收到内容 ✓':'失败 · '+(r.reason||r.kind))">
-              <span class="name"><span class="ch" :class="channelClass(r.channel)"><span class="k"></span>{{ r.model }}</span></span>
+              <span class="name"><span class="ch" :class="channelClass(r.channel)"><img class="logo" v-if="icoOf(r.channel)" :src="icoOf(r.channel)" alt=""><span class="k" v-else></span>{{ r.model }}</span></span>
               <span class="bar-track"><span class="bar-fill"
                 :style="{width:barPct(r.ttft_ms)+'%',background:r.ok?barColor(r.ttft_ms):'var(--crit)'}"></span></span>
               <span class="v">{{ r.ok ? (r.ttft_ms/1000).toFixed(1)+'s' : '失败' }}</span>
@@ -1007,7 +964,7 @@
             <thead><tr><th>渠道</th><th>模型</th><th>分类</th><th>原因</th><th>上游原话</th></tr></thead>
             <tbody>
               <tr v-for="r in failedResults" :key="'f'+r.channel+r.model">
-                <td><span class="ch" :class="channelClass(r.channel)"><span class="k"></span>{{ channelName(r.channel) }}</span></td>
+                <td><span class="ch" :class="channelClass(r.channel)"><img class="logo" v-if="icoOf(r.channel)" :src="icoOf(r.channel)" alt=""><span class="k" v-else></span>{{ channelName(r.channel) }}</span></td>
                 <td class="mono">{{ r.model }}</td>
                 <td><span class="pill crit"><span class="i">×</span><span class="swatch"></span>{{ r.kind || '失败' }}</span></td>
                 <td>{{ r.reason }}</td>
@@ -1088,7 +1045,7 @@
               <div class="field" style="margin:0;flex:1">
                 <label for="dc">渠道</label>
                 <select id="dc" v-model="diag.channel">
-                  <option v-for="c in overview.channels" :key="c.kind" :value="c.kind">{{ c.display_name }}</option>
+                  <option v-for="c in visChannels" :key="c.kind" :value="c.kind">{{ c.display_name }}</option>
                 </select>
               </div>
               <button class="btn primary" @click="runDiagnose" :disabled="busy">开始诊断</button>
@@ -1120,7 +1077,7 @@
             <div class="field" style="margin:0"><label for="fc">渠道</label>
               <select id="fc" v-model="logFilter.channel">
                 <option value="all">全部</option>
-                <option v-for="c in overview.channels" :key="c.kind" :value="c.kind">{{ c.display_name }}</option>
+                <option v-for="c in visChannels" :key="c.kind" :value="c.kind">{{ c.display_name }}</option>
               </select></div>
             <div class="field" style="margin:0"><label for="fs">状态</label>
               <select id="fs" v-model="logFilter.status">
@@ -1139,7 +1096,7 @@
             <tbody>
               <tr v-for="(r,i) in filteredLogs" :key="'lg'+i">
                 <td class="mono">{{ fmtTime(r.time) }}</td>
-                <td><span class="ch" :class="channelClass(r.channel)"><span class="k"></span>{{ channelName(r.channel) }}</span></td>
+                <td><span class="ch" :class="channelClass(r.channel)"><img class="logo" v-if="icoOf(r.channel)" :src="icoOf(r.channel)" alt=""><span class="k" v-else></span>{{ channelName(r.channel) }}</span></td>
                 <td class="mono">{{ r.channel }}/{{ r.model }}</td>
                 <td class="mono">{{ shortUid(r.account) }}</td>
                 <td><span class="pill" :class="logPill(r)"><span class="i">{{ logIcon(r) }}</span><span class="swatch"></span>{{ logText(r) }}</span></td>
@@ -1299,8 +1256,8 @@
             <table>
               <thead><tr><th>渠道</th><th>签到能力</th><th>上次结果</th></tr></thead>
               <tbody>
-                <tr v-for="c in overview.channels" :key="'ck'+c.kind">
-                  <td><span class="ch" :class="channelClass(c.kind,c.status)"><span class="k"></span>{{ c.display_name }}</span></td>
+                <tr v-for="c in visChannels" :key="'ck'+c.kind">
+                  <td><span class="ch" :class="channelClass(c.kind,c.status)"><img class="logo" v-if="icoOf(c.kind)" :src="icoOf(c.kind)" alt=""><span class="k" v-else></span>{{ c.display_name }}</span></td>
                   <td :class="{muted:!c.checkin_cap}">{{ c.checkin_cap ? (c.kind==='qodercn'?'每日 +100 Credits':'支持') : '无活动' }}</td>
                   <td>
                     <span v-if="!c.checkin_cap" class="muted">—</span>
@@ -1320,7 +1277,7 @@
               <thead><tr><th>渠道</th><th>状态</th><th class="num">下发模型</th><th>操作</th></tr></thead>
               <tbody>
                 <tr v-for="c in channels" :key="'sw'+c.kind">
-                  <td><span class="ch" :class="channelClass(c.kind,c.status)"><span class="k"></span>{{ c.display_name }}</span></td>
+                  <td><span class="ch" :class="channelClass(c.kind,c.status)"><img class="logo" v-if="icoOf(c.kind)" :src="icoOf(c.kind)" alt=""><span class="k" v-else></span>{{ c.display_name }}</span></td>
                   <td><span class="pill" :class="statusPill(c)"><span class="i">{{ statusIcon(c) }}</span><span class="swatch"></span>{{ statusText(c) }}</span></td>
                   <td class="num">{{ c.downstream ? modelCountOf(c.kind) : 0 }}</td>
                   <td>
@@ -1425,11 +1382,30 @@ createApp({
       account:null,modelCount:0,balance:null,balanceError:'',callbackBase:'',pasteHint:''});
     let authTimer=null, authLeft=0;
 
+    // ---------- 面板入口开关 ----------
+    // 「接入源」（API Key 式来源）先**只藏入口**：2026-09-26 用户裁定——这块他后面可能还要修，
+    // 所以代码一行不删，只把导航项与视图藏起来。想恢复：把下面 false 改成 true 即可
+    // （后端 /api/providers* 与 openaiup 适配器、17 个预设一直都在，没有任何改动）。
+    const SHOW_PROVIDERS=false;
+
+    // ---------- 渠道可见白名单 ----------
+    // 2026-09-26 用户裁定：面板只保留「能用的这几个」渠道（图1 里的 QoderCN / QoderCOM /
+    // TraeWork / WorkBuddyCN / WorkBuddyAI / 千问办公），其余渠道 —— 也就是豆包 / ChatGPT /
+    // 腾讯元宝 / Kimi / 智谱清言 / 通义 / DeepSeek 网页 / Gemini / iFlow / Antigravity 这些
+    // 「聊天模型」——先屏蔽。
+    //
+    // **代码与功能一行不删**：适配器、凭证、暂停状态全都没动，把 kind 加回下面的数组即可恢复。
+    // 边界要说清楚：这里只管**面板显示**；网关仍会下发被隐藏渠道的模型。要让 Studio 里也选不到，
+    // 去「设置 → 渠道开关」把它们暂停（那是运行状态，随时能恢复，与这里的显示无关）。
+    const VISIBLE_CHANNELS=['qodercn','qodercom','traework','workbuddy','workbuddyai','qwenwork'];
+    const chVisible=kind=>VISIBLE_CHANNELS.includes(kind);
+    const visChannels=computed(()=>(overview.value.channels||[]).filter(c=>chVisible(c.kind)));
+
     const navItems=[
       {k:'overview',label:'总览'},{k:'providers',label:'接入源'},{k:'accounts',label:'账号'},
       {k:'models',label:'模型与费率'},
       {k:'benchmark',label:'测速与体检'},{k:'logs',label:'日志'},{k:'settings',label:'设置'}
-    ];
+    ].filter(n=>SHOW_PROVIDERS||n.k!=='providers');
     const titles={overview:'总览',providers:'接入源',accounts:'账号',models:'模型与费率',
       benchmark:'测速与体检',logs:'日志与诊断',settings:'设置'};
 
@@ -1505,7 +1481,7 @@ createApp({
         return `数据每 5 秒刷新 · 今日 ${fmtNum(t.requests)} 次请求`;
       }
       if(view.value==='providers'){
-        return `${providerChannelRows.value.length} 个登录授权式渠道 · ${providers.value.length} 个 API Key 式来源 · 客户端只连一个入口`;
+        return `${providers.value.length} 个 API Key 式来源 · 扫码登录的渠道在「账号」页 · 客户端只连一个入口`;
       }
       if(view.value==='accounts')return `按渠道分组 · ${totalHealthy.value} 个可用 · ${pausedAccountCount.value} 个暂停`;
       if(view.value==='models'){
@@ -1544,8 +1520,9 @@ createApp({
     // 设置里那两项不生效。由服务端透出，不靠前端猜（猜错就是「静默失败」）。
     const listenPinned=ref(false);
 
-    // activeChannels 是「状态为启用」的渠道（配置层面）。
-    const activeChannels=computed(()=>(overview.value.channels||[]).filter(c=>c.downstream));
+    // activeChannels 是「状态为启用」的渠道（配置层面）；只统计白名单里的渠道，
+    // 否则总览会出现「N / 12 启用」而页面上只看得见 6 个（见 VISIBLE_CHANNELS）。
+    const activeChannels=computed(()=>(overview.value.channels||[]).filter(c=>c.downstream&&chVisible(c.kind)));
     // usableChannels 是「真的有号可用」的渠道（运行层面）。
     //
     // 「可用渠道」必须按后者算：只按状态算的话，全新安装 0 个账号也会显示
@@ -1618,6 +1595,8 @@ createApp({
       return Object.keys(seen).sort().map(k=>({kind:k,name:seen[k]}));
     });
     const filteredModels=computed(()=>modelRows.value.filter(m=>{
+      // 被屏蔽的渠道（聊天模型）连模型行都不显示 —— 见 VISIBLE_CHANNELS。
+      if(!chVisible(m.channel))return false;
       if(modelChannel.value!=='all'&&m.channel!==modelChannel.value)return false;
       if(modelQ.value&&!m.id.toLowerCase().includes(modelQ.value.toLowerCase()))return false;
       if(modelState.value==='ok'&&m.healthy!=='ok')return false;
@@ -1773,6 +1752,34 @@ createApp({
       return {qodercn:'k1',workbuddy:'k2',traework:'k3',
         qwenwork:'k4',qodercom:'k5',workbuddyai:'k6'}[k]||'k-off';
     };
+    // 品牌图标表：渠道 kind / 接入源 name / 预设名 → dist/brands 下的文件。
+    //
+    // 刻意做成「有就显示、没有就退回身份色方块」：图标全来自各平台自己的站点
+    // （来源与商标归属见 brands/SOURCES.md），万一某个平台要求移除，删掉文件即可 ——
+    // 前端不会因为缺图而报错或留白。同一家的多个来源共用一份文件（QoderCOM 用 qodercn、
+    // WorkBuddyCN 用 codebuddy、DeepSeek 官方 API 用 deepseek）。
+    // 路径必须是 './brands/…' 相对形式：飞牛应用网关会剥掉 /app/poolgate 前缀，
+    // 根绝对路径在网关下会 404（这条踩过，见 src/README 的「前端资源前缀铁律」）。
+    const BRANDS={
+      anthropic:'anthropic.png', antigravity:'antigravity.png', bailian:'bailian.png',
+      chatglm:'chatglm.png', chatgpt:'chatgpt.svg', codebuddy:'codebuddy.svg',
+      copilot:'copilot.svg', custom:'custom.svg',
+      deepseek:'deepseek.png', 'deepseek-api':'deepseek.png', doubao:'doubao.png',
+      gemini:'gemini.png', glm:'glm.png', google:'google.png', groq:'groq.png',
+      iflow:'iflow.png', kimi:'kimi.png', kiro:'kiro.svg', lingma:'lingma.png',
+      minimax:'minimax.png', mistral:'mistral.png', modelscope:'modelscope.png',
+      moonshot:'moonshot.png', nvidia:'nvidia.png', openrouter:'openrouter.png',
+      perplexity:'perplexity.png', qodercn:'qodercn.svg', qodercom:'qodercn.svg',
+      qwen:'qwen.png', qwenwork:'qwenwork.png', siliconflow:'siliconflow.png',
+      together:'together.png', traework:'traework.png', volc:'volc.png',
+      windsurf:'windsurf.svg', workbuddy:'codebuddy.svg', workbuddyai:'workbuddyai.svg',
+      xai:'xai.png', yuanbao:'yuanbao.png'
+    };
+    const icoOf=k=>BRANDS[k]?('./brands/'+BRANDS[k]):'';
+
+    // 「添加账号」只列登录式渠道：API Key 式来源在「接入源」页加（两个模块分开）。
+    // 它们出现在这里只会多出一张点了没反应的卡 —— 面板授权对 key 式来源不适用。
+    const pickChannels=computed(()=>channels.value.filter(c=>(c.source||'login')!=='api_key'&&chVisible(c.kind)));
     const statusPill=c=>{
       if(c.status==='active')return 'good';
       if(c.status==='maintenance')return 'warn';
@@ -1871,17 +1878,15 @@ createApp({
     };
     const ask=(title,body,action)=>{confirmBox.value={title,body,action};};
 
-    // ---------- 接入源：登录授权式渠道 + API Key 式来源 ----------
-    // 渠道行复用 /api/channels 的数据，来源行来自 /api/providers（key 只回掩码）。
+    // ---------- 接入源：只有 API Key 式来源 ----------
+    // 与「账号」页分工：登录授权式渠道（QoderCN / 千问办公 / 豆包 …）只在账号页管理，
+    // 这一页只列「填 key 就能用」的来源。数据来自 /api/providers（key 只回掩码）。
     const providers=ref([]), presets=ref([]);
     const provWiz=reactive({
       open:false,step:1,type:'key',editing:false,testing:false,test:null,
       preset:'',modelsText:'',
       cfg:{name:'',display_name:'',base_url:'',api_key:'',supports_tools:true,tools_mode:'native',notes:'',models:[]}
     });
-    // 只取登录授权式：API Key 式来源在下面单独一行渲染（后端用 source 字段标出来，
-    // 否则同一个来源会被列出两次 —— 实测过，页面上确实重了一行）。
-    const providerChannelRows=computed(()=>channels.value.filter(c=>(c.source||'login')!=='api_key'));
     // 渠道大类：后端 /api/channels 给 category（coding / chat / api），没标的按 coding。
     const catOf=kind=>{const c=channels.value.find(x=>x.kind===kind);return (c&&c.category)||'coding';};
     const CAT_SECS=[
@@ -1892,7 +1897,8 @@ createApp({
     ];
     // 每组渠道按大类拆两段（同类里先可用后暂停），空类不显示。
     const accountSections=computed(()=>CAT_SECS.map(sec=>{
-      const inCat=g=>catOf(g.kind)===sec.key;
+      // 白名单之外（聊天的那些渠道）不出现在账号页 —— 见 VISIBLE_CHANNELS。
+      const inCat=g=>catOf(g.kind)===sec.key&&chVisible(g.kind);
       return {key:sec.key,title:sec.title,note:sec.note,
         active:activeGroups.value.filter(inCat),paused:pausedGroups.value.filter(inCat)};
     }).filter(sec=>sec.active.length||sec.paused.length));
@@ -1912,14 +1918,15 @@ createApp({
     };
     const resetProviderForm=()=>{
       provWiz.preset='';provWiz.modelsText='';provWiz.test=null;
-      provWiz.cfg={name:'',display_name:'',base_url:'',api_key:'',supports_tools:true,notes:'',models:[]};
+      provWiz.cfg={name:'',display_name:'',base_url:'',api_key:'',supports_tools:true,tools_mode:'native',notes:'',models:[]};
     };
     const openProviderWizard=()=>{provWiz.editing=false;provWiz.step=1;provWiz.type='key';resetProviderForm();provWiz.open=true;};
     const editProvider=(p)=>{
-      provWiz.editing=true;provWiz.step=2;provWiz.type='key';provWiz.test=null;provWiz.preset=p.preset||'';
+      provWiz.editing=true;provWiz.step=1;provWiz.type='key';provWiz.test=null;provWiz.preset=p.preset||'';
       provWiz.modelsText=(p.models||[]).join(', ');
       provWiz.cfg={name:p.name,display_name:p.display_name,base_url:p.base_url,api_key:'',
-        supports_tools:!!p.supports_tools,notes:p.notes||'',models:p.models||[]};
+        supports_tools:!!p.supports_tools,tools_mode:p.tools_mode||(p.supports_tools?'native':'none'),
+        notes:p.notes||'',models:p.models||[]};
       provWiz.open=true;
     };
     // applyPreset 只填「模板能确定」的字段；名称已存在时不覆盖（改名等于换渠道）。
@@ -1930,6 +1937,7 @@ createApp({
       provWiz.cfg.display_name=it.display_name;
       provWiz.cfg.base_url=it.base_url;
       provWiz.cfg.supports_tools=!!it.supports_tools;
+      provWiz.cfg.tools_mode=it.supports_tools?'native':'none';
       provWiz.cfg.notes=it.free_tier||'';
       if((it.models||[]).length)provWiz.modelsText=it.models.join(', ');
     };
@@ -1941,7 +1949,7 @@ createApp({
     // 测试那一步真的会发一条带工具定义的请求 —— 拿不到结构化 tool_calls 就说明
     // 这个来源不能给 coding agent 当后端，用户在这里就该看到，而不是等他去 Studio 里踩。
     const runProviderTest=async()=>{
-      provWiz.testing=true;provWiz.test=null;provWiz.step=3;
+      provWiz.testing=true;provWiz.test=null;provWiz.step=2;
       try{provWiz.test=await post('/api/providers/test',providerFormPayload());}
       catch(e){provWiz.test={auth_ok:false,auth_note:'请求失败',model_count:0,models:[],tools_ok:false,
         tools_note:'',ttft_ms:0,error:e.message};}
@@ -2299,7 +2307,7 @@ createApp({
       catalogChannels,filteredModels,modelGroups,errorKinds,filteredLogs,historyDesc,failedResults,
       authLabel,authCountdown,authMethod,policyRows,pwStrength,
       callbackLockedLocal,callbackViaPanel,pasteLogin,pasteHintText,qrUsable,authQr,qrTip,qrScanHint,cbRaw,cbPlaceholder,submitCallback,
-      channelName,channelClass,statusPill,statusIcon,statusText,sevLabel,
+      channelName,channelClass,icoOf,pickChannels,statusPill,statusIcon,statusText,sevLabel,
       accountPill,accountIcon,accountText,checkinPill,checkinText,logPill,logIcon,logText,accountSections,catOf,
       srcLabel,humanCtx,capsText,shortUid,fmtNum,fmtTime,fmtDate,barPct,barColor,
       channelCheckin,modelCountOf,channelCredits,historyFailSummary,ask,
@@ -2312,7 +2320,8 @@ createApp({
       detectedBase,clientBase,keyShown,keyPlain,keyPath,copyClientBase,useDetectedBase,copyKey,revealKey,hideKey,rotateKey,
       listenEffective,listenPinned,failedModelCount,hiddenByHealthCount,
       reasonText,
-      providers,presets,provWiz,presetInfo,providerChannelRows,openProviderWizard,editProvider,applyPreset,syncToolMode,toolModeText,
+      SHOW_PROVIDERS,visChannels,
+      providers,presets,provWiz,presetInfo,openProviderWizard,editProvider,applyPreset,syncToolMode,toolModeText,
       runProviderTest,saveProvider,askRemoveProvider,testSavedProvider,
       authFlowOpen,
       doSetup,doLogin,logout};

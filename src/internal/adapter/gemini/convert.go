@@ -17,7 +17,13 @@ import (
 )
 
 // buildRequest 组装请求体。
-func buildRequest(req channel.ChatRequest, project, sessionID string) ([]byte, error) {
+//
+// 外层信封**只有** {model, project, request} 三个字段 —— 三份参考实现都只发这三个：
+// geminicli2api google_api_client.py:69-73、gpt4free GeminiCLI.py:825-856、
+// AIClient2API gemini-core.js:171-173 / 796。Google 的 JSON 解析对未知字段会直接
+// 400（Cannot find field），所以这里不再多发参考实现没有的字段：过去多发的
+// 外层 user_prompt_id 与内层 session_id 已删（三份参考实现都没有它们）。
+func buildRequest(req channel.ChatRequest, project string) ([]byte, error) {
 	var systemParts []map[string]any
 	contents := make([]map[string]any, 0, len(req.Messages))
 	for _, m := range req.Messages {
@@ -89,14 +95,10 @@ func buildRequest(req channel.ChatRequest, project, sessionID string) ([]byte, e
 			}
 		}
 	}
-	if sessionID != "" {
-		inner["session_id"] = sessionID
-	}
 	return json.Marshal(map[string]any{
-		"model":          req.Model, // 裸名，不带 models/ 前缀
-		"project":        project,
-		"user_prompt_id": sessionID,
-		"request":        inner,
+		"model":   req.Model, // 裸名，不带 models/ 前缀
+		"project": project,
+		"request": inner,
 	})
 }
 

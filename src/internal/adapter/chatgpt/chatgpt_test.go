@@ -85,7 +85,8 @@ func TestChatEndToEnd(t *testing.T) {
 	const seed = "0.987654321"
 	const difficulty = "0fffff"
 	// 参考实现里的样例挑战：认证态用空密钥异或。
-	tsDx := base64.StdEncoding.EncodeToString([]byte(`[[3,"ok"]]`))
+	// dx 是「与本次请求发出去的 p 异或后 base64」的 opcode 程序（上游就是这么发的）：
+	// fixture 必须照这个形态造，否则等于在测「用错密钥的解码」。
 
 	var deviceIDs, proofs, targetPaths []string
 	var convHeaders http.Header
@@ -117,6 +118,8 @@ func TestChatEndToEnd(t *testing.T) {
 					t.Errorf("p 的载荷应是 18 元素 JSON 数组，得到 %s", truncate(string(raw), 120))
 				}
 			}
+			// 挑战体用**收到的那把 p** 异或（与上游一致）。
+			tsDx := base64.StdEncoding.EncodeToString([]byte(xorCipher(`[[3,"ok"]]`, req.P)))
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = fmt.Fprintf(w,
 				`{"token":"req-token","proofofwork":{"required":true,"seed":%q,"difficulty":%q},"turnstile":{"required":true,"dx":%q}}`,
@@ -487,6 +490,32 @@ func TestStreamRoutesThoughtsAndBlocksModeration(t *testing.T) {
 	}
 }
 
+// 实测形态（2026-09-26 抓包）：上游把消息**直接摊在顶层**（没有外层 v），
+// 正文还是「逐次变长的整条快照」。以前 walk 只认带 v 的帧，于是三道门都过了、
+// 上游也在正常出字，客户端拿到的却是空回复 —— 这类「静默空回复」只能靠抓原始帧定位。
+func TestStreamAcceptsTopLevelMessageFrames(t *testing.T) {
+	sse := strings.Join([]string{
+		`data: {"message":{"author":{"role":"user"},"content":{"content_type":"text","parts":["说一句话"]}},"conversation_id":"c1","error":null}`,
+		`data: {"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":[""]},"status":"in_progress"},"conversation_id":"c1","error":null}`,
+		`data: {"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":["愿你今天"]},"status":"in_progress"},"conversation_id":"c1","error":null}`,
+		`data: {"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":["愿你今天遇见的小事。"]},"status":"finished_successfully","end_turn":true},"conversation_id":"c1","error":null}`,
+		`data: {"type":"message_stream_complete"}`,
+		`data: [DONE]`,
+		"",
+	}, "\n\n")
+	st := newStream(io.NopCloser(strings.NewReader(sse)), "auto")
+	content, _, finish, err := drain(t, st)
+	if err != nil {
+		t.Fatalf("读流失败：%v", err)
+	}
+	if content != "愿你今天遇见的小事。" {
+		t.Fatalf("顶层消息帧的正文没被认出来：%q", content)
+	}
+	if finish != "stop" {
+		t.Fatalf("结束原因不对：%q", finish)
+	}
+}
+
 // 帧内身份错误 → SessionDead；帧内其它错误 → 上游故障。
 func TestStreamFrameErrors(t *testing.T) {
 	cases := []struct {
@@ -495,6 +524,11 @@ func TestStreamFrameErrors(t *testing.T) {
 	}{
 		{`{"error":{"message":"invalid access token"}}`, errs.SessionDead},
 		{`{"error":{"message":"upstream exploded"}}`, errs.UpstreamFault},
+		// error 不是对象也要认：上游的形态不固定，只认对象会把明确报错吞成「空回复」。
+		// 依据 gpt4free OpenaiChat.py:1452-1453（对任何真值的 error 都抛）。
+		{`{"error":"invalid access token"}`, errs.SessionDead},
+		{`{"error":"upstream exploded"}`, errs.UpstreamFault},
+		{`{"error":{"code":"boom"}}`, errs.UpstreamFault},
 	}
 	for _, c := range cases {
 		st := newStream(io.NopCloser(strings.NewReader("data: "+c.payload+"\n\n")), "auto")
@@ -502,6 +536,66 @@ func TestStreamFrameErrors(t *testing.T) {
 		if k, ok := errs.KindOf(err); !ok || k != c.want {
 			t.Fatalf("%s 应归一成 %v，得到 %v（%v）", c.payload, c.want, k, err)
 		}
+	}
+	// 非真值的 error（null / false）不是报错，不能把正常流打断。
+	ok := `data: {"error":null,"p":"/message/content/parts/0","o":"append","v":"正常"}` + "\n\n" +
+		`data: [DONE]` + "\n\n"
+	st := newStream(io.NopCloser(strings.NewReader(ok)), "auto")
+	content, _, _, err := drain(t, st)
+	if err != nil {
+		t.Fatalf("error=null 不该当报错：%v", err)
+	}
+	if content != "正常" {
+		t.Fatalf("正文不对：%q", content)
+	}
+}
+
+// 省略路径的文本增量 `{"v":"…"}` 必须接进正文。
+//
+// 依据（三份参考实现都处理了这个形态）：
+//   - chatgpt2api-basketikun/services/protocol/conversation.py:502-503 与其
+//     docs/upstream-sse-conversation.md:88-107（真实序列：显式 patch 后面紧跟 {"v":" world"}）；
+//   - gpt4free/g4f/Provider/needs_auth/OpenaiChat.py:1290-1291（`"p" not in line` 也算正文）；
+//   - ChatGPT2API-GO/internal/app/upstream.go:1365（无 p / 无 o 的字符串 v 追加到当前文本）。
+//
+// 漏掉它的症状是**静默丢字**：正文被切成残缺句子，且没有任何错误信息。
+func TestStreamAcceptsOmittedPathDeltas(t *testing.T) {
+	sse := strings.Join([]string{
+		`data: {"p":"/message/content/parts/0","o":"append","v":"北京"}`,
+		`data: {"v":"今天"}`,
+		`data: {"v":"是晴天"}`,
+		// 批量补丁里嵌套的省略路径项也要认（参考实现是递归处理）。
+		`data: {"p":"","o":"patch","v":[{"v":"。"},{"p":"/message/end_turn","o":"replace","v":true}]}`,
+		// 结束快照与已有正文重复，不该重复发。
+		`data: {"v":{"conversation_id":"c-1","message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":["北京今天是晴天。"]},"status":"finished_successfully"}}}`,
+		`data: [DONE]`,
+		"",
+	}, "\n\n")
+	st := newStream(io.NopCloser(strings.NewReader(sse)), "auto")
+	content, reasoning, finish, err := drain(t, st)
+	if err != nil {
+		t.Fatalf("读流失败：%v", err)
+	}
+	if content != "北京今天是晴天。" {
+		t.Fatalf("省略路径的增量被丢了：%q", content)
+	}
+	if reasoning != "" {
+		t.Fatalf("省略路径的增量不该进思考：%q", reasoning)
+	}
+	if finish != "stop" {
+		t.Fatalf("结束原因不对：%q", finish)
+	}
+	// 带 o 但 v 不是字符串的帧（add 快照）不能走这条分支被当成正文追加。
+	st2 := newStream(io.NopCloser(strings.NewReader(
+		`data: {"o":"add","v":{"message":{"author":{"role":"user"},"content":{"content_type":"text","parts":["你好"]}}}}`+"\n\n"+
+			`data: {"p":"/message/content/parts/0","o":"append","v":"答"}`+"\n\n"+
+			`data: [DONE]`+"\n\n")), "auto")
+	content2, _, _, err := drain(t, st2)
+	if err != nil {
+		t.Fatalf("读流失败：%v", err)
+	}
+	if content2 != "答" {
+		t.Fatalf("用户消息不该被当正文：%q", content2)
 	}
 }
 

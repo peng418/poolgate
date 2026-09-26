@@ -94,6 +94,18 @@ func TestChatStreamsAndSignsHeaders(t *testing.T) {
 		if r.Header.Get("Conversation-Id") == "" {
 			t.Error("缺 conversation-id")
 		}
+		// 参考实现 _get_headers（proxy.py:104-129）的其余指纹头也要发出去。
+		if got := r.Header.Get("Accept-Language"); got != "*" {
+			t.Errorf("accept-language 应为 *，得到 %q", got)
+		}
+		if got := r.Header.Get("Sec-Fetch-Mode"); got != "cors" {
+			t.Errorf("sec-fetch-mode 应为 cors，得到 %q", got)
+		}
+		tp := r.Header.Get("Traceparent")
+		parts := strings.Split(tp, "-")
+		if len(parts) != 4 || parts[0] != "00" || len(parts[1]) != 32 || len(parts[2]) != 16 || parts[3] != "01" {
+			t.Errorf("traceparent 形态应为 00-<32hex>-<16hex>-01，得到 %q", tp)
+		}
 		ts := r.Header.Get("X-Iflow-Timestamp")
 		if n, err := strconv.ParseInt(ts, 10, 64); err != nil || n < 1_000_000_000_000 {
 			t.Errorf("x-iflow-timestamp 应是毫秒时间戳，得到 %q", ts)
@@ -422,6 +434,102 @@ func TestStreamErrorFrameClassified(t *testing.T) {
 	}
 }
 
+// 上游有时用 application/octet-stream 回 SSE（参考实现 proxy.py:687 把两者都当流），
+// 流式请求必须照样按 SSE 解，不能当整包 JSON 报「格式不对」。
+func TestStreamOctetStreamTreatedAsSSE(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"id\":\"c1\",\"model\":\"glm-4.6\"," +
+			"\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好\"}}]}\n\n" +
+			"data: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	a := New()
+	a.base = srv.URL
+	cred := &channel.Credential{UID: "iflow-test", AccessToken: testKey}
+	st, err := a.Chat(context.Background(), cred, channel.ChatRequest{
+		Model: "glm-4.6", Messages: []channel.Message{{Role: "user", Content: "hi"}}, Stream: true,
+	})
+	if err != nil {
+		t.Fatalf("Chat 失败：%v", err)
+	}
+	defer st.Close()
+	var content string
+	for {
+		c, err := st.Next()
+		if err != nil {
+			break
+		}
+		for _, ch := range c.Choices {
+			content += ch.Delta.Content
+		}
+	}
+	if content != "你好" {
+		t.Fatalf("octet-stream 的 SSE 没解出来：content=%q", content)
+	}
+}
+
+// iFlow 的错误信封装在**顶层 msg**（参考实现读 error_data.get("msg")），
+// 不是 OpenAI 的 {"error":{"message":…}}；两种都要能认出并归一。
+func TestTopLevelMsgErrorEnvelope(t *testing.T) {
+	// 帧内 msg 错误：signature 措辞 → SessionDead。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeSSE(w, "data: {\"code\":\"710020202\",\"msg\":\"signature invalid\"}\n\n")
+	}))
+	defer srv.Close()
+	a := New()
+	a.base = srv.URL
+	cred := &channel.Credential{UID: "iflow-test", AccessToken: testKey}
+	st, err := a.Chat(context.Background(), cred, channel.ChatRequest{
+		Model: "glm-4.6", Messages: []channel.Message{{Role: "user", Content: "hi"}}, Stream: true,
+	})
+	if err != nil {
+		t.Fatalf("错误应在流里出现：%v", err)
+	}
+	defer st.Close()
+	var got error
+	for {
+		if _, err := st.Next(); err != nil {
+			got = err
+			break
+		}
+	}
+	if k, ok := errs.KindOf(got); !ok || k != errs.SessionDead {
+		t.Fatalf("顶层 msg 的签名错误应归一成 SessionDead，得到 %v（%v）", k, got)
+	}
+
+	// 非流式 200 + 顶层 msg + 无 choices：不能当成功。
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":"710020202","msg":"common invalid param"}`))
+	}))
+	defer srv2.Close()
+	a2 := New()
+	a2.base = srv2.URL
+	st2, err := a2.Chat(context.Background(), cred, channel.ChatRequest{
+		Model: "glm-4.6", Messages: []channel.Message{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("错误应在流里出现：%v", err)
+	}
+	defer st2.Close()
+	var got2 error
+	for {
+		if _, err := st2.Next(); err != nil {
+			got2 = err
+			break
+		}
+	}
+	if got2 == nil {
+		t.Fatal("200 + 顶层 msg 且无 choices 不能被当成成功")
+	}
+	if !strings.Contains(got2.Error(), "common invalid param") {
+		t.Fatalf("错误文案应带上游 msg，得到 %v", got2)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 4. Classify
 // ---------------------------------------------------------------------------
@@ -573,6 +681,7 @@ func TestExtractAPIKey(t *testing.T) {
 		{`"` + testKey + `"`, testKey},
 		{`{"apiKey":"` + testKey + `"}`, testKey},
 		{`{"api_key": "` + testKey + `"}`, testKey},
+		{`{"searchApiKey": "` + testKey + `"}`, testKey},
 		{`"apiKey" = "` + testKey + `"`, testKey},
 		{"   " + testKey + "\n", testKey},
 		{"", ""},

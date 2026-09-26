@@ -361,13 +361,22 @@ func (a *Adapter) doMessages(ctx context.Context, c *channel.Credential, token s
 // 与旧版（按 sk-ant-oat 前缀在两套认证间自动切换）不同：本渠道**只用订阅令牌**，
 // 一律 Bearer + oauth beta。这一点没有「看情况」的余地 —— 官方把订阅令牌与 API key
 // 当成两套认证，送错头只会得到 401，且报文不会告诉你是认证方式错了。
+//
+// beta 头是**两个值**（cliBeta + oauthBeta），顺序照官方 CLI：它先 push claude-code
+// beta 再 push oauth beta（claude-code-cli/utils/betas.ts:241,252）。只带 oauth
+// 是「少了真实客户端固定会带的一项」，见 constants.go 的 cliBeta 说明。
 func (a *Adapter) setAPIAuth(req *http.Request, token string) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("anthropic-version", anthropicVersion)
-	req.Header.Set("anthropic-beta", oauthBeta)
-	// 伪装成官方 CLI：参考实现里真实 Claude Code 都带这两个头（见 constants.go）。
+	req.Header.Set("anthropic-beta", cliBeta+","+oauthBeta)
+	// 伪装成官方 CLI：参考实现里真实 Claude Code 都带这几个头（见 constants.go）。
 	req.Header.Set("User-Agent", cliUA)
 	req.Header.Set("x-app", "cli")
+	// 官方 CLI 的 getAnthropicClient 传 dangerouslyAllowBrowser: true
+	// （claude-code-cli/services/api/client.ts:145），@anthropic-ai/sdk 据此自动注入
+	// 这个头；auth2api 绕过 SDK 后手工补上它（src/upstream/anthropic-api.ts:147）。
+	// 也就是说真实订阅令牌请求一定带它 —— 属于「照抄真实客户端」而不是额外发明。
+	req.Header.Set("anthropic-dangerous-direct-browser-access", "true")
 }
 
 // postJSON 发一个 JSON 请求（令牌端点用），返回状态码与原始报文。
@@ -398,6 +407,11 @@ func (a *Adapter) postJSON(ctx context.Context, c *channel.Credential, urlStr st
 //   - 其它（Cloudflare / WAF / 出口 IP 被拦）→ UpstreamFault：**不是账号的问题**，
 //     判死会让用户以为凭证坏了去重新授权，而真正该做的是换出口。
 //
+// 关键词表里还有一条 `oauth token has been revoked`：官方 CLI 的 withOAuth401Retry
+// 把**403 + 该报文**也当成认证失败（强制刷新后重试一次，claude-code-cli/utils/http.ts:112-129），
+// 说明上游对「令牌被撤销」有时用 403 而不是 401 表达。漏了它，被撤销的令牌会被判成
+// 「上游故障」而继续留在池子里，每个请求都白跑一趟。
+//
 // 实测（2026-09-26，本机机房 IP）官方返回的就是后一种，报文是：
 //
 //	{"error":{"type":"forbidden","message":"Request not allowed"}}
@@ -412,7 +426,7 @@ func (a *Adapter) Classify(status int, body []byte) errs.Kind {
 	case status == 401:
 		return errs.SessionDead // authentication_error：令牌无效/过期（刷新也救不回来时）
 	case status == 403:
-		for _, kw := range []string{"permission_error", "does not have permission", "not authorized", "oauth authentication"} {
+		for _, kw := range []string{"permission_error", "does not have permission", "not authorized", "oauth authentication", "oauth token has been revoked"} {
 			if strings.Contains(s, kw) {
 				return errs.SessionDead
 			}

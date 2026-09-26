@@ -9,8 +9,8 @@
 set -euo pipefail
 
 VERSION="${1:-0.1.2}"
-OUT_DIR="${2:-$HERE/dist}"   # 第二个参数可指向任意目录（如本机的交付目录）
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OUT_DIR="${2:-$HERE/dist}"   # 第二个参数可指向任意目录（如本机的交付目录）
 TPL="$HERE/tpl"
 PAYLOAD="$HERE/payload/poolgate"
 BRIDGE="$TPL/wwbridge"
@@ -72,7 +72,7 @@ M="$PKG/manifest"
   printf 'appname               = %s\n'   "$APPNAME"
   printf 'version               = %s\n'   "$VERSION"
   printf 'display_name          = PoolGate\n'
-  printf 'desc                  = PoolGate AI 账号池网关。三渠道（QoderCN/WorkBuddyCN/TraeWork）聚合为 OpenAI/Anthropic/Codex 兼容 API（/v1）与内置 Web 控制台，端口 5014，IPv4+IPv6 双栈；与 wild-work 并存独立运行。\n'
+  printf 'desc                  = PoolGate AI 账号池网关。把 20+ 家 AI 登录态（QoderCN / TraeWork / WorkBuddy / 豆包 / Kimi / 智谱 / ChatGPT / Claude 订阅 / Copilot / Kiro / iFlow / 灵码 / Antigravity / Windsurf / 通义 / Gemini 等）聚合为 OpenAI/Anthropic/Codex 兼容 API（/v1）与内置 Web 控制台，端口 5014，IPv4+IPv6 双栈；与 wild-work 并存独立运行。\n'
   printf 'arch                  = x86_64\n'
   printf 'platform              = x86\n'
   printf 'source                = thirdparty\n'
@@ -82,7 +82,7 @@ M="$PKG/manifest"
   printf 'service_port          = %s\n'   "$PORT"
   printf 'desktop_uidir         = ui\n'
   printf 'desktop_applaunchname = %s.main\n' "$APPNAME"
-  printf 'changelog = Gemini 渠道（Google 官方 OAuth，粘贴授权码即登录，原生工具调用）；通义渠道；防封号：一账号一出口 + 每账号串行与最小间隔；账号分类隔离；接入源 | FPK %s\n' "$VERSION"
+  printf 'changelog = 面板只显示在用的 6 个渠道（QoderCN/QoderCOM/TraeWork/WorkBuddyCN/WorkBuddyAI/千问办公），聊天渠道（豆包/ChatGPT/元宝/Kimi/智谱/通义/DeepSeek 网页/Gemini 等）与「接入源」入口先屏蔽 —— 代码一行未删，改两个常量即可恢复；面板显示与网关行为分开，要让客户端也选不到请在「设置→渠道开关」暂停 | FPK %s\n' "$VERSION"
 } >> "$M"
 chmod 0644 "$M"
 sed -n '1,20p' "$M" | sed 's/^/  /'

@@ -90,8 +90,10 @@ func (a *Adapter) checkinActivity(ctx context.Context, c *channel.Credential) (a
 }
 
 // billingPost 向 billing 端点发一个 JSON POST。
+// 走 a.billing（www.codebuddy.cn），不是 chat 的 copilot.tencent.com ——
+// 与 Balance 同口径，依据 wild-work ChatBaseCN/BillingBaseCN 与 hub REALM_CONFIGS["cn"]。
 func (a *Adapter) billingPost(ctx context.Context, path string, c *channel.Credential, body []byte) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.base+path, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.billing+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, errs.New(errs.Transport, "构造签到请求失败").WithCause(err)
 	}
@@ -101,6 +103,12 @@ func (a *Adapter) billingPost(ctx context.Context, path string, c *channel.Crede
 	req.Header.Set("X-User-Id", c.UID)
 	req.Header.Set("X-Domain", DomainCN)
 	req.Header.Set("User-Agent", clientUA)
+	req.Header.Set("X-CodeBuddy-Request", "1")
+	req.Header.Set("Accept-Language", acceptLanguageCN)
+	if ent := enterpriseID(c); ent != "" {
+		req.Header.Set("X-Enterprise-Id", ent)
+		req.Header.Set("X-Tenant-Id", ent)
+	}
 	resp, err := a.http.Do(req)
 	if err != nil {
 		return nil, errs.New(errs.Transport, "签到请求失败").WithCause(err).

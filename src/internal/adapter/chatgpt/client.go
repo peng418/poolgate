@@ -81,7 +81,10 @@ func (a *Adapter) Spec() channel.Spec {
 		DefaultMinIntervalSec: defaultMinIntervalSec,
 		Docs: "浏览器登录后粘贴 accessToken；每个请求都要过 sentinel（引导 + 挑战 + PoW），" +
 			"需要 turnstile 时由本地 VM 求解；accessToken 过期后无法自动续期，需要重新粘贴；" +
-			"思考单独分流；工具调用由网关模拟（toolshim）。" +
+			"思考单独分流；**工具调用实测不可用**：网页模型会拒绝按文本协议输出工具调用" +
+			"（原话大意「你列出的 Read/Bash/Grep 并没有挂载到我的可调用工具列表」），" +
+			"三种措辞实测 0/4，所以本渠道可以当聊天后端、当不了 coding agent 后端 —— " +
+			"要用它跑 agent 得等它的原生工具通道被接进来。" +
 			"注意：出口若被 Cloudflare 判风险（表现为引导首页 403 或挑战循环），" +
 			"需要在出口层做 TLS 指纹伪装（参考实现用的是 curl-impersonate）",
 	}

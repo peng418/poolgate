@@ -48,7 +48,9 @@ func (s *stream) pump() {
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil && err != io.EOF {
-			s.ch <- chunkOrErr{err: err}
+			// 读流失败也要归一成 errs.Error：普通 error 会被网关换成通用文案（红线一）。
+			s.ch <- chunkOrErr{err: errs.New(errs.Transport, "读取上游流失败").
+				WithChannel(string(channel.Qwen)).WithUpstream(truncate(err.Error(), 200)).WithCause(err)}
 			return
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -59,10 +61,21 @@ func (s *stream) pump() {
 			}
 			var raw map[string]any
 			if json.Unmarshal([]byte(payload), &raw) == nil {
+				if msg, isErr := upstreamError(raw); isErr {
+					// 上游把错误塞进流内帧（HTTP 已是 200）。不归一的话这帧会被当空帧丢掉，
+					// 客户端只看到一条空流 —— 正是 TraeWork 那次「原话被换成通用文案」的坑。
+					if msg == "" {
+						msg = truncate(payload, 200)
+					}
+					s.ch <- chunkOrErr{err: errs.New(errs.UpstreamFault, "上游在流中返回错误："+msg).
+						WithChannel(string(channel.Qwen)).WithUpstream(truncate(payload, 200))}
+					return
+				}
 				if c, ok := channel.ParseOpenAIChunk(raw, s.model); ok {
 					s.ch <- chunkOrErr{chunk: c}
 				}
 			}
+			// 解不出来的帧跳过：上游常在流里插注释/心跳行，当成失败会误杀正常流。
 		}
 		if err == io.EOF {
 			return
@@ -73,7 +86,8 @@ func (s *stream) pump() {
 func (s *stream) pumpSingleJSON() {
 	raw, err := io.ReadAll(io.LimitReader(s.rc, 32<<20))
 	if err != nil {
-		s.ch <- chunkOrErr{err: err}
+		s.ch <- chunkOrErr{err: errs.New(errs.Transport, "读取上游响应失败").
+			WithChannel(string(channel.Qwen)).WithUpstream(truncate(err.Error(), 200)).WithCause(err)}
 		return
 	}
 	var obj map[string]any
@@ -82,8 +96,11 @@ func (s *stream) pumpSingleJSON() {
 			WithChannel(string(channel.Qwen)).WithUpstream(truncate(string(raw), 200))}
 		return
 	}
-	if _, hasErr := obj["error"]; hasErr {
-		s.ch <- chunkOrErr{err: errs.New(errs.UpstreamFault, "上游在 200 响应里返回了错误").
+	if msg, isErr := upstreamError(obj); isErr {
+		if msg == "" {
+			msg = truncate(string(raw), 200)
+		}
+		s.ch <- chunkOrErr{err: errs.New(errs.UpstreamFault, "上游在 200 响应里返回了错误："+msg).
 			WithChannel(string(channel.Qwen)).WithUpstream(truncate(string(raw), 200))}
 		return
 	}
@@ -96,6 +113,28 @@ func (s *stream) pumpSingleJSON() {
 	for _, c := range chunks {
 		s.ch <- chunkOrErr{chunk: c}
 	}
+}
+
+// upstreamError 从一个上游帧/回包对象里取错误文案，返回 (文案, 是否错误)。
+//
+// 认 OpenAI 形态的顶层 `error`（对象带 message/details，或直接是字符串）——portal.qwen.ai 是
+// OpenAI 兼容端，错误帧就是这个形状。取不到文案时返回空串，由调用方回退成原始报文摘要。
+func upstreamError(raw map[string]any) (string, bool) {
+	v, ok := raw["error"]
+	if !ok || v == nil {
+		return "", false
+	}
+	switch e := v.(type) {
+	case string:
+		return strings.TrimSpace(e), true
+	case map[string]any:
+		for _, k := range []string{"message", "details", "code"} {
+			if s, ok := e[k].(string); ok && strings.TrimSpace(s) != "" {
+				return strings.TrimSpace(s), true
+			}
+		}
+	}
+	return "", true
 }
 
 func (s *stream) Next() (channel.ChatCompletionChunk, error) {

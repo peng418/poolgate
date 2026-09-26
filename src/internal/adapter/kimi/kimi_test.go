@@ -1,9 +1,10 @@
 package kimi
 
-// kimi_test.go 覆盖三件最容易出错的事：
+// kimi_test.go 覆盖四件最容易出错的事：
 //  1. Connect 帧的切分（**半帧**是常态，切错的表现是「客户端拿到乱码/一直转圈」）；
 //  2. 思考与正文的分流（分错了用户会看到正文被吞进 reasoning）；
-//  3. 凭证链路（refresh token → access token、401 换一次再试）。
+//  3. 凭证链路（refresh token → access token、401 换一次再试）；
+//  4. 模型目录（普通 JSON 调目录、id 生成规则、缓存、拉不到时的兜底）。
 
 import (
 	"context"
@@ -178,6 +179,9 @@ func TestChatEndToEnd(t *testing.T) {
 			}
 			if got := r.Header.Get("Connect-Protocol-Version"); got != "1" {
 				t.Errorf("缺 Connect-Protocol-Version：%q", got)
+			}
+			if got := r.Header.Get("Priority"); got != "u=1, i" {
+				t.Errorf("缺浏览器伪装头 Priority：%q", got)
 			}
 			raw, _ := io.ReadAll(r.Body)
 			frames, rest := splitFrames(raw)
@@ -390,5 +394,157 @@ func TestClassify(t *testing.T) {
 		if got := a.Classify(c.status, []byte(c.body)); got != c.want {
 			t.Fatalf("status=%d body=%s: 期望 %v 得到 %v", c.status, c.body, c.want, got)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 4. 模型目录：请求形态、id 生成规则、缓存、失败兜底
+// ---------------------------------------------------------------------------
+
+// catalogFixture 是参考实现 tests/test_model_catalog.py 里的目录响应样例（原样搬过来）。
+const catalogFixture = `{
+  "availableModels": [
+    {"scenario":"SCENARIO_K2D5","displayName":"K2.6 Instant","description":"Quick response"},
+    {"scenario":"SCENARIO_K2D5","displayName":"K2.6 Thinking","description":"Deep thinking","thinking":true},
+    {"scenario":"SCENARIO_OK_COMPUTER","displayName":"K2.6 Agent","kimiPlusId":"ok-computer","agentMode":"TYPE_NORMAL"},
+    {"scenario":"SCENARIO_OK_COMPUTER","displayName":"K2.6 Agent Swarm","kimiPlusId":"ok-computer","agentMode":"TYPE_ULTRA"}
+  ],
+  "defaultScenario": {"scenario": "SCENARIO_K2D5"}
+}`
+
+// 目录接口必须是**普通 JSON**（不是 Connect 信封），body 恰好是 `{}`，
+// 且 id 按参考实现的规则生成出 6 个档位（含 -search 别名）；结果要进缓存。
+func TestModelsFromCatalog(t *testing.T) {
+	jwt := fakeJWT(t)
+	var catalogCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != epModels {
+			t.Errorf("未预期的路径：%s", r.URL.Path)
+			return
+		}
+		catalogCalls++
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Errorf("目录请求应是普通 JSON，Content-Type=%q", got)
+		}
+		if got := r.Header.Get("Accept"); got != "application/json" {
+			t.Errorf("目录请求的 Accept 应为 application/json，得到 %q", got)
+		}
+		raw, _ := io.ReadAll(r.Body)
+		if string(raw) != "{}" {
+			t.Errorf("目录请求体应是 `{}`，得到 %q", raw)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer "+jwt {
+			t.Errorf("目录请求要带 access token，得到 %q", got)
+		}
+		_, _ = w.Write([]byte(catalogFixture))
+	}))
+	defer srv.Close()
+
+	a := New()
+	a.base = srv.URL
+	cred := &channel.Credential{UID: "u1", AccessToken: jwt}
+
+	models, err := a.Models(context.Background(), cred)
+	if err != nil {
+		t.Fatalf("Models 失败：%v", err)
+	}
+	want := []string{
+		"kimi-k2.6", "kimi-k2.6-thinking", "kimi-k2.6-agent",
+		"kimi-k2.6-agent-swarm", "kimi-k2.6-search", "kimi-k2.6-thinking-search",
+	}
+	if len(models) != len(want) {
+		t.Fatalf("档位数量不对：%v", models)
+	}
+	for i, id := range want {
+		if models[i].ID != id {
+			t.Fatalf("第 %d 个档位应为 %s，得到 %s", i, id, models[i].ID)
+		}
+		if models[i].Source != channel.SourceUpstream {
+			t.Fatalf("%s 的来源应标成 upstream，得到 %s", id, models[i].Source)
+		}
+	}
+	if _, ok := a.specFor("kimi-k2.6-agent-search"); ok {
+		t.Fatal("agent 档不该有 -search 别名（参考实现 test_model_catalog.py:57 明确断言）")
+	}
+	// 思考档的能力位跟着档位走；agent 档在上游目录里 thinking=false。
+	if models[1].Reasoning != channel.CapYes || models[2].Reasoning != channel.CapNo {
+		t.Fatalf("思考能力位不对：%+v", models)
+	}
+	// 第二次调用走缓存，不再打上游。
+	if _, err := a.Models(context.Background(), cred); err != nil {
+		t.Fatalf("第二次 Models 失败：%v", err)
+	}
+	if catalogCalls != 1 {
+		t.Fatalf("目录应在 TTL 内命中缓存（只打 1 次），实际 %d 次", catalogCalls)
+	}
+}
+
+// 目录拉不到（上游 5xx / 网络断）时不能把面板搞空：退到兜底表并标 local。
+func TestModelsFallsBackWhenCatalogFails(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"error":"boom"}`))
+	}))
+	defer srv.Close()
+
+	a := New()
+	a.base = srv.URL
+	models, err := a.Models(context.Background(), &channel.Credential{UID: "u1", AccessToken: fakeJWT(t)})
+	if err != nil {
+		t.Fatalf("兜底路径不应返回错误：%v", err)
+	}
+	if len(models) != len(fallbackModels) {
+		t.Fatalf("应退到兜底表（%d 项），得到 %+v", len(fallbackModels), models)
+	}
+	for _, m := range models {
+		if m.Source != channel.SourceLocal {
+			t.Fatalf("兜底表的来源必须标 local：%+v", m)
+		}
+	}
+	if snap := a.ModelsSnapshot(); len(snap) != len(fallbackModels) {
+		t.Fatalf("没有快照时 ModelsSnapshot 也应给兜底表：%+v", snap)
+	}
+}
+
+// agent 档的请求体要多带 scenario/kimiplusId/agentMode 三个字段（client.py:320-335）。
+func TestChatAgentTierPayload(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		frames, _ := splitFrames(raw)
+		if len(frames) != 1 {
+			t.Errorf("请求体应恰好 1 帧，得到 %d", len(frames))
+			return
+		}
+		if err := json.Unmarshal(frames[0].payload, &got); err != nil {
+			t.Errorf("请求体不是 JSON：%v", err)
+			return
+		}
+		writeFrames(w, [][]byte{connectFrame(map[string]any{"done": map[string]any{}})})
+	}))
+	defer srv.Close()
+
+	a := New()
+	a.base = srv.URL
+	st, err := a.Chat(context.Background(), &channel.Credential{UID: "u1", AccessToken: fakeJWT(t)},
+		channel.ChatRequest{Model: "kimi-k2.6-agent", Messages: []channel.Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatalf("Chat 失败：%v", err)
+	}
+	defer st.Close()
+	for {
+		if _, err := st.Next(); err != nil {
+			break
+		}
+	}
+	if got["scenario"] != scenarioOKComputer {
+		t.Fatalf("agent 档的 scenario 应为 %s，得到 %v", scenarioOKComputer, got["scenario"])
+	}
+	if got["kimiplusId"] != kimiPlusIDAgent || got["agentMode"] != agentModeNormal {
+		t.Fatalf("agent 档缺产品字段：%v", got)
+	}
+	// 普通档**不能**带这两个字段（上游会当成别的产品请求）。
+	if spec := specOf("kimi-k2.6"); spec.kimiPlusID != "" || spec.agentMode != "" {
+		t.Fatalf("普通档不该有 agent 字段：%+v", spec)
 	}
 }

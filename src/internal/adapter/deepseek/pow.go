@@ -8,11 +8,12 @@ package deepseek
 //
 // 实测导出（2026-09 本机用 wazero 打印）：
 //
-//	wasm_solve(i32,i32,i32,i32,i32,f64)      求解，结果写回 retptr
+//	wasm_solve(i32,i32,i32,i32,i32,f64)      求解，结果写回 retptr；**status!=0 才算解出**
 //	__wbindgen_add_to_stack_pointer(i32)->i32 拿临时栈指针
-//	__wbindgen_export_0(i32,i32)->i32         分配器（签名就是 __wbindgen_malloc 的形状）
+//	__wbindgen_export_N(i32,i32)->i32         分配器（签名就是 __wbindgen_malloc 的形状）
 //
-// 所以分配器要**按签名探测**而不是写死名字 —— 上游换构建时导出名可能变。
+// 所以分配器与求解函数都要**按名字/签名探测**而不是写死编号 —— 上游换构建时导出名可能变
+// （参考实现 pow.rs:82-134 就是这么探测的）。
 
 import (
 	"bytes"
@@ -24,6 +25,8 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"sort"
+	"strings"
 	"sync"
 
 	"github.com/tetratelabs/wazero"
@@ -63,7 +66,12 @@ func newSolver(ctx context.Context, wasm []byte) (*solver, error) {
 		_ = rt.Close(ctx)
 		return nil, fmt.Errorf("实例化 PoW WASM 失败: %w", err)
 	}
+	// wasm_solve：优先按显式名字取，取不到再按唯一签名 (i32,i32,i32,i32,i32,f64)->() 探测
+	// —— 参考实现 pow.rs:99-134 就是这么做的（上游换 WASM 构建时导出名可能变）。
 	solve := mod.ExportedFunction("wasm_solve")
+	if solve == nil {
+		solve = pickSolve(mod)
+	}
 	addStack := mod.ExportedFunction("__wbindgen_add_to_stack_pointer")
 	if solve == nil || addStack == nil {
 		return nil, fmt.Errorf("PoW WASM 缺导出函数（wasm_solve / __wbindgen_add_to_stack_pointer）")
@@ -76,27 +84,66 @@ func newSolver(ctx context.Context, wasm []byte) (*solver, error) {
 }
 
 // pickAlloc 按签名探测分配器：(i32,i32)->i32，优先名字里带 malloc 的那个。
+//
+// 不能用固定名列表（`__wbindgen_export_0/1/2`）：参考实现 pow.rs:82-97 是按
+// **前缀 `__wbindgen_export_` + 签名**探测的 —— 上游换 WASM 构建时导出编号会变，
+// 写死编号会在新版本上直接起不来（这正是本文件开头注释所强调的）。
 func pickAlloc(mod api.Module) api.Function {
 	if f := mod.ExportedFunction("__wbindgen_malloc"); f != nil {
 		return f
 	}
-	for _, name := range []string{"__wbindgen_export_0", "__wbindgen_export_1", "__wbindgen_export_2"} {
-		f := mod.ExportedFunction(name)
-		if f == nil {
+	var names []string
+	for name, def := range mod.ExportedFunctionDefinitions() {
+		if !strings.HasPrefix(name, "__wbindgen_export_") {
 			continue
 		}
-		def := f.Definition()
-		if len(def.ParamTypes()) == 2 && len(def.ResultTypes()) == 1 {
-			return f
+		if isAllocSig(def) {
+			names = append(names, name)
 		}
 	}
-	return nil
+	if len(names) == 0 {
+		return nil
+	}
+	sort.Strings(names) // 多个候选时取编号最小者，保证结果稳定
+	return mod.ExportedFunction(names[0])
+}
+
+func isAllocSig(def api.FunctionDefinition) bool {
+	p, r := def.ParamTypes(), def.ResultTypes()
+	return len(p) == 2 && p[0] == api.ValueTypeI32 && p[1] == api.ValueTypeI32 &&
+		len(r) == 1 && r[0] == api.ValueTypeI32
+}
+
+// pickSolve 按唯一签名 (i32,i32,i32,i32,i32,f64)->() 探测求解函数（参考实现 pow.rs:113-133）。
+func pickSolve(mod api.Module) api.Function {
+	var names []string
+	for name, def := range mod.ExportedFunctionDefinitions() {
+		p, r := def.ParamTypes(), def.ResultTypes()
+		if len(p) != 6 || len(r) != 0 {
+			continue
+		}
+		if p[0] != api.ValueTypeI32 || p[1] != api.ValueTypeI32 || p[2] != api.ValueTypeI32 ||
+			p[3] != api.ValueTypeI32 || p[4] != api.ValueTypeI32 || p[5] != api.ValueTypeF64 {
+			continue
+		}
+		names = append(names, name)
+	}
+	// 只在签名唯一时认领（多个同签名函数时无法判断哪个是求解器）。
+	if len(names) != 1 {
+		return nil
+	}
+	return mod.ExportedFunction(names[0])
 }
 
 func (s *solver) Close(ctx context.Context) { _ = s.rt.Close(ctx) }
 
 // solve 解一个挑战，返回 answer（找不到解时 ok=false）。
 func (s *solver) solve1(ctx context.Context, ch powChallenge) (answer int64, ok bool, err error) {
+	// 只认 DeepSeekHashV1：参考实现 pow.rs:146-148 同样在求解前拒绝其它 algorithm，
+	// 免得把别的算法塞进这份 WASM 算出垃圾。
+	if ch.Algorithm != "DeepSeekHashV1" {
+		return 0, false, fmt.Errorf("不支持的 PoW 算法：%s", ch.Algorithm)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -143,7 +190,11 @@ func (s *solver) solve1(ctx context.Context, ch powChallenge) (answer int64, ok 
 	}
 	status := int32(binary.LittleEndian.Uint32(raw[0:4]))
 	val := math.Float64frombits(binary.LittleEndian.Uint64(raw[8:16]))
-	if status != 0 {
+	// **status == 0 才是无解**，非 0 表示求解成功 —— 参考实现 pow.rs:210-212
+	// （`if status == 0 { return Err(PowError::NoSolution) }`）与 gpt4free pow.py:80-84
+	// 两处独立实现一致。这里之前写反了（把成功当无解、把无解当成功），
+	// 表现就是「真上游上 PoW 永远解不出来 / 拿 0 当答案」。
+	if status == 0 {
 		return 0, false, nil // 无解（挑战本身有问题）
 	}
 	return int64(val), true, nil

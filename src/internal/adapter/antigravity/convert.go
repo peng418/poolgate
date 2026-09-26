@@ -81,27 +81,52 @@ func buildRequest(req channel.ChatRequest, project, requestID string) ([]byte, e
 		contents = append(contents, map[string]any{"role": gr, "parts": parts})
 	}
 
+	maxOut := maxOrDefault(req.MaxTokens)
+	genCfg := map[string]any{"maxOutputTokens": maxOut}
+	// thinkingConfig **只发给确实支持思考的型号**，且形态按后端分两种（见 thinkingConfigFor）。
+	// 旧实现无论什么型号都塞 includeThoughts:true —— 与两份参考实现都不符：
+	// 非思考型号（claude-sonnet-4-6 / gpt-oss-120b-medium）参考实现会**删掉** thinkingConfig。
+	if tc, bumped := thinkingConfigFor(req.Model, maxOut); tc != nil {
+		genCfg["thinkingConfig"] = tc
+		// Claude 思考型号：规格硬性要求 maxOutputTokens > thinkingBudget，
+		// 不足时参考实现把上限顶到 64000（见 claudeThinkingMaxOutput）。
+		if bumped > 0 {
+			genCfg["maxOutputTokens"] = bumped
+		}
+	}
 	inner := map[string]any{
-		"contents": contents,
-		"generationConfig": map[string]any{
-			"maxOutputTokens": maxOrDefault(req.MaxTokens),
-			// includeThoughts 打开，思考型号才会把思考块单独吐出来（映射成 reasoning_content）。
-			// 非思考型号忽略它，无害。
-			"thinkingConfig": map[string]any{"includeThoughts": true},
-		},
+		"contents":         contents,
+		"generationConfig": genCfg,
 	}
 	if req.Temperature != nil {
-		inner["generationConfig"].(map[string]any)["temperature"] = *req.Temperature
+		genCfg["temperature"] = *req.Temperature
 	}
 	if len(systemParts) > 0 {
-		// 注意是对象形态（带 parts），不是字符串 —— 这条写错上游直接 400。
-		inner["systemInstruction"] = map[string]any{"parts": systemParts}
+		// 形态：{role:"user", parts:[…]}，是对象不是字符串 —— 写成字符串上游直接 400。
+		// role:"user" 各参考实现都显式带上（opencode request.ts:1470-1493、g4f Antigravity.py:785、
+		// AIClient2API antigravity-core.js:963-971、antigravity-claude-proxy request-builder.js），
+		// 只带 parts 不带 role 与官方客户端形态不一致，照抄补齐。
+		inner["systemInstruction"] = map[string]any{"role": "user", "parts": systemParts}
 	}
 	if tools := req.ForwardTools(); len(tools) > 0 {
 		if decls := functionDeclarations(tools); len(decls) > 0 {
 			inner["tools"] = []map[string]any{{"functionDeclarations": decls}}
-			if tc := toolConfig(req.ToolChoice); tc != nil {
-				inner["toolConfig"] = map[string]any{"functionCallingConfig": tc}
+			fcc := toolConfig(req.ToolChoice)
+			if isClaude(req.Model) {
+				// Claude 后端只要带工具，就一定要带 functionCallingConfig.mode="VALIDATED"
+				//（不是标准的 AUTO/ANY/NONE）。三份**独立**实现一致：
+				//   - opencode request.ts:943-955：对 Claude 无条件设 mode="VALIDATED"；
+				//   - AIClient2API antigravity-tool-config.js:77-82：isClaudeModel 时覆写已有 toolConfig 的 mode；
+				//   - antigravity-claude-proxy request-converter.js:239-244：带 tools 的 Claude 请求即设 VALIDATED。
+				// 即使客户端没给 tool_choice，这里也补出一个 toolConfig（opencode/ACP 都如此）；
+				// 覆写 mode 时保留其余键（如 allowedFunctionNames），与 AIClient2API 一致。
+				if fcc == nil {
+					fcc = map[string]any{}
+				}
+				fcc["mode"] = "VALIDATED"
+			}
+			if fcc != nil {
+				inner["toolConfig"] = map[string]any{"functionCallingConfig": fcc}
 			}
 		}
 	}
@@ -123,6 +148,68 @@ func maxOrDefault(n int) int {
 	}
 	return 8192
 }
+
+const (
+	// claudeThinkingBudget 是 Claude 思考型号的默认思考预算。
+	// 依据：参考实现 model-resolver.ts:229-239 对**不带档位后缀**的 Claude 思考型号
+	// 取 claude.high = 32768；g4f 亦向 Claude 思考型号下发 thinkingBudget
+	//（Antigravity.py normalize_antigravity_thinking）。
+	claudeThinkingBudget = 32768
+
+	// claudeThinkingMaxOutput 是 Claude 思考型号的 maxOutputTokens 下限。
+	// 规格硬性要求 maxOutputTokens > thinkingBudget（docs/ANTIGRAVITY_API_SPEC.md
+	// 「Thinking / Extended Reasoning」）；参考实现直接把上限顶到 64000
+	//（opencode transform/claude.ts:18 CLAUDE_THINKING_MAX_OUTPUT_TOKENS）。
+	claudeThinkingMaxOutput = 64000
+)
+
+// thinkingConfigFor 按型号给出 generationConfig.thinkingConfig 与需要抬高的 maxOutputTokens。
+//
+// 各参考实现在这件事上一致（opencode / g4f / AIClient2API，见下）：
+//   - **非思考型号不带 thinkingConfig**：opencode request.ts:965-1013 对 claude-sonnet-4-6
+//     显式忽略 thinkingConfig；g4f 对 model_supports_thinking 为假的型号直接 pop 掉
+//     thinkingConfig（Antigravity.py:451-460、520-540）；AIClient2API normalizeAntigravityThinking
+//     （antigravity-core.js:424-428）同样如此。判据是「名字含 gemini-3 / gemini-2.5 / -thinking」
+//     或 metadata 里带 thinking 项——gpt-oss-120b-medium 三处都判否。
+//   - **Gemini 3 用字符串 thinkingLevel（low/high），不是数字 budget**：
+//     opencode MODEL-VARIANTS.md + model-resolver.ts:244-253；g4f/AIClient2API
+//     applyAntigravityClientModelThinkingLevel（thinkingLevel 映射表按型号给 high/low）。
+//     反例：antigravity-claude-proxy request-converter.js:188-196 对 Gemini 用数字 thinkingBudget，
+//     但它偏 Claude 场景，采纳多数派（thinkingLevel）。
+//   - **Claude 思考系用数字 thinkingBudget**：opencode request.ts:1020-1027；ACP request-converter.js:166-187。
+//
+// 返回 (nil, 0) 表示该型号不下发 thinkingConfig。
+func thinkingConfigFor(model string, maxOut int) (map[string]any, int) {
+	switch {
+	case isGemini3(model):
+		return map[string]any{"includeThoughts": true, "thinkingLevel": geminiThinkingLevel(model)}, 0
+	case isClaudeThinking(model):
+		bumped := 0
+		if maxOut <= claudeThinkingBudget {
+			bumped = claudeThinkingMaxOutput
+		}
+		return map[string]any{"includeThoughts": true, "thinkingBudget": claudeThinkingBudget}, bumped
+	}
+	return nil, 0
+}
+
+// geminiThinkingLevel 从 Gemini 3 型号名取思考档。
+//
+// Gemini 3 Pro 只认 low / high（MODEL-VARIANTS.md）；Antigravity 模式下型号名里的
+// -high / -low 后缀就是档位本身。取不到后缀时落回 low —— 与参考实现「无档位后缀的
+// Gemini 3 Pro 补 -low」一致（model-resolver.ts:186-193），不猜 high。
+func geminiThinkingLevel(model string) string {
+	s := strings.ToLower(strings.TrimSpace(model))
+	for _, lvl := range []string{"high", "medium", "low", "minimal"} {
+		if strings.HasSuffix(s, "-"+lvl) {
+			return lvl
+		}
+	}
+	return "low"
+}
+
+// isGemini3 判断是否 Gemini 3 系（思考档用 thinkingLevel 而不是 thinkingBudget）。
+func isGemini3(id string) bool { return containsFold(id, "gemini-3") }
 
 // functionDeclarations 把 OpenAI 形态的 tools 转成 Gemini 的 functionDeclarations。
 func functionDeclarations(tools []map[string]any) []map[string]any {

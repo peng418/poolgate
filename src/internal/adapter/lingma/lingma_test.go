@@ -291,6 +291,74 @@ func TestAcceptCallbackForms(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// 3b. 请求体字段（照参考实现 remote/client.go buildBody）
+// ---------------------------------------------------------------------------
+
+// model_config.is_reasoning 必须按模型名派生（参考实现 remoteReasoningEnabled），
+// 不能恒 false；tools 里每个 function 必须带齐 name/description/parameters（参考实现 projectTools）。
+func TestBuildChatBodyReasoningAndToolShape(t *testing.T) {
+	build := func(t *testing.T, model string, tools []map[string]any) map[string]any {
+		t.Helper()
+		raw, err := buildChatBody(channel.ChatRequest{
+			Model:    model,
+			Messages: []channel.Message{{Role: "user", Content: "hi"}},
+			Tools:    tools,
+		}, model)
+		if err != nil {
+			t.Fatalf("buildChatBody: %v", err)
+		}
+		var body map[string]any
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatalf("请求体不是 JSON：%v", err)
+		}
+		return body
+	}
+
+	// 思考模型：is_reasoning=true；普通模型：false。
+	thinking := build(t, "Qwen3-Thinking", nil)
+	mc := thinking["model_config"].(map[string]any)
+	if mc["is_reasoning"] != true {
+		t.Fatalf("thinking 模型的 is_reasoning 应为 true，得到 %v", mc["is_reasoning"])
+	}
+	plain := build(t, "Kimi-K2.6", nil)
+	if plain["model_config"].(map[string]any)["is_reasoning"] != false {
+		t.Fatal("非 thinking 模型的 is_reasoning 应为 false")
+	}
+	// auto → 空 key，且不是思考模型。
+	auto := build(t, "auto", nil)
+	mca := auto["model_config"].(map[string]any)
+	if mca["key"] != "" || mca["is_reasoning"] != false {
+		t.Fatalf("auto 应归一成空 key 且非思考：%+v", mca)
+	}
+
+	// 客户端漏给 description / parameters 时必须补空串与默认 schema（参考实现恒发这两个键）。
+	body := build(t, "Kimi-K2.6", []map[string]any{{
+		"type":     "function",
+		"function": map[string]any{"name": "get_weather"},
+	}})
+	tools, _ := body["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("tools 应透传 1 个，得到 %d", len(tools))
+	}
+	tool := tools[0].(map[string]any)
+	fn := tool["function"].(map[string]any)
+	if fn["name"] != "get_weather" {
+		t.Fatalf("函数名丢了：%+v", fn)
+	}
+	if desc, ok := fn["description"].(string); !ok || desc != "" {
+		t.Fatalf("缺 description 时补空串，得到 %v", fn["description"])
+	}
+	if _, ok := fn["parameters"].(map[string]any); !ok {
+		t.Fatalf("缺 parameters 时补默认 schema，得到 %v", fn["parameters"])
+	}
+	// 非标准形态（没有 function 对象）原样透传，不改写。
+	body = build(t, "Kimi-K2.6", []map[string]any{{"type": "function", "extra": 1}})
+	if len(body["tools"].([]any)) != 1 {
+		t.Fatal("非标准工具应原样透传")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // 4. 模型目录
 // ---------------------------------------------------------------------------
 

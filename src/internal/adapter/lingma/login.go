@@ -7,7 +7,8 @@
 //
 // 需要两个文件，因为缺一不可：
 //   - cache/user：AES 密文，密钥是 machineID 前 16 字节 —— 没有 machineID 就解不开；
-//   - cache/id  ：machineID 明文，同时也是请求头 `Cosy-Machineid` 的值。
+//   - cache/id （或 CLI 形态的 cli/.auth/id）：machineID 明文，同时也是请求头
+//     `Cosy-Machineid` 的值。参考实现两个位置都读（remote/credentials.go:422-427）。
 //
 // 实现 channel.CallbackAcceptor + Hint()：控制台据此把面板切成「粘贴」形态
 // （与 DeepSeek/Kimi 同一条通道，前端不需要为灵码做任何特判）。
@@ -30,8 +31,12 @@ const loginPage = "https://lingma.aliyun.com"
 // machineID 里的字符串，避免误切。
 const pasteSeparator = "@@@id@@@"
 
+// machineID 的两个等价来源：参考实现 remote/credentials.go:422-427 candidateMachineIDFiles
+// 依次读 `cache/id` 与 `cli/.auth/id`（后者是 CLI 形态的客户端），两边都是 machineID 明文，
+// 任取其一即可。面板提示必须把这两个都写出来 —— 只提 cache/id 时，用 CLI 登录的用户会找不到文件。
 const hintText = "通义灵码是「复用 IDE 登录态」的渠道，没有 API key，请把 IDE 的缓存粘回来。" +
-	"在装了灵码的机器上找到这两个文件：① cache/user（一段较长的 base64）② cache/id（machineID 明文）。" +
+	"在装了灵码的机器上找到这两个文件：① cache/user（一段较长的 base64）② machineID（明文），" +
+	"它在 cache/id，或 CLI 形态的 cli/.auth/id（两者内容等价，任取其一）。" +
 	"常见位置：~/.lingma/cache/ 或编辑器全局存储里的 alibaba-cloud.tongyi-lingma/。" +
 	"粘贴方式任选其一：" +
 	"A) 一次粘两段 —— 先粘 cache/user 的全部内容，另起一行写 " + pasteSeparator + "，再粘 cache/id 的内容；" +

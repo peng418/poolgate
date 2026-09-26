@@ -59,8 +59,8 @@ func buildChatBody(req channel.ChatRequest, modelKey string) ([]byte, error) {
 			"display_name": "",
 			"model":        model,
 			"format":       "",
-			"is_vl":        false,
-			"is_reasoning": false,
+			"is_vl":        false, // 本渠道不发图（Images=false），恒 false
+			"is_reasoning": isReasoningModel(model),
 			"api_key":      "",
 			"url":          "",
 			"source":       "",
@@ -78,9 +78,9 @@ func buildChatBody(req channel.ChatRequest, modelKey string) ([]byte, error) {
 		},
 	}
 
-	// 工具定义原样透传（上游就是 OpenAI 形态的 tools 数组）。
-	// ForwardTools 已处理「客户端显式 tool_choice:"none"」这种情况，不会静默丢工具。
-	if tools := req.ForwardTools(); len(tools) > 0 {
+	// 工具定义透传（上游就是 OpenAI 形态的 tools 数组），但补齐国参考实现保证存在的字段
+	// （见 projectTools）。ForwardTools 已处理「客户端显式 tool_choice:"none"」，不会静默丢工具。
+	if tools := projectTools(req.ForwardTools()); len(tools) > 0 {
 		payload["tools"] = tools
 	}
 	if req.ToolChoice != nil {
@@ -88,6 +88,59 @@ func buildChatBody(req channel.ChatRequest, modelKey string) ([]byte, error) {
 	}
 
 	return json.Marshal(payload)
+}
+
+// isReasoningModel 判定是否要向上游声明「本轮按思考模式跑」。
+//
+// 依据参考实现 remote/client.go:467-473 remoteReasoningEnabled：客户端显式给了
+// reasoning_effort，**或**模型名里含 "thinking"，就把 model_config.is_reasoning 置真。
+// 这里只实现了「模型名含 thinking」这一支 —— channel.ChatRequest 没有 reasoning_effort
+// 字段（共享类型，本轮不改），那条判据取不到材料，见报告。
+//
+// 它只影响上游的思考意图，不改变响应形态：远端 SSE 没有独立 reasoning 块
+// （参考实现 README:43、207），所以置真不会让正文变成我们解析不到的东西。
+func isReasoningModel(model string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(model)), "thinking")
+}
+
+// projectTools 保证每个工具都带齐 name / description / parameters 三个字段。
+//
+// 依据参考实现 remote/client.go:604-628 projectTools：它按内部 ToolDef 结构**重建**每个工具，
+// 于是 description 取不到时是空串、parameters 为空时兜底成 {"type":"object","properties":{}} ——
+// 也就是说上游实测形态里这两个键**恒存在**。我们的 tools 是客户端 OpenAI 形态的 map 直接透传，
+// 而 description 在 OpenAI 里是选填、parameters 也可能被客户端省掉，少键就与实测形态不一致。
+//
+// 只补缺失的键，其余（含 strict 等未知键）原样保留 —— 参考实现会丢掉未知键，我们保留，
+// 避免削掉客户端的语义；上游对多出来的 JSON 键是宽容的。
+func projectTools(tools []map[string]any) []map[string]any {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(tools))
+	for _, tool := range tools {
+		fn, ok := tool["function"].(map[string]any)
+		if !ok {
+			out = append(out, tool) // 非标准形态：不认识就不动它，原样透传
+			continue
+		}
+		clone := make(map[string]any, len(tool))
+		for k, v := range tool {
+			clone[k] = v
+		}
+		newFn := make(map[string]any, len(fn)+2)
+		for k, v := range fn {
+			newFn[k] = v
+		}
+		if _, ok := newFn["description"]; !ok {
+			newFn["description"] = ""
+		}
+		if params, ok := newFn["parameters"]; !ok || params == nil {
+			newFn["parameters"] = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
+		clone["function"] = newFn
+		out = append(out, clone)
+	}
+	return out
 }
 
 // projectMessages 把内部消息列表转成上游形态。

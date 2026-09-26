@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"poolgate/internal/channel"
 	"poolgate/internal/errs"
@@ -32,6 +33,19 @@ func newTestAdapter(url string) *Adapter {
 	a.githubAPIBase = url
 	a.copilotBase = url
 	return a
+}
+
+// allowPoll 把轮询门限清到过去 —— 等价于「控制台已经等够了 interval」，可以立刻问上游。
+// 测试里真 sleep 每秒一次太慢，直接改字段（测试与适配器同包）。
+func allowPoll(t *testing.T, sess channel.LoginSession) {
+	t.Helper()
+	ds, ok := sess.(*deviceSession)
+	if !ok {
+		t.Fatalf("测试期望 *deviceSession，得到 %T", sess)
+	}
+	ds.mu.Lock()
+	ds.nextPoll = time.Time{}
+	ds.mu.Unlock()
 }
 
 // writeSSE 按 SSE 形态写一串 data 帧。故意拆成小块 flush，模拟真实网络的分片。
@@ -169,10 +183,13 @@ func TestDeviceLoginEndToEnd(t *testing.T) {
 	}
 
 	// 第一次轮询：还没授权完 → ErrPending（不是错误）。
+	// allowPoll 跳过的只是「轮询间隔门限」（那个行为另有用例覆盖），协议流程照常走。
+	allowPoll(t, sess)
 	if _, err := sess.Poll(context.Background()); !errors.Is(err, channel.ErrPending) {
 		t.Fatalf("未完成时应返回 ErrPending，得到 %v", err)
 	}
 	// 第二次：拿到 githubToken，并当场换成 copilotToken 验一把。
+	allowPoll(t, sess)
 	cred, err := sess.Poll(context.Background())
 	if err != nil {
 		t.Fatalf("第二次轮询应成功：%v", err)
@@ -216,10 +233,69 @@ func TestDeviceLoginAccessDenied(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartLogin 失败：%v", err)
 	}
+	allowPoll(t, sess)
 	_, err = sess.Poll(context.Background())
 	k, ok := errs.KindOf(err)
 	if !ok || k != errs.AuthFailed {
 		t.Fatalf("拒绝授权应归 AuthFailed，得到 %v（%v）", k, err)
+	}
+}
+
+// 设备码轮询必须尊重上游给的 interval，并对 slow_down 加大间隔。
+//
+// 这是 mock 那套测不出来的那种差异：控制台每 2 秒调一次 Poll，而上游要求至少隔 interval 秒；
+// 不拦的话会把 github.com 打快，真上游回 slow_down 甚至限流。参考实现都按 interval 睡
+// （copilot-api poll-access-token.ts:17、gpt4free oauthFlow.py:60,82），我们按同一口径拦。
+func TestDeviceLoginHonorsPollInterval(t *testing.T) {
+	var tokenCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case epDeviceCode:
+			_, _ = w.Write([]byte(`{"device_code":"d","user_code":"U","verification_uri":"https://x/y",` +
+				`"expires_in":900,"interval":5}`))
+		case epAccessToken:
+			atomic.AddInt32(&tokenCalls, 1)
+			_, _ = w.Write([]byte(`{"error":"slow_down"}`))
+		}
+	}))
+	defer srv.Close()
+
+	a := newTestAdapter(srv.URL)
+	sess, err := a.StartLogin(context.Background(), channel.LoginOptions{})
+	if err != nil {
+		t.Fatalf("StartLogin 失败：%v", err)
+	}
+	ds := sess.(*deviceSession)
+
+	// 刚到点之前：只回 pending，不许碰上游。
+	if _, err := sess.Poll(context.Background()); !errors.Is(err, channel.ErrPending) {
+		t.Fatalf("未到 interval 应回 ErrPending，得到 %v", err)
+	}
+	if got := atomic.LoadInt32(&tokenCalls); got != 0 {
+		t.Fatalf("未到 interval 不应请求上游，实际 %d 次", got)
+	}
+
+	// 到点：真的问一次；上游回 slow_down → 间隔 +5s。
+	allowPoll(t, sess)
+	if _, err := sess.Poll(context.Background()); !errors.Is(err, channel.ErrPending) {
+		t.Fatalf("slow_down 应归 ErrPending，得到 %v", err)
+	}
+	if got := atomic.LoadInt32(&tokenCalls); got != 1 {
+		t.Fatalf("到点应请求上游一次，实际 %d 次", got)
+	}
+	ds.mu.Lock()
+	gotInterval := ds.interval
+	ds.mu.Unlock()
+	if want := 10 * time.Second; gotInterval != want {
+		t.Fatalf("slow_down 后间隔应增至 %v，得到 %v", want, gotInterval)
+	}
+
+	// 加大的间隔同样生效：还没到点就不该再打上游。
+	if _, err := sess.Poll(context.Background()); !errors.Is(err, channel.ErrPending) {
+		t.Fatalf("slow_down 后未到新间隔应回 ErrPending，得到 %v", err)
+	}
+	if got := atomic.LoadInt32(&tokenCalls); got != 1 {
+		t.Fatalf("slow_down 后未到新间隔不应再请求上游，实际 %d 次", got)
 	}
 }
 
@@ -298,8 +374,8 @@ func TestChatHeadersAndIncrementalText(t *testing.T) {
 				t.Errorf("对话必须用 Bearer <copilotToken>，得到 %q", got)
 			}
 			// 伪装头逐个点名：缺任何一个上游都可能判成第三方调用，而报错不会告诉你是哪个。
+			// （参考实现里没有 Copilot-Version 这个头，所以这里也不该有 —— 见 constants.go 注释。）
 			want := map[string]string{
-				"Copilot-Version":                     copilotVersion,
 				"Copilot-Integration-Id":              "vscode-chat",
 				"Editor-Version":                      "vscode/" + vsCodeVersion,
 				"Editor-Plugin-Version":               "copilot-chat/" + copilotVersion,

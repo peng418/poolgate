@@ -106,9 +106,15 @@ func (s *wbSession) Poll(ctx context.Context) (*channel.Credential, error) {
 		RefreshToken: tok.RefreshToken,
 		Extra:        map[string]string{},
 	}
-	if tok.Domain != "" {
-		cred.Extra["domain"] = tok.Domain
+	// 国际版 token 响应缺 domain 时按区域兜底：wild-work internal/login/login.go
+	// EndpointsForRegion(global).DefaultDomain="www.workbuddy.ai" 与
+	// internal/login_wbai/login.go SaveAuth（domain 为空时兜 www.workbuddy.ai）都如此，
+	// 否则账号会被判成 CN 而无法被加载。
+	domain := strings.TrimSpace(tok.Domain)
+	if domain == "" {
+		domain = "www.workbuddy.ai"
 	}
+	cred.Extra["domain"] = domain
 	if tok.ExpiresIn > 0 {
 		cred.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
 	}

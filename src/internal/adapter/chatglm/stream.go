@@ -134,8 +134,12 @@ func (s *stream) pump() {
 							tail = str(le["intervene_text"])
 						}
 						if tail == "" {
+							// 参考实现在没有 intervene_text 时发空 delta；我们补一句说明 ——
+							// 客户端看到「无缘无故结束」比看到「被拦截且上游没给说明」更糟（红线二）。
 							tail = "内容被上游审核拦截（上游没有给出说明）"
 						}
+						// 前缀 \n\n 照参考实现（chat.ts:1455-1460 `content: \`\n\n${intervene_text}\``）。
+						tail = "\n\n" + tail
 					}
 					// 收尾前把最后一帧的 parts 增量也发出去（finish 帧可能带新内容）。
 					if txt, rsn := state.feed(ev); txt != "" || rsn != "" {
@@ -219,10 +223,13 @@ func businessError(ev map[string]any) (errs.Kind, string, bool) {
 	if msg == "" {
 		msg = str(ev["msg"])
 	}
-	// 40102 = refresh_token 过期（参考实现里明确认定的语义）；1xxxx 里与 token 相关的同样处理。
+	// 40102 = refresh_token 过期，参考实现的判据是**报文字本含 40102**（chat.ts:1038 `message.includes('40102')`），
+	// 而不是看 code/status 字段等于 40102 —— 上游会把 40102 塞在 message 里、code 另给一个值，所以两种都认。
 	s := strings.ToLower(msg)
 	switch {
-	case code == 40102, code == 401, code == 403:
+	case code == 40102, strings.Contains(msg, "40102"):
+		return errs.SessionDead, "refresh_token 已过期（业务码 " + itoa(code) + "）：" + msg, true
+	case code == 401, code == 403:
 		return errs.SessionDead, "凭证已失效（业务码 " + itoa(code) + "）：" + msg, true
 	case strings.Contains(s, "token"), strings.Contains(s, "登录"), strings.Contains(s, "expire"):
 		return errs.SessionDead, "凭证已失效（业务码 " + itoa(code) + "）：" + msg, true

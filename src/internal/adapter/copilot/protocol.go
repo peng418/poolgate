@@ -69,6 +69,12 @@ func buildBody(req channel.ChatRequest) []byte {
 //
 // 为什么要跟参考实现一样只看角色、不看别的东西：X-Initiator 影响上游对「这个请求谁发起」的
 // 风控判断，写错（比如一律 user）会把 agent 流量伪装成人类流量，反而更容易被识别。
+//
+// 交叉验证（2026-09，任务补充）：更近的 BYOKEY 口径**不同** —— 它判「最后一条消息是不是用户
+// 输入」（`role=user` 且不含 tool_result）才算 user，工具回灌算 agent
+// （crates/provider/src/executor/copilot/headers.rs:32-48）。两者对「多轮纯聊天」的判定相反：
+// 例 [user, assistant, user]，copilot-api 口径 = agent，BYOKEY 口径 = user。两家都没法证明对方错，
+// 而我们没有真上游样本，故**保持 copilot-api 口径**不变；真上游若出现相关 4xx 再回来改这里。
 func initiatorOf(msgs []channel.Message) string {
 	for _, m := range msgs {
 		switch m.Role {

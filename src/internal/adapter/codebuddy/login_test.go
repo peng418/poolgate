@@ -206,6 +206,35 @@ func TestPollWithoutAccountFails(t *testing.T) {
 	}
 }
 
+// login/account 拿不到 uid 时，回落到令牌自带的 sub（参考实现以 sub 为权威 uid）。
+func TestPollFallsBackToJWTSubForUID(t *testing.T) {
+	tok := fakeJWT(t, map[string]any{"sub": "uid-sub-1", "exp": float64(time.Now().Add(time.Hour).Unix())})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/plugin/auth/state":
+			_, _ = io.WriteString(w, `{"code":0,"msg":"","data":{"state":"st-1","authUrl":"https://www.codebuddy.cn/login"}}`)
+		case "/v2/plugin/auth/token":
+			_, _ = io.WriteString(w, `{"code":0,"msg":"","data":{"accessToken":"`+tok+`","refreshToken":"rt-1","expiresIn":3600}}`)
+		default:
+			// login/account 挂了：不能再让整次授权失败。
+			w.WriteHeader(500)
+		}
+	}))
+	defer srv.Close()
+
+	a := NewWithBase(srv.URL, srv.Client())
+	s, _ := a.StartLogin(context.Background(), channel.LoginOptions{})
+	defer s.Cancel()
+
+	cred, err := s.Poll(context.Background())
+	if err != nil {
+		t.Fatalf("login/account 失败时应回落到令牌 sub，实际报错: %v", err)
+	}
+	if cred.UID != "uid-sub-1" {
+		t.Fatalf("uid 应取自 JWT 的 sub，实际 %q", cred.UID)
+	}
+}
+
 // 取消后不再轮询上游。
 func TestPollAfterCancel(t *testing.T) {
 	var polls int

@@ -2,8 +2,11 @@
 //
 // 协议取自**两份互相独立的公开实现**（Python 的 yuanbao-free-api 与 Rust 的
 // yuanbao-chat2api），它们在请求体上完全一致，所以这一版可以照着实现而不是猜：
-//   - 凭证是浏览器请求头里的 `x-uskey`（外加同一请求的 cookie），用户粘一次；
-//     没有签名、没有 nonce —— 这是本渠道比豆包省事的地方；
+//   - 凭证形态两份**并不一致**：free-api 的做法是把浏览器那一次请求的**整段头原样重放**
+//     （src/services/browser/browser_manager.py:110-167 拦截请求头，含 `x-uskey` 与 Cookie）；
+//     chat2api 则只用 Cookie 里的 `hy_user`/`hy_token`（src/yuanbao.rs:248-283，**根本不带
+//     x-uskey**）。我们沿用 `x-uskey`（它是浏览器请求里真实存在的鉴权头），并补上 chat2api
+//     明确构造的 `X-Agentid`；cookie 用户粘了就一并带上。都没有签名、没有 nonce；
 //   - 对话分两步：先建会话（conversation/create）拿到 id，再 POST /api/chat/{id}；
 //   - 响应是 SSE，**帧结构明确**：`{"type":"think","content":"…"}` 是思考、
 //     `{"type":"text","msg":"…"}` 是正文（注意两者字段名不一样）、`{"stopReason":"…"}` 是结束；
@@ -36,6 +39,9 @@ const (
 // webModels 是面板下发的档位（公开模型名 → 上游 chatModelId）。
 //
 // 上游是用 `chatModelId` 指定模型的；这是两款实现的共同结论。
+// 档位清单以**较新的 free-api** 为准（src/const.py:3-12，共 8 档，含各模型的联网变体）；
+// chat2api 只列 deepseek-v3 / deepseek-r1 两档（src/service.rs:87-103），
+// 且把联网搜索留成 TODO 没实现（src/yuanbao.rs:163）。
 var webModels = []struct {
 	ID     string // 客户端用的名字
 	Name   string
@@ -43,10 +49,14 @@ var webModels = []struct {
 	Search bool   // 是否开联网搜索（supportFunctions）
 }{
 	{ID: "deepseek-v3", Name: "元宝 · DeepSeek V3", Upward: "deep_seek_v3"},
-	{ID: "deepseek-r1", Name: "元宝 · DeepSeek R1（推理）", Upward: "deep_seek", Search: false},
+	{ID: "deepseek-r1", Name: "元宝 · DeepSeek R1（推理）", Upward: "deep_seek"},
 	{ID: "hunyuan", Name: "元宝 · 混元", Upward: "hunyuan_gpt_175B_0404"},
 	{ID: "hunyuan-t1", Name: "元宝 · 混元 T1（推理）", Upward: "hunyuan_t1"},
+	// 以下三档是 free-api 有、我们 0.5.0 漏掉的联网变体（src/const.py:6-11）。
 	{ID: "deepseek-v3-search", Name: "元宝 · DeepSeek V3（联网）", Upward: "deep_seek_v3", Search: true},
+	{ID: "deepseek-r1-search", Name: "元宝 · DeepSeek R1（联网·推理）", Upward: "deep_seek", Search: true},
+	{ID: "hunyuan-search", Name: "元宝 · 混元（联网）", Upward: "hunyuan_gpt_175B_0404", Search: true},
+	{ID: "hunyuan-t1-search", Name: "元宝 · 混元 T1（联网·推理）", Upward: "hunyuan_t1", Search: true},
 }
 
 // modelSpec 是一个档位解析后的形态。

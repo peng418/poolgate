@@ -16,7 +16,11 @@ for(const [name,w,h] of [["桌面",1400,900],["手机",390,844]]){
   else {await ins.first().fill("pg-test-1234");await p.getByRole("button",{name:"登录"}).click();}
   await p.waitForTimeout(2500);
   for(const [k,label] of [["overview","总览"],["providers","接入源"],["accounts","账号"],["models","模型与费率"],["benchmark","测速与体检"],["logs","日志"],["settings","设置"]]){
-    await p.locator(".nav a",{hasText:label}).first().click({timeout:5000});
+    const nav=p.locator(".nav a",{hasText:label}).first();
+    // 入口不在就跳过：审计跟着面板入口走（例如「接入源」现在被 SHOW_PROVIDERS 隐藏）。
+    // 恢复入口后这一屏会自动重新被覆盖，不用改脚本。
+    if(await nav.count()===0){console.log(`  跳过「${label}」：导航里没有这个入口`);continue;}
+    await nav.click({timeout:5000});
     await p.waitForTimeout(800);
     const m=await p.evaluate(()=>{
       const de=document.documentElement;

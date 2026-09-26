@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"poolgate/internal/channel"
+	"poolgate/internal/errs"
 )
 
 // contextConfig 形状：{"<label>": {"is_default":bool,"token_count":int}}
@@ -49,32 +50,35 @@ func (a *Adapter) fetchModels(ctx context.Context, c *channel.Credential) ([]Mod
 	rawURL := a.gateway + EpModels
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, err
+		return nil, errs.New(errs.Transport, "构造模型目录请求失败").WithAccount(c.UID).WithCause(err)
 	}
 	ut := a.userTypeOf(c)
 	sess, err := newCosySession(a.fingerprint(c), c.Nickname, c.UID, c.AccessToken, c.RefreshToken, ut)
 	if err != nil {
-		return nil, fmt.Errorf("cosy session: %w", err)
+		return nil, errs.New(errs.Transport, "构建 COSY 会话失败").WithAccount(c.UID).WithCause(err)
 	}
 	if err := sess.ApplyHeaders(req, "", rawURL, c.UID, "application/json", false, ""); err != nil {
-		return nil, fmt.Errorf("cosy headers: %w", err)
+		return nil, errs.New(errs.Transport, "设置 COSY 头失败").WithAccount(c.UID).WithCause(err)
 	}
 	resp, err := a.http.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, errs.New(errs.Transport, "模型目录请求失败").WithAccount(c.UID).WithCause(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		return nil, fmt.Errorf("models api status %d: %s", resp.StatusCode, truncate(string(raw), 300))
+		// 归一成 errs.Error 并带上游原话：普通 error 到网关会丢分类，上游原话也定位不到。
+		return nil, errs.New(Classify(resp.StatusCode, string(raw)), "模型目录请求失败").
+			WithChannel(string(channel.QoderCN)).WithAccount(c.UID).WithUpstream(truncate(string(raw), 300))
 	}
 	var apiResp map[string]json.RawMessage
 	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
-		return nil, fmt.Errorf("models parse: %w", err)
+		return nil, errs.New(errs.Parse, "模型目录响应无法解析").WithAccount(c.UID).WithCause(err)
 	}
 	enabled, err := parseDynamicModels(apiResp)
 	if err != nil {
-		return nil, err
+		return nil, errs.New(errs.Parse, "模型目录里没有可用模型").
+			WithChannel(string(channel.QoderCN)).WithUpstream(err.Error())
 	}
 	a.setCache(enabled) // 上次成功即缓存（无静态兜底）
 	return enabled, nil

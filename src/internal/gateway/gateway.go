@@ -9,6 +9,7 @@ package gateway
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -23,6 +24,17 @@ import (
 	"poolgate/internal/toolshim"
 )
 
+// sseHeartbeat 是等待上游下一个 chunk 期间发 SSE 保活注释帧的间隔（见 streamChunks）。
+const sseHeartbeat = 15 * time.Second
+
+// heartbeatInterval 返回实际使用的保活间隔（测试里可以把它调小）。
+func (s *Server) heartbeatInterval() time.Duration {
+	if s.heartbeat > 0 {
+		return s.heartbeat
+	}
+	return sseHeartbeat
+}
+
 // Server 是网关服务。
 type Server struct {
 	pool     *pool.Pool
@@ -32,6 +44,9 @@ type Server struct {
 	basePath string
 	excluded Excluder
 	health   func() health.Snapshot
+	// heartbeat 覆盖 SSE 保活间隔（0 = 用默认的 sseHeartbeat）。
+	// 存在的原因是它必须可测：15 秒的间隔没法写进单测。
+	heartbeat time.Duration
 }
 
 // KeyVerifier 校验 API Key。store.APIKeyStore 实现之；测试可注入。
@@ -309,6 +324,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		creq = toolshim.BuildRequest(creq)
 	}
 
+	// 网关侧最后一道防线（见 pairing.go）：剔除无法配对的 tool_call / tool 结果，
+	// 并把插在配对组中间的消息挪到整组之后。放在这里 = 发往上游前的最后一步
+	// （shim 改写也已完成），与 wild-work 在 wire 改写末尾做这一步的定位一致。
+	// 缺一侧的配对会被上游 400 顶死整条会话，因此宁可丢一轮工具上下文也要先清掉。
+	creq.Messages = sanitizeToolPairing(creq.Messages)
+
 	// 路由：选号 + 换号重试 + 分档冷却。
 	session := r.Header.Get("X-Poolgate-Session")
 	start := time.Now()
@@ -391,8 +412,59 @@ func (s *Server) streamChunks(w http.ResponseWriter, kind channel.Kind, cred cha
 	start := time.Now()
 	var ttft time.Duration
 	wroteFirst := false
+	// sawContent：整条流里有没有出现过真正的内容（正文/工具调用/思考）。
+	// 上游把内容帧换成我们不认识的形态时，流里照样有帧、照样正常结束 —— 只有这个标记能发现。
+	sawContent := false
+
+	// 上游 Next() 是阻塞的：放到独立 goroutine 里读，主循环用 select 兼顾
+	// 「等下一个 chunk」与「发保活心跳」两件事。
+	//
+	// 为什么需要心跳：思考型档位（豆包深度思考、TraeWork 长推理等）在出字前可能几十秒
+	// 没有任何输出，这条连接在这段时间里是**完全静默**的 —— 夹在中间的 nginx / 飞牛网关 /
+	// CDN 会按空闲超时把它掐掉，客户端表现成「莫名其妙断开」。参考实现（doubao2api 新版）
+	// 为此每 5 秒发一次 SSE 注释帧；我们取 15 秒（够躲开常见的 30/60 秒空闲超时，也不刷屏）。
+	// 注释帧以 `:` 开头，按 SSE 规范客户端必须忽略，不会污染正文。
+	type chunkOrErr struct {
+		chunk channel.ChatCompletionChunk
+		err   error
+	}
+	chunks := make(chan chunkOrErr)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		defer close(chunks)
+		for {
+			c, err := stream.Next()
+			select {
+			case chunks <- chunkOrErr{chunk: c, err: err}:
+			case <-done:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	ticker := time.NewTicker(s.heartbeatInterval())
+	defer ticker.Stop()
+
 	for {
-		chunk, err := stream.Next()
+		var chunk channel.ChatCompletionChunk
+		var err error
+		select {
+		case r, ok := <-chunks:
+			if !ok {
+				err = errEOF
+			} else {
+				chunk, err = r.chunk, r.err
+			}
+		case <-ticker.C:
+			if _, werr := w.Write([]byte(": keep-alive\n\n")); werr != nil {
+				return ttft, wroteFirst
+			}
+			flush()
+			continue
+		}
 		if err != nil {
 			if err == errEOF {
 				break
@@ -407,10 +479,13 @@ func (s *Server) streamChunks(w http.ResponseWriter, kind channel.Kind, cred cha
 		if _, err := w.Write([]byte("data: " + string(raw) + "\n\n")); err != nil {
 			return ttft, wroteFirst
 		}
-		if !wroteFirst {
+		if hasContent(chunk) {
 			// 首个「带内容」的 chunk 才算首字：上游常先发一个空 role 帧。
-			if hasContent(chunk) {
+			// 之前写成「只有第一个 chunk 带内容才记 TTFT」，于是先发 role 帧的渠道
+			// TTFT 永远记成 0（面板那列一直显示 0 就是这个原因）—— 已于 2026-09-26 修正。
+			if !sawContent {
 				ttft = time.Since(start)
+				sawContent = true
 			}
 		}
 		wroteFirst = true
@@ -424,6 +499,16 @@ func (s *Server) streamChunks(w http.ResponseWriter, kind channel.Kind, cred cha
 		writeSSEErr(w, err, flush)
 		writeSSEDone(w, flush)
 		return 0, false
+	}
+	if !sawContent {
+		// 「有帧、没内容」：上游改了帧形态而适配器没认出来（chatgpt 网页渠道 2026-09-26
+		// 就是这样整轮空的）。必须写错误帧，不能让客户端对着一个空回复猜。
+		err := errs.New(errs.Parse, "上游只发了空帧：没有正文、工具调用或思考").
+			WithChannel(string(kind)).WithAccount(cred.UID)
+		s.noteFailure(kind, cred.UID, err)
+		writeSSEErr(w, err, flush)
+		writeSSEDone(w, flush)
+		return ttft, false
 	}
 	s.pool.NoteSuccess(kind, cred.UID)
 	writeSSEDone(w, flush)
@@ -534,6 +619,19 @@ func (s *Server) aggregateChunks(w http.ResponseWriter, kind channel.Kind, cred 
 		writeErrFromErr(w, err)
 		return 0, false
 	}
+	// 「分片收到了、但一个字都没有」也是失败 —— 不能当成功。
+	//
+	// 这条是 2026-09-26 补的：chatgpt 网页渠道上游换了帧形态，适配器认不出内容帧，
+	// 于是整轮「HTTP 200 + finish_reason=stop + content 空」——客户端以为模型没话说，
+	// 其实是解析器瞎了。判断口径与流式那条一致（正文/工具调用/思考三者都没有才算空）。
+	if content.Len() == 0 && len(toolCalls) == 0 {
+		err := errs.New(errs.Parse,
+			fmt.Sprintf("上游返回了空内容：收到 %d 个分片，但没有正文、工具调用或思考", got)).
+			WithChannel(string(kind)).WithAccount(cred.UID)
+		s.noteFailure(kind, cred.UID, err)
+		writeErrFromErr(w, err)
+		return 0, false
+	}
 	if id == "" {
 		id = "chatcmpl-" + time.Now().Format("20060102150405.000000000")
 	}
@@ -542,6 +640,11 @@ func (s *Server) aggregateChunks(w http.ResponseWriter, kind channel.Kind, cred 
 	}
 	s.pool.NoteSuccess(kind, cred.UID)
 	message := map[string]any{"role": role, "content": content.String()}
+	// 流被截断（finish_reason==length）时，tool_call 的 arguments 可能只剩半截 JSON：
+	// 不把脏参数交给客户端（见 truncation.go）。完整参数与无参工具照常保留。
+	if truncatedFinish(finish) {
+		toolCalls = dropTruncatedToolCalls(toolCalls)
+	}
 	if len(toolCalls) > 0 {
 		message["tool_calls"] = toolCalls
 		// 有工具调用时 finish_reason 必须是 tool_calls（客户端据此判断「先执行工具再继续」）。

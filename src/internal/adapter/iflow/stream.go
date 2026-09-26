@@ -31,11 +31,23 @@ type stream struct {
 	ch    chan chunkOrErr
 }
 
-func newStream(rc io.ReadCloser, contentType, model string) *stream {
+func newStream(rc io.ReadCloser, contentType, model string, wantStream bool) *stream {
+	ct := strings.ToLower(contentType)
+	// SSE 判定：
+	//   - text/event-stream 当然是流；
+	//   - **application/octet-stream 也要按流解**：参考实现的流式分支把这两种
+	//     content-type 都当流（proxy.py:687 只在「既不是 event-stream 也不是
+	//     octet-stream」时才走非流式错误路径），说明上游有时会用 octet-stream 回 SSE。
+	//     octet-stream 只在**请求本来就要流式**时才这么判 —— 非流式请求若真回了
+	//     octet-stream，按 JSON 解会明确报错，比按空流解出「什么都没收到」更安全。
+	//     （第二份独立实现 AIClient2API 完全不看 content-type，只按行解 data:；
+	//     故这一条是单源，但保留它不会与「按行解 SSE」冲突。）
+	sse := strings.Contains(ct, "text/event-stream") ||
+		(wantStream && strings.Contains(ct, "application/octet-stream"))
 	s := &stream{
 		rc:    rc,
 		model: model,
-		sse:   strings.Contains(strings.ToLower(contentType), "text/event-stream"),
+		sse:   sse,
 		ch:    make(chan chunkOrErr, 16),
 	}
 	go s.pump()
@@ -86,9 +98,8 @@ func (s *stream) pumpSingleJSON() {
 		s.ch <- chunkOrErr{err: parseFailure(raw)}
 		return
 	}
-	if e, ok := obj["error"]; ok {
+	if msg, isErr := upstreamError(obj); isErr {
 		// 上游把错误放进了 200 的信封里 —— 不能当成功（红线二）。
-		msg := errorMessage(e)
 		if msg == "" {
 			msg = truncate(string(raw), 200)
 		}
@@ -112,8 +123,7 @@ func (s *stream) handlePayload(payload []byte) bool {
 	if json.Unmarshal(payload, &raw) != nil {
 		return true // 解不出的帧跳过，不误杀
 	}
-	if e, ok := raw["error"]; ok {
-		msg := errorMessage(e)
+	if msg, isErr := upstreamError(raw); isErr {
 		if msg == "" {
 			msg = truncate(string(payload), 200)
 		}
@@ -141,6 +151,41 @@ func errorMessage(v any) string {
 		return strings.TrimSpace(e)
 	}
 	return ""
+}
+
+// upstreamError 从一个上游响应/SSE 帧对象里取错误文案，返回 (文案, 是否错误)。
+//
+// iFlow 的错误信封是**顶层 `msg` 字段**（参考实现一律读 `error_data.get("msg")`：
+// proxy.py:694、app.py:1184/1220/1547），而不是 OpenAI 的 `{"error":{"message":…}}`。
+// 只认 `error` 键会把「顶层 msg 的业务错误」当成正常回包（红线二），所以两种都认。
+//
+// 顶层 msg 只在**没有 choices** 时才判定为错误：正常 chunk/回包一定带 choices，
+// 只有错误信封才是「有 msg、没 choices」。这样不会因为某个正常回包恰好带 msg 而误判。
+//
+// 交叉印证：第二份独立实现 AIClient2API（iflow-core.js）**不**解析信封，只靠 axios 对
+// 非 2xx 抛错，也不区分 200+业务错误 —— 故「顶层 msg」这一条仍是单源（iflow2api）。
+// 保留它不矛盾：多认一种错误形态只会更安全（能识别出「有错误」而不是当成功）。
+func upstreamError(raw map[string]any) (string, bool) {
+	if v, ok := raw["error"]; ok && v != nil {
+		// 有 error 键就是错误；文案取不到时返回空串，由调用方回退成原始报文摘要。
+		return errorMessage(v), true
+	}
+	if _, hasChoices := raw["choices"]; !hasChoices {
+		if m, ok := raw["msg"].(string); ok && strings.TrimSpace(m) != "" {
+			return strings.TrimSpace(m), true
+		}
+	}
+	return "", false
+}
+
+// errorTextFromBytes 是 upstreamError 的字节版：给看不到 HTTP 语义的场景（非 2xx 回包）取人话。
+func errorTextFromBytes(raw []byte) string {
+	var obj map[string]any
+	if json.Unmarshal(raw, &obj) != nil {
+		return ""
+	}
+	msg, _ := upstreamError(obj)
+	return msg
 }
 
 // parseFailure 把「解析不了」变成客户端可见的失败，并带上上游原话摘要（红线一）。

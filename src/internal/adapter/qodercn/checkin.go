@@ -82,7 +82,8 @@ func (a *Adapter) doCheckin(ctx context.Context, method, path string, c *channel
 	}
 	req, err := http.NewRequestWithContext(ctx, method, a.base+path, body)
 	if err != nil {
-		return 0, nil, err
+		// 归一成 errs.Error：普通 error 到网关只会按兜底 Parse 处理（红线一）。
+		return 0, nil, errs.New(errs.Transport, "构造签到请求失败").WithCause(err).WithAccount(c.UID)
 	}
 	// ★ cosy-clienttype 必须为 10（桌面端）；推理链路用的是 5。
 	req.Header.Set("authorization", "Bearer "+c.AccessToken)

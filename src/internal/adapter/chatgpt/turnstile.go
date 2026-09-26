@@ -44,8 +44,14 @@ var jsUndefined = vmUndef{}
 type vmFunc func(args ...any) any
 
 // turnstileVM 是一次挑战解释的执行体。
+//
+// regs 的键是**JS 对象属性名**（字符串），不是整数 —— 上游把 opcode 重绑到随机的
+// **小数槽位**上做混淆（84.18 / 9.23 这类），而 9.23 与 9 在 JS 里是两个不同的键。
+// 早期版本用 map[int]any 存（照 ChatGPT2API-GO 的 intAny 截断写法），
+// 于是 9.23 被截成 9 —— 正好砸在程序队列寄存器的头上，队列被换成别的值、程序当场停摆，
+// 表现成「解释器跑不出结果」。实测证据：程序里确实出现 `[84.18, 9.23, 7]`。
 type turnstileVM struct {
-	regs        map[int]any
+	regs        map[string]any
 	resolved    string
 	hasResolved bool
 	rejected    string
@@ -53,37 +59,43 @@ type turnstileVM struct {
 	scriptSrcs  []string
 }
 
-// solveTurnstileToken 解一次 turnstile 挑战，返回 token 与「是否解出」。
+// solveTurnstileToken 解一次 turnstile 挑战，返回 token 或**说明原因**的失败。
 //
-// xorKey 是 requirements token（`p`）：**带凭证的请求传空串**（参考实现如此 ——
-// 那时 p 由服务端重新下发，本地这份不作密钥），未带凭证时传本次请求用的 p。
+// xorKey 是 requirements token（`p`）：dx 就是「与本次请求发出去的 p 逐码点异或后 base64」
+// 的一段 opcode 程序，所以解码必须用**同一把 p**。这里曾经传空串（注释还写着「参考实现如此」，
+// 但 gpt4free 的 process_turnstile_new 与 ChatGPT2API-GO 的 solveTurnstileToken 传的都是 p）——
+// 解出来是一段乱码、程序永远跑不出结果，表现成「本地解释器覆盖不到上游的指令集」，
+// 真实原因却是密钥用错。2026-09-26 用现网挑战核对：空串解出 22216 字节乱码，
+// 换成 p 立刻得到合法程序（88 条指令），VM 随后正常跑出结果。
 //
-// 解不出来返回 (", false)，由调用方**明确报错**而不是把空 token 发上去：
-// 空 token 换回来的是一个语焉不详的 403，看起来像「网络/账号问题」，
-// 而真正的原因是「本地解释器没跑出这条程序」——这两种情况给用户的下一步动作完全不同。
-func solveTurnstileToken(dx, xorKey string, scriptSrcs []string, userAgent string) (string, bool) {
+// 失败分三种，错误文本直接说是哪一种（红线一：不许把「我们没搞懂」讲成「上游不支持」）：
+// 解不开（编码/密钥变了）、程序显式拒绝、程序跑完没产出结果。
+func solveTurnstileToken(dx, xorKey string, scriptSrcs []string, userAgent string) (string, error) {
 	dx = strings.TrimSpace(dx)
 	if dx == "" {
-		return "", false
+		return "", fmt.Errorf("上游下发了空的 dx")
 	}
 	raw, err := b64decodeLoose(dx)
 	if err != nil {
-		return "", false
+		return "", fmt.Errorf("dx 不是合法 base64")
 	}
 	plain := xorCipher(string(raw), xorKey)
 	var program []any
 	if err := json.Unmarshal([]byte(plain), &program); err != nil {
-		return "", false
+		return "", fmt.Errorf("dx 解出来不是合法程序（异或密钥或编码方式变了）")
 	}
 	if len(program) == 0 {
-		return "", false
+		return "", fmt.Errorf("dx 解出来是空程序")
 	}
 	vm := newTurnstileVM(program, xorKey, scriptSrcs, userAgent)
 	vm.run()
 	if !vm.hasResolved {
-		return "", false
+		if vm.rejected != "" {
+			return "", fmt.Errorf("程序显式失败：%s", truncate(vm.rejected, 120))
+		}
+		return "", fmt.Errorf("程序跑完没有产出结果（%d 条指令，可能是上游换了 VM 指令集）", len(program))
 	}
-	return base64.StdEncoding.EncodeToString([]byte(vm.resolved)), true
+	return base64.StdEncoding.EncodeToString([]byte(vm.resolved)), nil
 }
 
 // newTurnstileVM 建表。userAgent 为空时用渠道默认 UA（navigator.userAgent 探针要用）。
@@ -95,45 +107,44 @@ func newTurnstileVM(program []any, xorKey string, scriptSrcs []string, userAgent
 		scriptSrcs = []string{defaultPowScript}
 	}
 	v := &turnstileVM{
-		regs:       map[int]any{},
+		regs:       map[string]any{},
 		start:      time.Now(),
 		scriptSrcs: scriptSrcs,
 	}
-	r := v.regs
-	r[0] = vmFunc(v.op0Reenter)
-	r[1] = vmFunc(v.op1Xor)
-	r[2] = vmFunc(v.op2Set)
-	r[3] = vmFunc(v.op3Resolve)
-	r[4] = vmFunc(v.op4Reject)
-	r[5] = vmFunc(v.op5Append)
-	r[6] = vmFunc(v.op6Index)
-	r[7] = vmFunc(v.op7Call)
-	r[8] = vmFunc(v.op8Copy)
-	r[9] = program
-	r[10] = v.makeWindow(userAgent)
-	r[11] = vmFunc(v.op11FindScript)
-	r[12] = vmFunc(v.op12ExposeMap)
-	r[13] = vmFunc(v.op13CallCatch)
-	r[14] = vmFunc(v.op14JSONParse)
-	r[15] = vmFunc(v.op15JSONStringify)
-	r[16] = xorKey
-	r[17] = vmFunc(v.op17AsyncCall)
-	r[18] = vmFunc(v.op18B64Decode)
-	r[19] = vmFunc(v.op19B64Encode)
-	r[20] = vmFunc(v.op20CondCall)
-	r[21] = vmFunc(v.op21CondDelta)
-	r[22] = vmFunc(v.op22Subprogram)
-	r[23] = vmFunc(v.op23CallIfDefined)
-	r[24] = vmFunc(v.op24Bind)
-	r[25] = vmFunc(noop)
-	r[26] = vmFunc(noop)
-	r[27] = vmFunc(v.op27Remove)
-	r[28] = vmFunc(noop)
-	r[29] = vmFunc(v.op29LessThan)
-	r[30] = vmFunc(v.op30Closure)
-	r[33] = vmFunc(v.op33Multiply)
-	r[34] = vmFunc(v.op34Await)
-	r[35] = vmFunc(v.op35Divide)
+	v.set(0, vmFunc(v.op0Reenter))
+	v.set(1, vmFunc(v.op1Xor))
+	v.set(2, vmFunc(v.op2Set))
+	v.set(3, vmFunc(v.op3Resolve))
+	v.set(4, vmFunc(v.op4Reject))
+	v.set(5, vmFunc(v.op5Append))
+	v.set(6, vmFunc(v.op6Index))
+	v.set(7, vmFunc(v.op7Call))
+	v.set(8, vmFunc(v.op8Copy))
+	v.set(9, program)
+	v.set(10, v.makeWindow(userAgent))
+	v.set(11, vmFunc(v.op11FindScript))
+	v.set(12, vmFunc(v.op12ExposeMap))
+	v.set(13, vmFunc(v.op13CallCatch))
+	v.set(14, vmFunc(v.op14JSONParse))
+	v.set(15, vmFunc(v.op15JSONStringify))
+	v.set(16, xorKey)
+	v.set(17, vmFunc(v.op17AsyncCall))
+	v.set(18, vmFunc(v.op18B64Decode))
+	v.set(19, vmFunc(v.op19B64Encode))
+	v.set(20, vmFunc(v.op20CondCall))
+	v.set(21, vmFunc(v.op21CondDelta))
+	v.set(22, vmFunc(v.op22Subprogram))
+	v.set(23, vmFunc(v.op23CallIfDefined))
+	v.set(24, vmFunc(v.op24Bind))
+	v.set(25, vmFunc(noop))
+	v.set(26, vmFunc(noop))
+	v.set(27, vmFunc(v.op27Remove))
+	v.set(28, vmFunc(noop))
+	v.set(29, vmFunc(v.op29LessThan))
+	v.set(30, vmFunc(v.op30Closure))
+	v.set(33, vmFunc(v.op33Multiply))
+	v.set(34, vmFunc(v.op34Await))
+	v.set(35, vmFunc(v.op35Divide))
 	return v
 }
 
@@ -228,30 +239,30 @@ func (v *turnstileVM) run() {
 		if v.hasResolved || v.rejected != "" {
 			return
 		}
-		q, ok := v.regs[9].([]any)
+		q, ok := v.get(9).([]any)
 		if !ok || len(q) == 0 {
 			return
 		}
 		op, ok := q[0].([]any)
-		v.regs[9] = q[1:]
+		v.set(9, q[1:])
 		if !ok || len(op) == 0 {
 			continue
 		}
-		code := toInt(op[0])
-		fn, ok := v.regs[code].(vmFunc)
+		key := slotKey(op[0])
+		fn, ok := v.regs[key].(vmFunc)
 		if !ok {
 			continue // 认不出的 opcode：跳过（参考实现行为，不抛错）
 		}
-		v.callOp(code, fn, op[1:])
+		v.callOp(key, fn, op[1:])
 	}
 }
 
 // callOp 执行一条指令。JS 里指令抛错会 reject 整个 VM，这里用 recover 对应。
-func (v *turnstileVM) callOp(code int, fn vmFunc, args []any) {
+func (v *turnstileVM) callOp(slot string, fn vmFunc, args []any) {
 	defer func() {
 		if r := recover(); r != nil {
 			if v.rejected == "" {
-				v.rejected = fmt.Sprintf("op %d failed: %v", code, r)
+				v.rejected = fmt.Sprintf("op %s failed: %v", slot, r)
 			}
 		}
 	}()
@@ -262,14 +273,18 @@ func (v *turnstileVM) callOp(code int, fn vmFunc, args []any) {
 // 取值 / 调用 / JS 强转工具
 // ---------------------------------------------------------------------------
 
-func (v *turnstileVM) get(k int) any {
-	if val, ok := v.regs[k]; ok {
+// slotKey 是程序里的槽位号 → JS 属性名。数字按 JS 的 String() 归一（9.23 → "9.23"，9 → "9"，
+// 两者是不同的槽位；截断成 int 会把混淆用的随机小数槽位砸到整数槽位上）。
+func slotKey(k any) string { return toStr(k) }
+
+func (v *turnstileVM) get(k any) any {
+	if val, ok := v.regs[slotKey(k)]; ok {
 		return val
 	}
 	return jsUndefined
 }
 
-func (v *turnstileVM) set(k int, val any) { v.regs[k] = val }
+func (v *turnstileVM) set(k any, val any) { v.regs[slotKey(k)] = val }
 
 func (v *turnstileVM) call(fn any, args []any) any {
 	if f, ok := fn.(vmFunc); ok {
@@ -317,7 +332,7 @@ func toStr(v any) string {
 		return strconv.FormatFloat(x, 'f', -1, 64)
 	case int:
 		return strconv.Itoa(x)
-	case []any, map[string]any, map[int]any:
+	case []any, map[string]any:
 		if b, err := marshalCompact(x); err == nil {
 			return b
 		}
@@ -418,9 +433,6 @@ func jsGet(obj any, key any) (any, bool) {
 		}
 		val, exists := o[s]
 		return val, exists
-	case map[int]any:
-		val, ok := o[toInt(key)]
-		return val, ok
 	case []any:
 		i := toInt(key)
 		if i < 0 || i >= len(o) {
@@ -468,7 +480,7 @@ func (v *turnstileVM) op1Xor(args ...any) any {
 	if len(args) < 2 {
 		return nil
 	}
-	n, e := toInt(args[0]), toInt(args[1])
+	n, e := args[0], args[1]
 	v.set(n, xorCipher(toStr(v.get(n)), toStr(v.get(e))))
 	return nil
 }
@@ -478,7 +490,7 @@ func (v *turnstileVM) op2Set(args ...any) any {
 	if len(args) < 2 {
 		return nil
 	}
-	v.set(toInt(args[0]), args[1])
+	v.set(args[0], args[1])
 	return nil
 }
 
@@ -514,7 +526,7 @@ func (v *turnstileVM) op5Append(args ...any) any {
 	if len(args) < 2 {
 		return nil
 	}
-	n, e := toInt(args[0]), toInt(args[1])
+	n, e := args[0], args[1]
 	cur := v.get(n)
 	if list, ok := cur.([]any); ok {
 		// Go 的 append 可能换底层数组，所以要把新切片写回寄存器；
@@ -532,7 +544,7 @@ func (v *turnstileVM) op6Index(args ...any) any {
 	if len(args) < 3 {
 		return nil
 	}
-	n, e, r := toInt(args[0]), toInt(args[1]), toInt(args[2])
+	n, e, r := args[0], args[1], args[2]
 	if val, ok := jsGet(v.get(e), v.get(r)); ok {
 		v.set(n, val)
 		return nil
@@ -546,10 +558,10 @@ func (v *turnstileVM) op7Call(args ...any) any {
 	if len(args) < 1 {
 		return nil
 	}
-	fn := v.get(toInt(args[0]))
+	fn := v.get(args[0])
 	callArgs := make([]any, 0, len(args)-1)
 	for _, a := range args[1:] {
-		callArgs = append(callArgs, v.get(toInt(a)))
+		callArgs = append(callArgs, v.get(a))
 	}
 	return v.call(fn, callArgs)
 }
@@ -559,7 +571,7 @@ func (v *turnstileVM) op8Copy(args ...any) any {
 	if len(args) < 2 {
 		return nil
 	}
-	v.set(toInt(args[0]), v.get(toInt(args[1])))
+	v.set(args[0], v.get(args[1]))
 	return nil
 }
 
@@ -568,7 +580,7 @@ func (v *turnstileVM) op11FindScript(args ...any) any {
 	if len(args) < 2 {
 		return nil
 	}
-	n, e := toInt(args[0]), toInt(args[1])
+	n, e := args[0], args[1]
 	pattern, ok := v.get(e).(string)
 	if !ok {
 		v.set(n, nil)
@@ -594,7 +606,7 @@ func (v *turnstileVM) op12ExposeMap(args ...any) any {
 	if len(args) < 1 {
 		return nil
 	}
-	v.set(toInt(args[0]), v.regs)
+	v.set(args[0], v.regs)
 	return nil
 }
 
@@ -603,7 +615,7 @@ func (v *turnstileVM) op13CallCatch(args ...any) any {
 	if len(args) < 2 {
 		return nil
 	}
-	n, e := toInt(args[0]), toInt(args[1])
+	n, e := args[0], args[1]
 	v.set(n, v.callCatching(v.get(e), args[2:]))
 	return nil
 }
@@ -613,7 +625,7 @@ func (v *turnstileVM) op14JSONParse(args ...any) any {
 	if len(args) < 2 {
 		return nil
 	}
-	n, e := toInt(args[0]), toInt(args[1])
+	n, e := args[0], args[1]
 	var parsed any
 	if err := json.Unmarshal([]byte(toStr(v.get(e))), &parsed); err != nil {
 		v.set(n, jsUndefined)
@@ -628,7 +640,7 @@ func (v *turnstileVM) op15JSONStringify(args ...any) any {
 	if len(args) < 2 {
 		return nil
 	}
-	n, e := toInt(args[0]), toInt(args[1])
+	n, e := args[0], args[1]
 	if s, err := marshalCompact(jsonSafe(v.get(e))); err == nil {
 		v.set(n, s)
 	}
@@ -640,10 +652,10 @@ func (v *turnstileVM) op17AsyncCall(args ...any) any {
 	if len(args) < 2 {
 		return nil
 	}
-	n, e := toInt(args[0]), toInt(args[1])
+	n, e := args[0], args[1]
 	callArgs := make([]any, 0, len(args)-2)
 	for _, a := range args[2:] {
-		callArgs = append(callArgs, v.get(toInt(a)))
+		callArgs = append(callArgs, v.get(a))
 	}
 	v.set(n, v.callCatching(v.get(e), callArgs))
 	return nil
@@ -654,7 +666,7 @@ func (v *turnstileVM) op18B64Decode(args ...any) any {
 	if len(args) < 1 {
 		return nil
 	}
-	n := toInt(args[0])
+	n := args[0]
 	raw, err := b64decodeLoose(toStr(v.get(n)))
 	if err != nil {
 		v.set(n, "")
@@ -669,7 +681,7 @@ func (v *turnstileVM) op19B64Encode(args ...any) any {
 	if len(args) < 1 {
 		return nil
 	}
-	n := toInt(args[0])
+	n := args[0]
 	v.set(n, base64.StdEncoding.EncodeToString([]byte(toStr(v.get(n)))))
 	return nil
 }
@@ -679,7 +691,7 @@ func (v *turnstileVM) op20CondCall(args ...any) any {
 	if len(args) < 3 {
 		return nil
 	}
-	n, e, r := toInt(args[0]), toInt(args[1]), toInt(args[2])
+	n, e, r := args[0], args[1], args[2]
 	if strictEq(v.get(n), v.get(e)) {
 		return v.call(v.get(r), args[3:])
 	}
@@ -691,7 +703,7 @@ func (v *turnstileVM) op21CondDelta(args ...any) any {
 	if len(args) < 4 {
 		return nil
 	}
-	n, e, r, o := toInt(args[0]), toInt(args[1]), toInt(args[2]), toInt(args[3])
+	n, e, r, o := args[0], args[1], args[2], args[3]
 	if math.Abs(toNum(v.get(n))-toNum(v.get(e))) > toNum(v.get(r)) {
 		return v.call(v.get(o), args[4:])
 	}
@@ -703,8 +715,8 @@ func (v *turnstileVM) op22Subprogram(args ...any) any {
 	if len(args) < 2 {
 		return nil
 	}
-	n := toInt(args[0])
-	saved := v.regs[9]
+	n := args[0]
+	saved := v.get(9)
 	sub, ok := args[1].([]any)
 	if !ok {
 		v.set(n, "undefined")
@@ -713,7 +725,7 @@ func (v *turnstileVM) op22Subprogram(args ...any) any {
 	v.set(9, sub)
 	v.run()
 	v.set(n, "undefined")
-	v.regs[9] = saved
+	v.set(9, saved)
 	return nil
 }
 
@@ -722,7 +734,7 @@ func (v *turnstileVM) op23CallIfDefined(args ...any) any {
 	if len(args) < 2 {
 		return nil
 	}
-	n, e := toInt(args[0]), toInt(args[1])
+	n, e := args[0], args[1]
 	if _, isUndef := v.get(n).(vmUndef); !isUndef {
 		return v.call(v.get(e), args[2:])
 	}
@@ -734,7 +746,7 @@ func (v *turnstileVM) op24Bind(args ...any) any {
 	if len(args) < 3 {
 		return nil
 	}
-	n, e, r := toInt(args[0]), toInt(args[1]), toInt(args[2])
+	n, e, r := args[0], args[1], args[2]
 	obj, key := v.get(e), v.get(r)
 	if val, ok := jsGet(obj, key); ok {
 		v.set(n, val)
@@ -749,7 +761,7 @@ func (v *turnstileVM) op27Remove(args ...any) any {
 	if len(args) < 2 {
 		return nil
 	}
-	n, e := toInt(args[0]), toInt(args[1])
+	n, e := args[0], args[1]
 	cur, val := v.get(n), v.get(e)
 	if list, ok := cur.([]any); ok {
 		out := make([]any, 0, len(list))
@@ -773,7 +785,7 @@ func (v *turnstileVM) op29LessThan(args ...any) any {
 	if len(args) < 3 {
 		return nil
 	}
-	n, e, r := toInt(args[0]), toInt(args[1]), toInt(args[2])
+	n, e, r := args[0], args[1], args[2]
 	v.set(n, jsLt(v.get(e), v.get(r)))
 	return nil
 }
@@ -786,7 +798,7 @@ func (v *turnstileVM) op30Closure(args ...any) any {
 	if len(args) < 3 {
 		return nil
 	}
-	n, e := toInt(args[0]), toInt(args[1])
+	n, e := args[0], args[1]
 	// args[2] 是 Python 参考实现签名里的 r —— 它接收了但不使用，
 	// 这里保留同样的「跳过」语义（改签名会与上游程序的参数个数对不上）。
 	rest := args[3:]
@@ -799,20 +811,20 @@ func (v *turnstileVM) op30Closure(args ...any) any {
 		}
 	}
 	v.set(n, vmFunc(func(callArgs ...any) any {
-		saved := v.regs[9]
+		saved := v.get(9)
 		for i, slot := range bindSlots {
 			if i >= len(callArgs) {
 				break
 			}
-			v.set(toInt(slot), callArgs[i])
+			v.set(slot, callArgs[i])
 		}
 		v.set(9, body)
 		v.run()
 		result := v.get(e)
 		if prev, ok := saved.([]any); ok {
-			v.regs[9] = prev
+			v.set(9, prev)
 		} else {
-			v.regs[9] = []any{}
+			v.set(9, []any{})
 		}
 		return result
 	}))
@@ -824,7 +836,7 @@ func (v *turnstileVM) op33Multiply(args ...any) any {
 	if len(args) < 3 {
 		return nil
 	}
-	v.set(toInt(args[0]), toNum(v.get(toInt(args[1])))*toNum(v.get(toInt(args[2]))))
+	v.set(args[0], toNum(v.get(args[1]))*toNum(v.get(args[2])))
 	return nil
 }
 
@@ -832,7 +844,7 @@ func (v *turnstileVM) op34Await(args ...any) any {
 	if len(args) < 2 {
 		return nil
 	}
-	v.set(toInt(args[0]), v.get(toInt(args[1])))
+	v.set(args[0], v.get(args[1]))
 	return nil
 }
 
@@ -840,12 +852,12 @@ func (v *turnstileVM) op35Divide(args ...any) any {
 	if len(args) < 3 {
 		return nil
 	}
-	divisor := toNum(v.get(toInt(args[2])))
+	divisor := toNum(v.get(args[2]))
 	if divisor == 0 {
-		v.set(toInt(args[0]), float64(0))
+		v.set(args[0], float64(0))
 		return nil
 	}
-	v.set(toInt(args[0]), toNum(v.get(toInt(args[1])))/divisor)
+	v.set(args[0], toNum(v.get(args[1]))/divisor)
 	return nil
 }
 

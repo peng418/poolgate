@@ -35,7 +35,13 @@ const (
 	deviceGrant = "urn:ietf:params:oauth:grant-type:device_code"
 
 	// cliUA 是 CLI 端认的客户端标识：形如 QwenCode/<版本> (<os>; <arch>)。
-	// 版本号跟着上游客户端走，过旧可能被拒；这里与参考实现对齐。
+	// 版本号跟着上游客户端走，过旧可能被拒。
+	//
+	// 取值来自 BYOKEY crates/provider/src/executor/qwen.rs（DEFAULT_USER_AGENT，逐字一致）。
+	// 注意参考实现之间**不一致**，未擅自改：AIClient2API src/providers/openai/qwen-core.js:672
+	// 用 QwenCode/0.14.2（platform 动态），qwen-code-oai-proxy src/qwen/api.ts:109 用
+	// QwenCode/0.14.3。两份较新的实现都是 0.14.x，我们/BYOKEY 是 0.10.3 —— 哪个被上游接受
+	// 没有实测依据，保持现值 + 记在这里，等有真账号再定（见交接报告）。
 	cliUA = "QwenCode/0.10.3 (darwin; arm64)"
 )
 
@@ -52,22 +58,48 @@ const chatTimeout = 10 * time.Minute
 //
 // 为什么是写死的：CLI 端没有目录接口（参考实现也是硬编码），只有这几个档位。
 // 标注 SourceLocal 是诚实：这是本地声明的清单，不是上游给的。
+//
+// 档位清单来源：qwen-code-oai-proxy（走 portal.qwen.ai 的公开实现）README「Supported Models」
+// 与 src/qwen/api.ts 的 QWEN_MODELS —— 六档：coder-model / qwen3.5-plus / qwen3.6-plus /
+// qwen3-coder-plus / qwen3-coder-flash / vision-model。qwen-code 源码里 OAuth 只认
+// coder-model，其余是它的别名或 Coding Plan 里也有的同名档（见该仓库 docs/model-discovery.md）。
 var cliModels = []struct {
 	ID      string
 	Name    string
 	Context int
 	Note    string
 }{
-	{ID: "coder-model", Name: "Coder Model", Context: 256000, Note: "Qwen3.5-Plus 基座，带推理链，256K"},
+	// coder-model 是上游自己维护的别名（Qwen 团队会换基座，现指向 Qwen 3.6 Plus）：
+	// 上下文 1,000,000 / 输出上限 65536，来源 qwen-code 的 tokenLimits（见 model-discovery.md）。
+	{ID: "coder-model", Name: "Coder Model", Context: 1000000, Note: "Qwen 3.6 Plus（上游维护的别名，会跟随换基座），带推理链，1M 上下文"},
 	{ID: "qwen3-coder-plus", Name: "Qwen3 Coder Plus", Context: 256000},
 	{ID: "qwen3-coder-flash", Name: "Qwen3 Coder Flash", Context: 256000},
-	{ID: "qwen3.6-plus", Name: "Qwen3.6 Plus", Context: 256000},
-	{ID: "qwen3.5-plus", Name: "Qwen3.5 Plus（别名，上游会重定向到 coder-model）", Context: 256000},
+	{ID: "qwen3.6-plus", Name: "Qwen3.6 Plus（别名，请求时本地重定向到 coder-model）", Context: 1000000},
+	{ID: "qwen3.5-plus", Name: "Qwen3.5 Plus（别名，请求时本地重定向到 coder-model）", Context: 1000000},
+	// vision-model 是多模态档；本渠道 Spec.Images=false（不转发图片），所以只按文本用。
+	{ID: "vision-model", Name: "Vision Model", Context: 256000, Note: "多模态档，本渠道未开图片（Spec.Images=false）"},
 }
 
 // modelRedirect 是上游要求的别名重定向（参考实现里写死的映射）。
+//
+// 来源：qwen-code-oai-proxy src/qwen/api.ts 的 MODEL_ALIASES —— qwen3.5-plus 与 qwen3.6-plus
+// 都重定向到 coder-model。README 亦注明「两者均解析为 coder-model」。
 var modelRedirect = map[string]string{
 	"qwen3.5-plus": "coder-model",
+	"qwen3.6-plus": "coder-model",
+}
+
+// modelMaxTokens 是上游对各档 max_tokens 的硬上限，超过会被上游拒或截断，先本地夹住。
+//
+// 来源：qwen-code-oai-proxy src/qwen/api.ts 的 MODEL_LIMITS（clampMaxTokens）。注意这里是
+// **输出** token 上限，与 cliModels 的 Context（输入上下文）是两回事。
+var modelMaxTokens = map[string]int{
+	"vision-model":  32768,
+	"qwen3-vl-plus": 32768,
+	"qwen3-vl-max":  32768,
+	"qwen3.5-plus":  65536,
+	"qwen3.6-plus":  65536,
+	"coder-model":   65536,
 }
 
 // unsupportedFields 是 CLI 端不接受的请求体字段：留着会被上游拒或行为不可预期。

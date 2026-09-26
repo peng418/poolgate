@@ -199,12 +199,18 @@ func (a *Adapter) createConversation(ctx context.Context, c *channel.Credential,
 //
 // 元宝的鉴权就是「浏览器那一次请求的头」，所以我们照浏览器形态补齐；
 // 用户粘回来的 UA 优先（他要是从手机浏览器复制的，用他的更一致）。
+//
+// Referer 与 X-Agentid 照 chat2api 构造（src/yuanbao.rs:248-283）：那边把 agent id
+// 同时放进 Referer 路径（`/chat/{agent_id}`）与 `X-Agentid` 头，两条请求（建会话、对话）
+// 都带着。我们原先 Referer 只到 `/chat/` 且漏了 `X-Agentid` —— 补上，别让上游在
+// 伪装头上看出不是浏览器发的。
 func (a *Adapter) setHeaders(req *http.Request, cr *cred, accept string) {
 	req.Header.Set("Accept", accept)
 	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", apiBase)
-	req.Header.Set("Referer", apiBase+"/chat/")
+	req.Header.Set("Referer", apiBase+"/chat/"+agentID)
+	req.Header.Set("X-Agentid", agentID)
 	req.Header.Set("x-uskey", cr.uskey)
 	if cr.cookie != "" {
 		req.Header.Set("Cookie", cr.cookie)

@@ -32,12 +32,44 @@ const placeholder = "(empty placeholder)"
 // 悄悄换档会让用户以为自己在用 A，实际在用 B。
 func resolveModel(id string) string {
 	s := strings.ToLower(strings.TrimSpace(id))
-	s = strings.TrimSuffix(s, "[1m]") // 客户端会带这种上下文窗口标记，不是模型名的一部分
-	s = strings.TrimSuffix(s, "[200k]")
+	s = trimContextSuffix(s) // 客户端会带这种上下文窗口标记，不是模型名的一部分
 	if v, ok := modelAliases[s]; ok {
 		return v
 	}
 	return s
+}
+
+// trimContextSuffix 剥掉模型名尾部的「上下文窗口标记」，如 `[1m]` / `[200k]` / `[256K]`。
+//
+// 依据：参考实现 model_resolver.py:132 用
+// re.sub(r"\[\d+[mk]\]$", 空串, name, flags=IGNORECASE) 把所有
+// 「左方括号 + 数字 + m/k + 右方括号」的结尾都剥掉，而且大小写不敏感、位数不限。
+// 我们原来只剥字面量 "[1m]" / "[200k]"：`[1M]`、`[256k]` 这类会带着方括号
+// 被当成模型 id 发给上游，撞一个没法定位的 400。
+func trimContextSuffix(s string) string {
+	if !strings.HasSuffix(s, "]") {
+		return s
+	}
+	i := strings.LastIndexByte(s, '[')
+	if i < 0 {
+		return s
+	}
+	inner := s[i+1 : len(s)-1]
+	n := len(inner)
+	if n < 2 { // 至少要「一个数字 + 一个单位」
+		return s
+	}
+	switch inner[n-1] {
+	case 'm', 'M', 'k', 'K':
+	default:
+		return s
+	}
+	for _, c := range inner[:n-1] {
+		if c < '0' || c > '9' {
+			return s
+		}
+	}
+	return s[:i]
 }
 
 // unifiedMsg 是归一后的消息（只有 user / assistant 两种角色）。
@@ -120,7 +152,14 @@ func buildPayload(req channel.ChatRequest, modelID, profileArn string) (map[stri
 			"chatTriggerType": chatTriggerManual,
 			// conversationId 每次请求新生成：我们不做参考实现那套「按消息哈希取稳定 id」
 			// 的截断恢复机制，稳定 id 只会让不同会话在上游侧看起来是同一个。
-			"conversationId": randHex(16),
+			//
+			// 但**形态**要照抄参考实现：它的 generate_conversation_id() 不带 messages 时
+			// 返回 str(uuid.uuid4())（utils.py:102-127），而 routes 里的 4 处调用全是不带
+			// messages 的（routes_openai.py:323/571、routes_anthropic.py:376/684），
+			// 所以实际发到上游的就是带连字符的 UUID。我们原来用 randHex(16)（32 个 hex、
+			// 无连字符），形态对不上 —— 这类「上游 SDK 协议里的 id 字面量」必须照抄
+			// （豆包渠道就是栽在 local_conversation_id 的形态上）。
+			"conversationId": uuid4(),
 			"currentMessage": map[string]any{"userInputMessage": userInput},
 		},
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -213,6 +214,141 @@ func TestChatFlowWithMockServer(t *testing.T) {
 	}
 	if !deleted {
 		t.Fatal("流结束后应当删掉会话（否则上游会话表会越堆越多）")
+	}
+}
+
+// 上游用「HTTP 200 + JSON 业务错误信封」表示失败时，整条流必须报结构化错误，
+// 并把上游原话带出来（红线一）——不能当成「成功但没内容」。
+func TestStreamSurfacesUpstreamEnvelope(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/chat_session/create"):
+			fmt.Fprint(w, `{"data":{"biz_data":{"chat_session":{"id":"sess-1"}}}}`)
+		case strings.HasSuffix(r.URL.Path, "/chat/create_pow_challenge"):
+			fmt.Fprint(w, `{"data":{"biz_data":{"challenge":{"algorithm":"DeepSeekHashV1","challenge":"c1",
+				"salt":"s1","signature":"sig1","difficulty":1000,"expire_at":1,"target_path":"/api/v0/chat/completion"}}}}`)
+		case strings.HasSuffix(r.URL.Path, "/chat/completion"):
+			// 实测形态：HTTP 200，body 是信封 JSON（不是 SSE）。
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"code":40003,"msg":"Authorization Failed (invalid token)","data":null}`)
+		default:
+			fmt.Fprint(w, `{"code":0}`)
+		}
+	}))
+	defer srv.Close()
+
+	a := New()
+	a.base = srv.URL
+	a.SetSolver(&stubSolver{})
+	cred := &channel.Credential{UID: "u1", AccessToken: "tok", Extra: map[string]string{"device_id": "d"}}
+
+	st, err := a.Chat(context.Background(), cred, channel.ChatRequest{Model: "default"})
+	if err != nil {
+		t.Fatalf("Chat 应当成功建流（错误在流里）：%v", err)
+	}
+	defer st.Close()
+	_, err = st.Next()
+	if err == nil {
+		t.Fatal("HTTP 200 + 业务错误码必须报错，不能静默结束")
+	}
+	if k, ok := errs.KindOf(err); !ok || k != errs.SessionDead {
+		t.Fatalf("invalid token 应归一成 SessionDead：%v", err)
+	}
+	var ee *errs.Error
+	if !errors.As(err, &ee) || !strings.Contains(ee.Upstream, "invalid token") {
+		t.Fatalf("必须带上游原话：%+v", err)
+	}
+}
+
+// 完全空的流（HTTP 200、零字节）也要报错，不能回一个空成功。
+func TestStreamEmptyIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/chat_session/create"):
+			fmt.Fprint(w, `{"data":{"biz_data":{"chat_session":{"id":"sess-1"}}}}`)
+		case strings.HasSuffix(r.URL.Path, "/chat/create_pow_challenge"):
+			fmt.Fprint(w, `{"data":{"biz_data":{"challenge":{"algorithm":"DeepSeekHashV1","challenge":"c1",
+				"salt":"s1","signature":"sig1","difficulty":1000,"expire_at":1,"target_path":"/api/v0/chat/completion"}}}}`)
+		case strings.HasSuffix(r.URL.Path, "/chat/completion"):
+			// 空 body
+		default:
+			fmt.Fprint(w, `{"code":0}`)
+		}
+	}))
+	defer srv.Close()
+
+	a := New()
+	a.base = srv.URL
+	a.SetSolver(&stubSolver{})
+	cred := &channel.Credential{UID: "u1", AccessToken: "tok", Extra: map[string]string{"device_id": "d"}}
+	st, err := a.Chat(context.Background(), cred, channel.ChatRequest{Model: "default"})
+	if err != nil {
+		t.Fatalf("Chat 失败：%v", err)
+	}
+	defer st.Close()
+	if _, err := st.Next(); err == nil {
+		t.Fatal("空流必须报错（红线二）")
+	}
+}
+
+// 模型名解析对齐参考实现：`deepseek-<type>` 与裸 `<type>` 都要认（models.rs:43-64），
+// 大小写不敏感；未知名回落 default 但 ok=false。
+func TestModelOfAcceptsReferenceIDs(t *testing.T) {
+	for _, id := range []string{"default", "DEFAULT", "deepseek-default", "deepseek-DEFAULT"} {
+		typ, _, ok := modelOf(id)
+		if !ok || typ != "default" {
+			t.Errorf("modelOf(%q) = %q ok=%v，want default/true", id, typ, ok)
+		}
+	}
+	for _, id := range []string{"expert", "deepseek-expert"} {
+		typ, _, ok := modelOf(id)
+		if !ok || typ != "expert" {
+			t.Errorf("modelOf(%q) = %q ok=%v，want expert/true", id, typ, ok)
+		}
+	}
+	if _, _, ok := modelOf("gpt-4o"); ok {
+		t.Fatal("未知模型名应回落 default 但 ok=false")
+	}
+}
+
+// 首轮 completion 请求体不得出现 parent_message_id（参考实现 skip_serializing_if 省略）。
+func TestBodyOmitsParentMessageID(t *testing.T) {
+	var sawBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/chat_session/create"):
+			fmt.Fprint(w, `{"data":{"biz_data":{"chat_session":{"id":"sess-1"}}}}`)
+		case strings.HasSuffix(r.URL.Path, "/chat/create_pow_challenge"):
+			fmt.Fprint(w, `{"data":{"biz_data":{"challenge":{"algorithm":"DeepSeekHashV1","challenge":"c1",
+				"salt":"s1","signature":"sig1","difficulty":1000,"expire_at":1,"target_path":"/api/v0/chat/completion"}}}}`)
+		case strings.HasSuffix(r.URL.Path, "/chat/completion"):
+			raw, _ := io.ReadAll(r.Body)
+			json.Unmarshal(raw, &sawBody)
+			fmt.Fprint(w, "event: message\ndata: {\"p\":\"response/status\",\"v\":\"FINISHED\"}\n\n")
+		default:
+			fmt.Fprint(w, `{"code":0}`)
+		}
+	}))
+	defer srv.Close()
+
+	a := New()
+	a.base = srv.URL
+	a.SetSolver(&stubSolver{})
+	cred := &channel.Credential{UID: "u1", AccessToken: "tok", Extra: map[string]string{"device_id": "d"}}
+	st, err := a.Chat(context.Background(), cred, channel.ChatRequest{Model: "default"})
+	if err != nil {
+		t.Fatalf("Chat 失败：%v", err)
+	}
+	for {
+		if _, err := st.Next(); err == io.EOF {
+			break
+		} else if err != nil {
+			break
+		}
+	}
+	_ = st.Close()
+	if _, exists := sawBody["parent_message_id"]; exists {
+		t.Fatalf("首轮不应下发 parent_message_id（应为省略而非 null）：%v", sawBody)
 	}
 }
 

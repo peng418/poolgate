@@ -23,8 +23,13 @@ const (
 	epToken    = "https://oauth2.googleapis.com/token"
 	epUserInfo = "https://www.googleapis.com/oauth2/v1/userinfo?alt=json"
 
-	// 对话与开通的基址，按上游可用性**依序回落**（参考实现实测：daily 沙箱最稳，
-	// 生产域作为兜底；autopush 沙箱实测不可用，故意不列）。
+	// 对话与开通的基址，按上游可用性**依序回落**。
+	//
+	// 顺序各参考实现一致：对话 daily 优先、生产兜底；开通反过来（生产优先，见 client.go）。
+	// 但 daily 的**主机名**参考实现分成两派、未决：opencode 用 daily-cloudcode-pa.sandbox.googleapis.com
+	//（本实现跟它）；g4f、AIClient2API、antigravity-claude-proxy、BYOKEY 都用不带 .sandbox 的
+	// daily-cloudcode-pa.googleapis.com。本机无法验证哪个才是活的上游，故保持跟主参考实现（opencode）。
+	// autopush 沙箱参考实现自标不可用，故意不列。
 	epDaily = "https://daily-cloudcode-pa.sandbox.googleapis.com"
 	epProd  = "https://cloudcode-pa.googleapis.com"
 
@@ -61,6 +66,11 @@ const (
 	ideType    = "ANTIGRAVITY"
 
 	// defaultTier 是 loadCodeAssist 没给出 allowedTiers 时的兜底档位。
+	//
+	// 参考实现在这个字面量上分成两派、未决：opencode project.ts:273 与
+	// antigravity-claude-proxy auth/oauth.js:499 用大写 "FREE"；g4f Antigravity.py:1566、
+	// GeminiCLI.py:547、AIClient2API antigravity-core.js:1283 用小写 "free-tier"。
+	// 真实档位通常由 allowedTiers 给出，这里保留与 Gemini 系写法一致、出现更多次的 "free-tier"。
 	defaultTier = "free-tier"
 
 	// antigravityVersion 是伪装用的客户端版本号。上游改版后这个号会过时，
@@ -106,8 +116,11 @@ var agModels = []struct {
 	{ID: "gemini-3-pro-low", Name: "Gemini 3 Pro（Low 思考）", Context: 1048576, Reasoning: capYes},
 	{ID: "claude-opus-4-6-thinking", Name: "Claude Opus 4.6（Thinking）", Context: 200000, Reasoning: capYes},
 	{ID: "claude-sonnet-4-6", Name: "Claude Sonnet 4.6", Context: 200000, Reasoning: capNo},
-	// GPT-OSS 是否吐思考块，参考实现没有明确结论 —— 标未知，不去猜。
-	{ID: "gpt-oss-120b-medium", Name: "GPT-OSS 120B（Medium）", Context: 0, Reasoning: capUnknown},
+	// GPT-OSS 不吐思考块：三份参考实现一致 —— opencode isThinkingCapableModel 对它为假；
+	// g4f model_supports_thinking（Antigravity.py:451-460）与 AIClient2API modelSupportsThinking
+	//（antigravity-core.js:317-325）的模型 metadata 里它都没有 thinking 项。
+	// 上下文长度参考实现未给 → 仍写 0（未知），不猜。
+	{ID: "gpt-oss-120b-medium", Name: "GPT-OSS 120B（Medium）", Context: 0, Reasoning: capNo},
 }
 
 // capFlag 是能力位在模型表里的三态表达（与 channel.Cap 一一对应，见 client.go 的映射）。
@@ -126,3 +139,6 @@ const (
 func isClaudeThinking(id string) bool {
 	return containsFold(id, "claude") && containsFold(id, "thinking")
 }
+
+// isClaude 判断是否 Claude 系（Claude 后端在工具配置上要 VALIDATED，见 convert.go buildRequest）。
+func isClaude(id string) bool { return containsFold(id, "claude") }

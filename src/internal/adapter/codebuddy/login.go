@@ -203,7 +203,10 @@ func (s *session) pollOAuth(ctx context.Context, state string) (*channel.Credent
 	if exp := tokenExpiry(tok.ExpiresIn, tok.ExpiresAt); !exp.IsZero() {
 		cred.ExpiresAt = exp
 	}
-	// uid/nickname/企业 要另外问一次（带 Bearer）。取不到就如实报错 —— 不编造 UID。
+	// uid/nickname/企业 要另外问一次（带 Bearer）。login/account 拿不到 uid 时**回落到令牌自带的 sub**：
+	// 参考实现就以 JWT 的 sub 为权威 uid（workbuddy2api-hub/wb_accounts.py:1004
+	// `uid = jwt_uid(token)`，login/account 只用来补昵称，失败也 try/except 放过），
+	// 本包的粘贴兜底路径同样用 jwtUID 取 sub（见 completePaste）。两边都拿不到才报错，绝不编造 UID。
 	if uid, ent, nick, aerr := s.a.fetchAccount(ctx, tok.AccessToken, state); aerr == nil {
 		cred.UID = uid
 		cred.Nickname = nick
@@ -212,7 +215,10 @@ func (s *session) pollOAuth(ctx context.Context, state string) (*channel.Credent
 		}
 	}
 	if cred.UID == "" {
-		return nil, errs.New(errs.Parse, "授权成功但拿不到账号 uid（login/account 未返回）").
+		cred.UID = jwtUID(tok.AccessToken)
+	}
+	if cred.UID == "" {
+		return nil, errs.New(errs.Parse, "授权成功但拿不到账号 uid（login/account 未返回，令牌里也解不出 sub）").
 			WithChannel(string(channel.CodeBuddy)).WithUpstream(truncate(string(data), 200))
 	}
 	s.markDone()

@@ -2,9 +2,9 @@ package windsurf
 
 // client.go 渠道实现：能力声明、对话编排、额度校验、错误归一。
 //
-// 本渠道的「工具调用」交给**网关模拟层**（Spec: Tools=false + ToolsShim=true）：
-// 上游那条路虽然有原生工具字段位，但 ToolDef 的内部子 tag 在参考实现里没标定，
-// 猜错会静默失败（请求过、模型不调工具、客户端干等）—— 所以不猜，走模拟。
+// 本渠道的「工具调用」走**原生**（Spec: Tools=true）：请求 #10 下发 ToolDef、响应 #6
+// 回收 ChatToolCall。参考实现已用付费实弹标定了 ToolDef 的内部 tag（见 protocol.go
+// toolDefFieldName 处说明），所以不再走网关模拟。
 
 import (
 	"bytes"
@@ -49,8 +49,9 @@ func (a *Adapter) Kind() channel.Kind { return channel.Windsurf }
 
 // Spec 能力声明（说实话，逐条有依据）。
 //
-//   - Tools=false + ToolsShim=true：上游这条路的原生工具子 tag 未标定，我们走网关模拟。
-//     声明成 native 就是撒谎 —— 会让 agent 客户端拿到「模型把工具调用写成文本」的结果。
+//   - Tools=true：上游原生工具调用（请求 #10 ToolDef、响应 #6 ChatToolCall）。
+//     ToolDef 的内部 tag 已被参考实现付费实弹标定（devin-connect.js:394-397），
+//     所以走原生透传，不再声明 ToolsShim。
 //   - Reasoning=true：上游把思考与正文**原生分流**（正文 #3、思考 #9），我们映射成
 //     reasoning_content。这是一个真实的独立通道，不是把正文切一半。
 //   - Images=false：上游能收图（请求 ChatMessage #10），但本网关的 ChatRequest 里
@@ -64,8 +65,8 @@ func (a *Adapter) Spec() channel.Spec {
 		DisplayName:           "Windsurf（Codeium）",
 		Status:                channel.Active,
 		Category:              channel.CategoryCoding,
-		Tools:                 false,
-		ToolsShim:             true,
+		Tools:                 true,
+		ToolsShim:             false,
 		Images:                false,
 		Reasoning:             true,
 		SSEOnly:               true,
@@ -76,7 +77,8 @@ func (a *Adapter) Spec() channel.Spec {
 			"挂后台对外提供服务**；别拿主力账号登录，封号与本项目无关。" +
 			" | 登录：粘贴 session token（形如 devin-session-token$…），我们**不做**邮箱密码登录。" +
 			" | 模型：免费账号只跑得动 swe-1-6-slow，其它 selector 上游返回升级提示。" +
-			" | 工具：走网关模拟（toolshim）—— 上游原生工具字段的内部 tag 未标定，不猜。",
+			" | 工具：原生透传（请求 #10 / 响应 #6）；上游会对工具描述做 MCP 指纹匹配，命中即整请求" +
+			" permission_denied，所以工具描述会被替换成工具名、参数 schema 里的描述会被去掉。",
 	}
 }
 
@@ -97,7 +99,7 @@ func (a *Adapter) Models(context.Context, *channel.Credential) ([]channel.ModelI
 			// 上下文长度：上游没给可信值，不猜数字（F4.2）。
 			ContextWindow: 0,
 			Source:        channel.SourceLocal,
-			Tools:         channel.CapYes, // 客户端可用（由网关模拟）
+			Tools:         channel.CapYes, // 原生工具调用（请求 #10 / 响应 #6）
 			Reasoning:     capOf(m.Think),
 			Images:        channel.CapNo,
 		})
@@ -152,7 +154,9 @@ func (a *Adapter) Chat(ctx context.Context, c *channel.Credential, req channel.C
 		encodedMax = defaultMaxTokens
 	}
 
-	proto := buildChatRequest(token, model, "", req.Messages, req.MaxTokens, req.Temperature)
+	// ForwardTools 已按 tool_choice:"none" 过滤（见 channel.ChatRequest）。
+	tools := req.ForwardTools()
+	proto := buildChatRequest(token, model, "", req.Messages, tools, req.MaxTokens, req.Temperature)
 	framed := wrapRequest(proto)
 
 	resp, err := a.send(ctx, c, epChat, ctConnectProto, framed)
@@ -166,7 +170,7 @@ func (a *Adapter) Chat(ctx context.Context, c *channel.Credential, req channel.C
 			WithChannel(string(channel.Windsurf)).WithAccount(uidOf(c)).
 			WithUpstream(truncate(string(raw), 200))
 	}
-	return newStream(resp.Body, req.Model, encodedMax), nil
+	return newStream(resp.Body, req.Model, encodedMax, toolNamesOf(tools)), nil
 }
 
 // checkCredential 用额度接口当场验一次凭证（登录时调用）。
@@ -346,6 +350,25 @@ func uidOf(c *channel.Credential) string {
 		return ""
 	}
 	return c.UID
+}
+
+// toolNamesOf 抽出本轮下发的工具名，供响应侧工具调用「解不到 name 时反查」用
+// （上游响应侧 ChatToolCall 的 name 字段参考实现自己存疑，见 protocol.go 的说明）。
+func toolNamesOf(tools []map[string]any) []string {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(tools))
+	for _, t := range tools {
+		fn, _ := t["function"].(map[string]any)
+		if fn == nil {
+			continue
+		}
+		if name, _ := fn["name"].(string); name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 func trimSpace(s string) string { return strings.TrimSpace(s) }

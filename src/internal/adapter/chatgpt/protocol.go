@@ -179,13 +179,12 @@ func (a *Adapter) sentinelFlow(ctx context.Context, c *channel.Credential, fp fi
 			// 不额外报错，避免把能过的请求挡下来。
 			out.TurnstileToken = ""
 		} else {
-			// 带凭证的请求里，异或密钥用**空串**（参考实现如此：p 由服务端重新下发，
-			// 本地这份不作密钥）。空串在 xorCipher 里等价于不异或。
-			tok, solved := solveTurnstileToken(dx, "", bs.scripts, fp.UserAgent)
-			if !solved {
+			// dx = 「与本次请求发出去的 p 异或后 base64」的 opcode 程序：
+			// 解码密钥就是这把 p（细节与踩坑见 solveTurnstileToken 的注释）。
+			tok, err := solveTurnstileToken(dx, p, bs.scripts, fp.UserAgent)
+			if err != nil {
 				return out, errs.New(errs.UpstreamFault,
-					"turnstile 挑战求解失败（第 3 道门）：上游下发的 opcode 程序本地解释不出来"+
-						"（已知边界：解释器覆盖 1–35 号指令，上游换程序形态时会在这里明确失败）").
+					"turnstile 挑战求解失败（第 3 道门）："+err.Error()).
 					WithChannel(string(channel.ChatGPT)).WithAccount(uidOf(c)).
 					WithUpstream("dx 长度 " + fmt.Sprint(len(dx)))
 			}

@@ -231,6 +231,17 @@ func (a *Adapter) fetchIdentity(ctx context.Context, c *channel.Credential) (ema
 	return out.Email, out.Name
 }
 
+// onboardPollMax / onboardPollEvery 是开通长任务的轮询上限与间隔。
+//
+// 取 10 次 × 5 秒（上限约 50 秒）：与 gpt4free GeminiCLI.py:566-567 的
+// attempts=10 / delay_ms=5000 一致，足够绝大多数账号开完，又不至于把面板的
+// 「等待授权」卡死太久（geminicli2api auth.py:497-510 是不设上限的 while True，
+// 照抄会把授权流程永久挂住，故不采用）。
+const (
+	onboardPollMax   = 10
+	onboardPollEvery = 5 * time.Second
+)
+
 // ensureProject 跑开通流程，返回可用的 project id。
 //
 // 逻辑（照官方 CLI）：先 loadCodeAssist；已有档位+项目就直接用；
@@ -240,10 +251,16 @@ func (a *Adapter) ensureProject(ctx context.Context, c *channel.Credential) (str
 	if p := strings.TrimSpace(c.Extra["project"]); p != "" {
 		return p, nil
 	}
+	// metadata：三份参考实现都带 duetProject（geminicli2api utils.py:32-38、
+	// gpt4free GeminiCLI.py:582-587、AIClient2API gemini-core.js:471-475），
+	// 开通阶段还没有项目，按 AIClient2API 同款用空串。
+	// platform 保持 PLATFORM_UNSPECIFIED：geminicli2api 会按主机算成 LINUX_AMD64，
+	// 而 AIClient2API 直接用 PLATFORM_UNSPECIFIED —— 两份冲突，按后者（现状）不动。
 	meta := map[string]any{
-		"ideType":    "IDE_UNSPECIFIED",
-		"platform":   "PLATFORM_UNSPECIFIED",
-		"pluginType": pluginType,
+		"ideType":     "IDE_UNSPECIFIED",
+		"platform":    "PLATFORM_UNSPECIFIED",
+		"pluginType":  pluginType,
+		"duetProject": "",
 	}
 	body, _ := json.Marshal(map[string]any{"metadata": meta})
 	var loaded struct {
@@ -283,34 +300,44 @@ func (a *Adapter) ensureProject(ctx context.Context, c *channel.Credential) (str
 		payload["cloudaicompanionProject"] = loaded.CloudAICompanionProject
 	}
 	onbBody, _ := json.Marshal(payload)
-	var lro struct {
-		Name     string `json:"name"`
-		Done     bool   `json:"done"`
-		Response struct {
-			CloudAICompanionProject struct {
-				ID string `json:"id"`
-			} `json:"cloudaicompanionProject"`
-		} `json:"response"`
-	}
+	var lro onboardResp
 	if err := a.postJSONInto(ctx, c, a.codeAssistBase+"/v1internal:onboardUser", onbBody, &lro); err != nil {
 		return "", err
 	}
-	// 长任务：没 done 就轮询（最多 ~30 秒，避免把授权卡死）
-	for i := 0; !lro.Done && i < 6 && lro.Name != ""; i++ {
+	// 长任务：没 done 就**重发同一个 onboardUser**，不是去 GET 操作名。
+	// 三份参考实现都是重发：geminicli2api auth.py:497-510（while True 再 POST）、
+	// gpt4free GeminiCLI.py:594-635（attempts=10、每次 sleep 5s）、
+	// AIClient2API gemini-core.js:523-533（循环重发，最长 60s）。
+	// 过去走的是自创路径 GET /v1internal/{name} —— 那个端点没有任何参考实现用过。
+	for i := 0; !lro.Done && i < onboardPollMax; i++ {
 		select {
 		case <-ctx.Done():
 			return "", errs.New(errs.Transport, "等待开通超时").WithChannel(string(channel.Gemini)).WithCause(ctx.Err())
-		case <-time.After(5 * time.Second):
+		case <-time.After(onboardPollEvery):
 		}
-		if err := a.getJSONInto(ctx, c, a.codeAssistBase+"/v1internal/"+lro.Name, &lro); err != nil {
+		var next onboardResp
+		if err := a.postJSONInto(ctx, c, a.codeAssistBase+"/v1internal:onboardUser", onbBody, &next); err != nil {
 			return "", err
 		}
+		lro = next
 	}
 	if id := lro.Response.CloudAICompanionProject.ID; id != "" {
 		return id, nil
 	}
 	return "", errs.New(errs.AuthFailed, "开通没拿到项目 id（可能这个账号需要先在浏览器里完成验证）").
 		WithChannel(string(channel.Gemini)).WithAccount(c.UID)
+}
+
+// onboardResp 是 onboardUser 的长任务响应。
+//
+// done 为假时表示还没开完，要重发同一请求（见 ensureProject 的说明）。
+type onboardResp struct {
+	Done     bool `json:"done"`
+	Response struct {
+		CloudAICompanionProject struct {
+			ID string `json:"id"`
+		} `json:"cloudaicompanionProject"`
+	} `json:"response"`
 }
 
 // postForm 发一个表单请求（token 端点用），返回状态码与原始报文。
@@ -335,10 +362,6 @@ func (a *Adapter) postForm(ctx context.Context, c *channel.Credential, urlStr st
 
 func (a *Adapter) postJSONInto(ctx context.Context, c *channel.Credential, urlStr string, body []byte, out any) error {
 	return a.doJSONInto(ctx, c, http.MethodPost, urlStr, body, out)
-}
-
-func (a *Adapter) getJSONInto(ctx context.Context, c *channel.Credential, urlStr string, out any) error {
-	return a.doJSONInto(ctx, c, http.MethodGet, urlStr, nil, out)
 }
 
 func (a *Adapter) doJSONInto(ctx context.Context, c *channel.Credential, method, urlStr string, body []byte, out any) error {

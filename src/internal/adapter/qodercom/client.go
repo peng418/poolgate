@@ -1,4 +1,4 @@
-// client.go QoderCN 适配器主体：实现 channel.Channel，把 COSY 签名对话、
+// client.go QoderCOM 适配器主体：实现 channel.Channel，把 COSY 签名对话、
 // QoderEncoding 编码、嵌套 SSE 剥壳、错误 Classify 归一全部收敛在这里。
 package qodercom
 
@@ -17,11 +17,16 @@ import (
 	"poolgate/internal/errs"
 )
 
-// Adapter 实现 channel.Channel（QoderCN 渠道）。
+// Adapter 实现 channel.Channel（QoderCOM 渠道）。
 type Adapter struct {
 	http    *http.Client
-	base    string // 业务 API，默认 https://openapi.qoder.com.cn
-	gateway string // 推理网关，默认 https://gateway.qoder.com.cn
+	base    string // 业务 API，默认 https://openapi.qoder.sh
+	gateway string // 推理网关，默认 https://api1.qoder.sh
+	// modelsBase 是模型目录域名，默认 https://api2.qoder.sh。
+	// COM 与 CN 不同：COM 的模型表在 api2、推理在 api1，是两个域名（CN 的模型表与推理同网关）。
+	// 依据 wild-work internal/qodercom/client.go 的 ModelsBase 字段与 models.go
+	// `rawURL := c.ModelsBase + EpModels`。
+	modelsBase string
 
 	// modelMap 客户端名（display_name 规范化）→ 上游 model key；
 	// cache 为最近一次成功拉取的完整模型表（无静态兜底，仅此缓存）。
@@ -48,19 +53,23 @@ func NewWithTimeout(timeout time.Duration) *Adapter {
 		TLSNextProto:        map[string]func(string, *tls.Conn) http.RoundTripper{}, // 强制 HTTP/1.1
 	}
 	return &Adapter{
-		http:      &http.Client{Timeout: timeout, Transport: tr},
-		base:      OpenAPIBase,
-		gateway:   GatewayBase,
-		modelMap:  map[string]string{},
-		userTypes: map[string]string{},
+		http:       &http.Client{Timeout: timeout, Transport: tr},
+		base:       OpenAPIBase,
+		gateway:    GatewayBase,
+		modelsBase: ModelsBase,
+		modelMap:   map[string]string{},
+		userTypes:  map[string]string{},
 	}
 }
 
 // NewWithBase 测试用：覆盖 base/gateway/http。
+// modelsBase 也指向 gateway（测试用的是同一个 httptest 服务），
+// 否则测模型目录时会打到真上游 api2.qoder.sh。
 func NewWithBase(base, gateway string, hc *http.Client) *Adapter {
 	a := New()
 	a.base = base
 	a.gateway = gateway
+	a.modelsBase = gateway
 	if hc != nil {
 		a.http = hc
 	}
@@ -161,7 +170,8 @@ func (a *Adapter) Refresh(ctx context.Context, c *channel.Credential) (*channel.
 	body, _ := json.Marshal(map[string]string{"refresh_token": c.RefreshToken})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.base+EpDTRefresh, strings.NewReader(string(body)))
 	if err != nil {
-		return nil, err
+		// 归一成 errs.Error：普通 error 到网关只会按兜底 Parse 处理（红线一）。
+		return nil, errs.New(errs.Transport, "构造刷新请求失败").WithAccount(c.UID).WithCause(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -223,7 +233,7 @@ func (a *Adapter) Models(ctx context.Context, c *channel.Credential) ([]channel.
 func (a *Adapter) Balance(ctx context.Context, c *channel.Credential) (channel.Balance, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.base+EpQuotaUsage, nil)
 	if err != nil {
-		return channel.Balance{}, err
+		return channel.Balance{}, errs.New(errs.Transport, "构造余额请求失败").WithAccount(c.UID).WithCause(err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.AccessToken)
 	req.Header.Set("Accept", "application/json")

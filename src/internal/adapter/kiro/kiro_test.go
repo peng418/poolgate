@@ -759,6 +759,40 @@ func TestSpecAndModels(t *testing.T) {
 	if got := resolveModel("some-future-model"); got != "some-future-model" {
 		t.Fatalf("未知档位应原样透传：%q", got)
 	}
+	// 上下文窗口标记：参考实现剥的是「[数字+m/k]」任意位数、大小写不敏感
+	//（model_resolver.py:132），不是只有字面量 [1m]/[200k]。
+	for in, want := range map[string]string{
+		"claude-sonnet-4.5[1m]":   "claude-sonnet-4.5",
+		"claude-sonnet-4.5[200k]": "claude-sonnet-4.5",
+		"claude-sonnet-4.5[1M]":   "claude-sonnet-4.5",
+		"claude-sonnet-4.5[256k]": "claude-sonnet-4.5",
+		"claude-sonnet-4.5[abc]":  "claude-sonnet-4.5[abc]", // 不是窗口标记，原样透传
+		"claude-sonnet-4.5[1g]":   "claude-sonnet-4.5[1g]",  // 单位不是 m/k，原样透传
+	} {
+		if got := resolveModel(in); got != want {
+			t.Fatalf("窗口标记剥离不对 %q：期望 %q 得到 %q", in, want, got)
+		}
+	}
+}
+
+// conversationId 的形态要照参考实现：不带 messages 调用 generate_conversation_id()
+// 得到的是 str(uuid.uuid4())（utils.py:102-127 + routes 的 4 处调用），
+// 即带连字符的 8-4-4-4-12。
+func TestBuildPayloadConversationIDIsUUID(t *testing.T) {
+	payload, err := buildPayload(channel.ChatRequest{
+		Model:    "claude-sonnet-4.5",
+		Messages: []channel.Message{{Role: "user", Content: "hi"}},
+	}, "claude-sonnet-4.5", "")
+	if err != nil {
+		t.Fatalf("buildPayload 失败：%v", err)
+	}
+	id, _ := payload["conversationState"].(map[string]any)["conversationId"].(string)
+	if len(id) != 36 {
+		t.Fatalf("conversationId 应是带连字符的 UUID（36 字符），得到 %q", id)
+	}
+	if id[8] != '-' || id[13] != '-' || id[18] != '-' || id[23] != '-' {
+		t.Fatalf("conversationId 的连字符位置不对：%q", id)
+	}
 }
 
 // ---------------------------------------------------------------------------

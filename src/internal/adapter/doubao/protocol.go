@@ -171,21 +171,38 @@ func queryParams(c *cred, tabID string) string {
 
 // buildBody 组装请求体（形态照参考实现，字段一个都不能少：它们是上游 SDK 的固定协议）。
 func buildBody(text string, think int, c *cred) []byte {
+	// 参考实现是 `f"local_{uuid.uuid4().hex[:16]}"` —— 16 个 hex 字符，不是 32 个；
+	// 长度是对上游协议的一部分，照抄。
+	convID := "local_" + randHex16()[:16]
+	msgID := randUUID4()
+	blockID := randUUID4()
 	body := map[string]any{
 		"client_meta": map[string]any{
-			"local_conversation_id": "",
+			"local_conversation_id": convID,
 			"conversation_id":       "",
 			"bot_id":                botID,
 			"last_section_id":       "",
 			"last_message_index":    0,
 		},
 		"messages": []any{map[string]any{
-			"local_message_id": "",
+			"local_message_id": msgID,
 			"content_block": []any{map[string]any{
 				"block_type": 10000,
 				"content": map[string]any{
-					"text_block": map[string]any{"text": text},
+					"text_block": map[string]any{
+						"text":          text,
+						"icon_url":      "",
+						"icon_url_dark": "",
+						"summary":       "",
+					},
+					"pc_event_block": "",
 				},
+				"block_id":      blockID,
+				"parent_id":     "",
+				"meta_info":     []any{},
+				"append_fields": []any{},
+				"is_finish":     true,
+				"patch_type":    2,
 			}},
 			"message_status": 0,
 		}},
@@ -216,6 +233,8 @@ func buildBody(text string, think int, c *cred) []byte {
 			"regen_instruction":        "",
 			"regen_query_id":           []any{},
 			"edit_query_id":            []any{},
+			"create_time_ms":           0,
+			"unique_key":               randUUID4(),
 		},
 		"chat_ability": map[string]any{},
 		"ext": map[string]any{

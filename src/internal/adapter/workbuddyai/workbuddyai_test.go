@@ -3,6 +3,7 @@ package workbuddyai
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -176,5 +177,85 @@ func TestStartLoginFailsWithoutAuthURL(t *testing.T) {
 	_, err := a.StartLogin(context.Background(), channel.LoginOptions{})
 	if err == nil {
 		t.Fatal("缺少 authUrl 应报错")
+	}
+}
+
+// 客户端没给 max_tokens（网关传 0）时不发该字段；tool_choice 归一成字符串
+// （与 CN 适配器同源约束，见 wild-work payload.go / hub v1.5.8 normalize_tool_choice）。
+func TestBuildBodyOmitsMaxTokensAndNormalizesToolChoice(t *testing.T) {
+	raw := buildBody(channel.ChatRequest{Model: "hy3", Messages: []channel.Message{{Role: "user", Content: "u"}}})
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := obj["max_tokens"]; ok {
+		t.Fatalf("客户端没给 max_tokens 时不应带该字段，实际 %v", obj["max_tokens"])
+	}
+
+	tools := []map[string]any{{"type": "function", "function": map[string]any{"name": "f"}}}
+	raw2 := buildBody(channel.ChatRequest{Model: "hy3", Messages: []channel.Message{{Role: "user", Content: "u"}},
+		Tools: tools, ToolChoice: map[string]any{"type": "function", "function": map[string]any{"name": "f"}}})
+	var obj2 map[string]any
+	_ = json.Unmarshal(raw2, &obj2)
+	if obj2["tool_choice"] != "f" {
+		t.Fatalf("function 型 tool_choice 应归一成函数名，实际 %#v", obj2["tool_choice"])
+	}
+	if _, ok := obj2["tools"]; !ok {
+		t.Fatal("给了 tools 就应转发")
+	}
+}
+
+// 余额请求带 PackageEndTimeRange* 且路径正确（国际版 chat/billing 同域）。
+func TestBalanceSendsRanges(t *testing.T) {
+	var gotPath, gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		_, _ = io.WriteString(w, `{"code":0,"msg":"","data":{"Response":{"Data":{"Accounts":[]}}}}`)
+	}))
+	defer srv.Close()
+
+	a := NewWithBase(srv.URL, srv.Client())
+	if _, err := a.Balance(context.Background(), &channel.Credential{UID: "u1", AccessToken: "t"}); err != nil {
+		t.Fatalf("余额查询失败: %v", err)
+	}
+	if gotPath != EpUserRes {
+		t.Fatalf("账单路径应为 %s，实际 %s", EpUserRes, gotPath)
+	}
+	if !strings.Contains(gotBody, "PackageEndTimeRangeBegin") || !strings.Contains(gotBody, "PackageEndTimeRangeEnd") {
+		t.Fatalf("账单请求体应带 PackageEndTimeRange*，实际 %s", gotBody)
+	}
+}
+
+// 出站脱敏回归：Claude Code / Agent SDK 注入的身份句必须在上游**收到的 body** 里被改写。
+// 上游对其逐字精确匹配，命中即 HTTP 400 code=11128
+// （"Illegal API invocation from an unapproved channel"）。断言改写发生，且消息条数与无关内容不变。
+func TestBuildBodySanitizesClaudeFingerprint(t *testing.T) {
+	const ccIdentity = "You are Claude Code, Anthropic's official CLI for Claude."
+	raw := buildBody(channel.ChatRequest{
+		Model: "hy3",
+		Messages: []channel.Message{
+			{Role: "system", Content: ccIdentity},
+			{Role: "user", Content: "hi"},
+		},
+	})
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("请求体不是合法 JSON: %v", err)
+	}
+	msgs := obj["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("消息条数应保持 2 条，实际 %d", len(msgs))
+	}
+	sys, _ := msgs[0].(map[string]any)["content"].(string)
+	if strings.Contains(sys, ccIdentity) {
+		t.Fatalf("上游收到的 body 仍带指纹原文: %q", sys)
+	}
+	if !strings.Contains(sys, "official CLI tool for Claude.") {
+		t.Fatalf("身份句未被最小改写: %q", sys)
+	}
+	if got, _ := msgs[1].(map[string]any)["content"].(string); got != "hi" {
+		t.Fatalf("无关消息被改动: %q", got)
 	}
 }

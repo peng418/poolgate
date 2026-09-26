@@ -9,6 +9,7 @@ package iflow
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -17,6 +18,7 @@ import (
 	"hash/fnv"
 	"strconv"
 	"strings"
+	"time"
 
 	"poolgate/internal/channel"
 )
@@ -37,11 +39,31 @@ import (
 //   - timestamp 是**毫秒**，且与头里 x-iflow-timestamp 是同一个数（不是各取一次时间）。
 //
 // 我们不去「校验」这些，只是严格保证三处用同一个值：只要它们一致，签名就成立。
+//
+// 交叉印证：第二份**独立**实现 AIClient2API（src/providers/openai/iflow-core.js:286-303）
+// 的 `createIFlowSignature(UA, sessionID, timestamp, apiKey)` 逐字节相同 —— payload 同为
+// `${userAgent}:${sessionID}:${timestamp}`、key 同为 apiKey、`createHmac('sha256').digest('hex')`、
+// 时间戳同取 `Date.now()`（毫秒）。两份实现在此完全一致，说明这里抄对了。
 func signature(apiKey, sessionID string, tsMillis int64) string {
 	msg := cliUserAgent + ":" + sessionID + ":" + strconv.FormatInt(tsMillis, 10)
 	mac := hmac.New(sha256.New, []byte(apiKey))
 	_, _ = mac.Write([]byte(msg))
 	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// traceparent 生成一个 W3C Trace Context 头值：`00-<32hex trace_id>-<16hex parent_id>-01`。
+//
+// 参考实现每个请求都带这个头（proxy.py:68-74 生成、:129 发送），形态是硬性的四段式；
+// 它**不参与签名**，上游按「有则传」的可选头处理（proxy.py:127 注释）。我们没有埋点链路，
+// 每请求现生成一个随机值即可 —— 只要形态合法，不追求跨请求复用同一个 trace_id。
+func traceparent() string {
+	var b [24]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// 熵源不可用时退化成派生值：头值只需形态合法（它不进签名）。
+		h := sha256.Sum256([]byte(strconv.FormatInt(time.Now().UnixNano(), 10)))
+		copy(b[:], h[:24])
+	}
+	return "00-" + hex.EncodeToString(b[0:16]) + "-" + hex.EncodeToString(b[16:24]) + "-01"
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +165,12 @@ func messagePayloads(msgs []channel.Message) []any {
 // 规则逐条注释自 its 源码，不是我们编的）。
 //
 // 分支顺序有意义：先命中的分支生效（例如 glm-5 走专属分支，不进 glm-* 通用分支）。
+//
+// 交叉印证（部分）：第二份独立实现 AIClient2API（iflow-core.js:316-364 applyIFlowThinkingConfig）
+// 也认「glm-4.x 用 chat_template_kwargs.enable_thinking」，与我们 glm-4.6/4.7 的处理一致；
+// 但它是**由客户端 reasoning_effort 驱动**的（没传就不加），且对 glm-5 / deepseek 不加任何静态
+// 参数、并多一个 clear_thinking 键 —— 与 iflow2api 的静态规则冲突。这里仍以 iflow2api
+// （自称来自 iflow-cli configureRequest 源码）为准，不引入第二份的分歧规则。
 func thinkingParams(model string) map[string]any {
 	m := strings.ToLower(strings.TrimSpace(model))
 	out := map[string]any{}
@@ -194,6 +222,10 @@ func thinkingParams(model string) map[string]any {
 //   - 整段 settings.json（或它的片段）→ 取其中的 `apiKey` / `api_key` / `key` / `value`；
 //   - 面板引导语里的 `"apiKey" = "xxx"` 这种键值对写法。
 //
+// apiKey 的取法对齐参考实现：优先 `apiKey`，其次是兼容字段 `searchApiKey`
+// （config.py:109 `data.get("apiKey") or data.get("searchApiKey")`）——
+// 有的账号/版本只写了后者，不认就会「照引导语粘了却说没识别出」。
+//
 // 挡掉明显误粘的内容（空、太短、含空白）——把 URL 或整段配置当 key 存进去，
 // 表现是「装上了但一调用就 401」，比当场拒绝难查得多。
 func extractAPIKey(raw string) string {
@@ -203,13 +235,14 @@ func extractAPIKey(raw string) string {
 	}
 	if strings.HasPrefix(s, "{") {
 		var obj struct {
-			APIKey  string `json:"apiKey"`
-			APIKey2 string `json:"api_key"`
-			Key     string `json:"key"`
-			Value   string `json:"value"`
+			APIKey       string `json:"apiKey"`
+			SearchAPIKey string `json:"searchApiKey"`
+			APIKey2      string `json:"api_key"`
+			Key          string `json:"key"`
+			Value        string `json:"value"`
 		}
 		if json.Unmarshal([]byte(s), &obj) == nil {
-			for _, v := range []string{obj.APIKey, obj.APIKey2, obj.Key, obj.Value} {
+			for _, v := range []string{obj.APIKey, obj.SearchAPIKey, obj.APIKey2, obj.Key, obj.Value} {
 				if strings.TrimSpace(v) != "" {
 					s = strings.TrimSpace(v)
 					break

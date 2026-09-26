@@ -27,9 +27,12 @@ import (
 )
 
 // onboardPollMax / onboardPollEvery 是长任务的轮询上限与间隔。
-// 上限 ~30 秒：足够绝大多数账号开完，又不会把面板的「等待授权」卡死。
+// 取 10 次 × 5 秒（上限 ~50 秒）：各参考实现一致（opencode project.ts:169-174
+// attempts=10 / delayMs=5000；g4f Antigravity.py:1563-1564 默认 10 × 5s；
+// antigravity-claude-proxy account-manager/onboarding.js 亦为 maxAttempts=10 / delayMs=5000），
+// 足够绝大多数账号开完，又不至于把面板的「等待授权」卡死太久。
 const (
-	onboardPollMax   = 6
+	onboardPollMax   = 10
 	onboardPollEvery = 5 * time.Second
 )
 
@@ -174,7 +177,23 @@ func (a *Adapter) loadCodeAssist(ctx context.Context, c *channel.Credential, tok
 	return out, base, nil
 }
 
-// onboard 调 onboardUser 开项目，长任务没做完就轮询。
+// onboardResp 是 onboardUser 的响应（含长任务字段）。
+//
+// 长任务没做完时上游给 done=false，然后**再发一次同样的请求**直到 done=true ——
+// 参考实现都是这么做的（opencode project.ts:182-217；g4f Antigravity.py:1583-1620；
+// AIClient2API antigravity-core.js:1306-1314；antigravity-claude-proxy onboarding.js）。
+// 我们过去改成去 GET 操作名 `/v1internal/{name}`，那个端点没有任何参考实现用过、也未经验证，
+// 属于自创路径。
+type onboardResp struct {
+	Done     bool `json:"done"`
+	Response struct {
+		CloudAICompanionProject struct {
+			ID string `json:"id"`
+		} `json:"cloudaicompanionProject"`
+	} `json:"response"`
+}
+
+// onboard 调 onboardUser 开项目，长任务没做完就重发同一请求。
 func (a *Adapter) onboard(ctx context.Context, c *channel.Credential, token string, bases []string, tier string) (string, error) {
 	payload := map[string]any{
 		"tierId":   tier,
@@ -183,15 +202,7 @@ func (a *Adapter) onboard(ctx context.Context, c *channel.Credential, token stri
 	// 关键约束：请求体里**没有** cloudaicompanionProject。free tier 带了会被上游拒绝。
 	body, _ := json.Marshal(payload)
 
-	var lro struct {
-		Name     string `json:"name"`
-		Done     bool   `json:"done"`
-		Response struct {
-			CloudAICompanionProject struct {
-				ID string `json:"id"`
-			} `json:"cloudaicompanionProject"`
-		} `json:"response"`
-	}
+	var lro onboardResp
 	status, raw, base, err := a.callJSON(ctx, c, token, bases, "/v1internal:onboardUser", body, &lro)
 	if err != nil {
 		return "", err
@@ -200,25 +211,18 @@ func (a *Adapter) onboard(ctx context.Context, c *channel.Credential, token stri
 		return "", errs.New(a.Classify(status, raw), "开通失败（onboardUser）").
 			WithChannel(string(channel.Antigravity)).WithAccount(c.UID).WithUpstream(truncate(string(raw), 200))
 	}
-	// 长任务：没 done 就轮询（用同一台基址，别在轮询中途换基址导致查不到任务）。
+	// 长任务：没 done 就重发同一个 onboardUser（钉在同一台基址上，别在轮询中途换基址）。
 	if basesForPoll := preferBase(bases, base); len(basesForPoll) > 0 {
 		base = basesForPoll[0]
 	}
-	for i := 0; !lro.Done && i < onboardPollMax && strings.TrimSpace(lro.Name) != ""; i++ {
+	for i := 0; !lro.Done && i < onboardPollMax; i++ {
 		select {
 		case <-ctx.Done():
 			return "", errs.New(errs.Transport, "等待开通超时").WithChannel(string(channel.Antigravity)).WithCause(ctx.Err())
 		case <-time.After(onboardPollEvery):
 		}
-		var next struct {
-			Done     bool `json:"done"`
-			Response struct {
-				CloudAICompanionProject struct {
-					ID string `json:"id"`
-				} `json:"cloudaicompanionProject"`
-			} `json:"response"`
-		}
-		st, raw2, _, err := a.callJSON(ctx, c, token, []string{base}, "/v1internal/"+lro.Name, nil, &next)
+		var next onboardResp
+		st, raw2, _, err := a.callJSON(ctx, c, token, []string{base}, "/v1internal:onboardUser", body, &next)
 		if err != nil {
 			return "", err
 		}
@@ -226,8 +230,7 @@ func (a *Adapter) onboard(ctx context.Context, c *channel.Credential, token stri
 			return "", errs.New(a.Classify(st, raw2), "开通轮询失败").
 				WithChannel(string(channel.Antigravity)).WithAccount(c.UID).WithUpstream(truncate(string(raw2), 200))
 		}
-		lro.Done = next.Done
-		lro.Response = next.Response
+		lro = next
 	}
 	if id := strings.TrimSpace(lro.Response.CloudAICompanionProject.ID); id != "" {
 		return id, nil

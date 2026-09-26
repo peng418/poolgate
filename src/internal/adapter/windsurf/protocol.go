@@ -11,6 +11,7 @@ package windsurf
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 
 	"poolgate/internal/channel"
@@ -25,14 +26,15 @@ import (
 //	#3  repeated ChatMessage（对话正文）
 //	#7  常量 5
 //	#8  CompletionConfig（max_tokens / 上下文 / 温度 …）
+//	#10 repeated ToolDef（原生工具定义，见下）
 //	#15 ModelConfig（会话配置 id + 轮次）
 //	#16 session_id（会话 id，字符串）
 //	#20 常量 1
 //	#21 model selector（字符串，如 "swe-1-6-slow"）
 //
 // 故意**不写**的字段：
-//   - #10 tools（ToolDef 的子字段 tag 未标定，猜错静默失败 —— 本渠道走 toolshim）；
-//   - #11/#12 tool_choice / disable_parallel（参考实现里也是默认关的未确认坐标）；
+//   - #11/#12 tool_choice / disable_parallel（参考实现里也是默认关的**未确认坐标**，
+//     它自己注明是「别人 .proto 的声明顺序」而非抓包，我们同样不猜）；
 //   - #13 system_prompt_cache_options（同上，默认关）；
 //   - #22 request_id（实测只有第 2 轮起才出现，我们无状态、按第 1 轮形态发）。
 const (
@@ -41,10 +43,43 @@ const (
 	reqFieldChatMessage = 3
 	reqFieldConst7      = 7
 	reqFieldCompletion  = 8
+	reqFieldTools       = 10
 	reqFieldModelConfig = 15
 	reqFieldSessionID   = 16
 	reqFieldConst20     = 20
 	reqFieldModel       = 21
+)
+
+// ToolDef（请求 #10 里每个工具定义）的子 tag。
+//
+// ★ 来源：参考实现 WindsurfAPI/src/devin-connect.js:394-397 的 DEFAULT_DEF_TAGS ——
+// 它标注为**付费实弹标定**（2026-07-04，teams 账号 claude-opus-4-8）：按
+// name=1 / description=2 / parameters=3 发原生 ToolDef，#10 里的定义被模型正确理解、
+// 并真的回出了原生 tool_calls（见该文件 :359-381 的结论段）。所以这是**已标定**的
+// tag，不是猜的（schema 是 parameters 的别名，同号，:433）。
+//
+// 于是我们不再走 toolshim，改为原生透传（Spec.Tools=true）。
+const (
+	toolDefFieldName        = 1
+	toolDefFieldDescription = 2
+	toolDefFieldParameters  = 3
+	schemaFieldAlias        = toolDefFieldParameters // 参考实现里 schema 与 parameters 同号
+)
+
+// ChatMessage 里原生工具历史用到的字段号（参考实现 encodeChatMessage /
+// encodeAssistantToolCall，devin-connect.js:301-357）：
+//
+//	#6 = 一个 ToolCall 子消息（仅 assistant 轮）：子 tag #1 id / #2 name / #3 argsJSON
+//	#7 = tool_call_id（仅 source=4 的 tool_result 轮）
+//
+// 子 tag 与响应侧 ChatToolCall 的 id/name/arguments_json 同号，是同一套逆向坐标。
+const (
+	cmFieldToolCall   = 6
+	cmFieldToolCallID = 7
+
+	callFieldID        = 1
+	callFieldName      = 2
+	callFieldArguments = 3
 )
 
 // ClientMetadata 的字段号。token 在这里是**单份**（#3），双写只发生在 HTTP 头。
@@ -78,16 +113,20 @@ const (
 // ChatMessage 的字段号。
 //
 //	#1 uuid（每条消息一个，随机）
-//	#2 source（1=user, 2=assistant；4=tool_result 是上游的另一种 source，
-//	           但本渠道把工具结果降级成 user 文本，所以不产出 4）
+//	#2 source（1=user, 2=assistant, 4=tool_result）
 //	#3 text
+//
+// source=4 是上游客观的第四种 source：走原生工具时，`role:"tool"` 的结果会以
+// source=4 发出，并用 #7 回指被调用的那次 tool_call（参考实现 encodeChatMessage 的
+// TOOL_RESULT 分支，devin-connect.js:130、:1184-1195）。
 const (
 	cmFieldUUID   = 1
 	cmFieldSource = 2
 	cmFieldText   = 3
 
-	sourceUser      = 1
-	sourceAssistant = 2
+	sourceUser       = 1
+	sourceAssistant  = 2
+	sourceToolResult = 4
 )
 
 // ModelConfig 的字段号：#1 会话配置 uuid（同一会话内稳定）、#2 轮次、#3 常量 4。
@@ -116,8 +155,26 @@ const (
 const (
 	respFieldContent   = 3
 	respFieldFinish    = 5
+	respFieldToolCalls = 6
 	respFieldMeta      = 7
 	respFieldReasoning = 9
+)
+
+// ChatToolCall（响应 #6 repeated）的子 tag。
+//
+// ★ 来源：参考实现 WindsurfAPI/src/devin-connect.js:1489-1492 的 DEFAULT_CALL_TAGS，
+// 由 devin.exe 反汇编钉死（encode_raw @0x1442fe1f0 + merge_field 跳转表）：
+//
+//	outer=6（顶层 repeated delta_tool_calls）, id=1, name=2, arguments_json=3,
+//	invalid_json_str=4, invalid_json_err=5, is_custom_tool_call=6
+//
+// 注意同一份参考实现里有**互相矛盾**的两条备注：文件头 :1462-1470 说「响应侧
+// ChatToolCall 没有 name 字段」（只有 id + arguments），而 :1489 又把 name=2 标成
+// 反汇编钉死。处置：照抄 name=2，但解不到 name 时用「本轮只下发了一个工具」反查兜底，
+// 再退回 "unknown" —— 与参考实现 decodeToolCalls / devin-connect-openai.js:672 一致。
+const (
+	callFieldInvalidJSONStr = 4
+	callFieldInvalidJSONErr = 5
 )
 
 // 响应 #7 metadata 子消息里的用量字段号。
@@ -214,7 +271,7 @@ func buildModelConfig() []byte {
 	return b
 }
 
-// buildChatMessage 组装一条 ChatMessage（请求 #3 的一个元素）。
+// buildChatMessage 组装一条纯文本 ChatMessage（请求 #3 的一个元素）。
 func buildChatMessage(source int, text string) []byte {
 	b := make([]byte, 0, len(text)+40)
 	b = appendStringField(b, cmFieldUUID, newUUID())
@@ -223,13 +280,105 @@ func buildChatMessage(source int, text string) []byte {
 	return b
 }
 
+// buildToolCallMessage 组装一条只带原生工具调用的 assistant 轮（ChatMessage #6）。
+//
+// 参考实现 encodeAssistantToolCall（devin-connect.js:328-357）：请求侧的 ToolCall 是
+// protobuf 子消息 {#1 id, #2 name, #3 argsJSON}，**只有 args 的值**是 JSON 字符串。
+// 一条消息只放一个 tool_call（参考实现按每个 call 各发一条）。
+func buildToolCallMessage(tc channel.ToolCall) []byte {
+	args := trimSpace(tc.Function.Arguments)
+	if args == "" {
+		args = "{}"
+	}
+	id := trimSpace(tc.ID)
+	if id == "" {
+		// 没给 id 就补一个：后面的 tool_result 要靠它才能对上号。
+		id = "call_" + shortHash(tc.Function.Name+args)
+	}
+	name := trimSpace(tc.Function.Name)
+	if name == "" {
+		name = "unknown" // 与参考实现 encodeToolDef/encodeAssistantToolCall 的兜底一致
+	}
+	sub := make([]byte, 0, len(args)+64)
+	sub = appendStringField(sub, callFieldID, id)
+	sub = appendStringField(sub, callFieldName, name)
+	sub = appendStringField(sub, callFieldArguments, args)
+
+	b := make([]byte, 0, len(sub)+40)
+	b = appendStringField(b, cmFieldUUID, newUUID())
+	b = appendVarintField(b, cmFieldSource, sourceAssistant)
+	b = appendBytesField(b, cmFieldToolCall, sub)
+	return b
+}
+
+// buildToolResultMessage 组装一条 source=4 的 tool_result 轮。
+//
+// 参考实现 devin-connect.js:1184-1195：role=tool 的结果以 source=4 发出，文本进 #3，
+// 并用 #7 tool_call_id 回指前面那条 assistant #6。
+func buildToolResultMessage(callID, text string) []byte {
+	if text == "" {
+		text = "[tool result]"
+	}
+	b := make([]byte, 0, len(text)+64)
+	b = appendStringField(b, cmFieldUUID, newUUID())
+	b = appendVarintField(b, cmFieldSource, sourceToolResult)
+	b = appendStringField(b, cmFieldText, text)
+	b = appendStringField(b, cmFieldToolCallID, callID)
+	return b
+}
+
+// buildToolDef 组装一个 ToolDef 子消息（请求 #10 的一个元素）。
+//
+// ★ 两处「不这么做就会被上游拒掉」的细节（全部抄自参考实现 encodeToolDef，
+// devin-connect.js:594-609）：
+//
+//  1. 顶层 description 写的是**工具名**，不是真实描述。上游 server.codeium.com 会对
+//     工具描述做 MCP 指纹匹配，命中已知工具签名就整个请求回 permission_denied
+//     （"Unable to process request due to an MCP configuration issue."）。实测 Cursor
+//     的 21 个工具里 8 个会触发；模型是按名字识别工具的，描述正文可去（:572-592）。
+//  2. parameters 的 JSON Schema 先规整：丢掉 $schema、压平顶层组合子、去掉所有
+//     description 注解（同上，指纹需要「描述 + 参数描述」组合才命中，去掉任一层不够）。
+//
+// 形状不合要求的工具（不是 function / 没名字）直接跳过 —— 宁可少发一个定义，也不发
+// 一个会让上游整请求报错的畸形 ToolDef。
+func buildToolDef(tool map[string]any) []byte {
+	fn, _ := tool["function"].(map[string]any)
+	if fn == nil {
+		return nil
+	}
+	name, _ := fn["name"].(string)
+	if trimSpace(name) == "" {
+		return nil
+	}
+	b := make([]byte, 0, 256)
+	b = appendStringField(b, toolDefFieldName, name)
+	if desc, _ := fn["description"].(string); desc != "" {
+		b = appendStringField(b, toolDefFieldDescription, name) // ← 写名字，见上
+	}
+	if params, ok := fn["parameters"]; ok {
+		b = appendStringField(b, schemaFieldAlias, string(mustJSON(normalizeToolSchema(params))))
+	}
+	return b
+}
+
 // buildChatRequest 组装完整的 GetChatMessageRequest。
 //
-// 字段顺序按字段号升序，与参考实现的抓包一致。
-func buildChatRequest(token, model, sessionID string, msgs []channel.Message, maxTokens int, temperature *float64) []byte {
+// tools 是已经过 ForwardTools() 过滤的客户端工具定义（OpenAI 形态）；为空则不发 #10。
+//
+// 字段顺序与参考实现一致：除 #10 外按字段号升序，而 #10 ToolDefs 是**追加在最后**的
+// （参考实现 devin-connect.js:1279-1315 先拼完 #1..#21 再把 tools push 到末尾——该字段
+// 是后加进协议里的）。protobuf 与字段顺序无关，这里照抄它的字节序以便逐字节对照。
+func buildChatRequest(token, model, sessionID string, msgs []channel.Message, tools []map[string]any, maxTokens int, temperature *float64) []byte {
 	system, chats := packMessages(msgs)
 	if sessionID == "" {
 		sessionID = newUUID()
+	}
+	// ★ 空 system + 有 tools 的兜底。参考实现实测（devin-connect.js:1230-1242）：上游对
+	// 「声明了 tools 但 system 为空/缺失」的 Claude 系请求直接回 internal error
+	// （"an internal error occurred (trace ID …)"）；只要有一个字符的 system 就能过。
+	// 纯 API 客户端很容易不发 system，所以这里补一句无害的话。
+	if system == "" && len(tools) > 0 {
+		system = toolsGuardSystem
 	}
 	b := make([]byte, 0, 2048)
 	b = appendBytesField(b, reqFieldMetadata, buildClientMetadata(token))
@@ -243,8 +392,17 @@ func buildChatRequest(token, model, sessionID string, msgs []channel.Message, ma
 	b = appendStringField(b, reqFieldSessionID, sessionID)
 	b = appendVarintField(b, reqFieldConst20, 1)
 	b = appendStringField(b, reqFieldModel, model)
+	for _, tool := range tools {
+		if td := buildToolDef(tool); td != nil {
+			b = appendBytesField(b, reqFieldTools, td)
+		}
+	}
 	return b
 }
+
+// toolsGuardSystem 是「有工具但没 system 提示词」时的兜底 system。
+// 文案照抄参考实现 devin-connect.js:1241。
+const toolsGuardSystem = "You are a helpful assistant. Use the available tools when appropriate."
 
 // buildUserStatusRequest 组装 GetUserStatusRequest（unary，字段 #1 = ClientMetadata）。
 func buildUserStatusRequest(token string) []byte {
@@ -266,10 +424,11 @@ func buildUserStatusRequest(token string) []byte {
 //     带 tool_calls / tool_result 的消息**不合并** —— 那是有结构的轮，合并会改语义。
 //  3. 空的 assistant 轮直接丢掉（上游对空 assistant 文本不友好），但 user 轮照发。
 //
-// 说明：走 toolshim 时，网关已经把 tools 定义并进一条 system 消息、把工具历史
-// 改写成纯文本了（internal/toolshim.BuildRequest）。这里再兜一层 role=tool 与
-// assistant.tool_calls 的降级，是为了「客户端只发工具历史、不发 tools」这种
-// toolshim 不介入的情况（那时 role=tool 会原样到这里）。
+// 工具历史走**原生**编码（与参考实现的 nativeToolCall 分支一致，devin-connect.js:1146-1219）：
+//   - assistant 带 tool_calls → 先发一条纯文本 source=2（若有正文），再为每个 call 发一条
+//     只带 #6 的 source=2；两者都不降级成文本（降级会让模型看不懂自己调过什么）。
+//   - role=tool 且带 tool_call_id → source=4 的 tool_result 轮（文本进 #3，id 进 #7）。
+//     **没有 id** 的 tool 消息无法与调用对上号，才退化成 user 文本（参考实现同款兜底）。
 func packMessages(msgs []channel.Message) (system string, out [][]byte) {
 	var systems []string
 	merged := make([]channel.Message, 0, len(msgs))
@@ -306,24 +465,29 @@ func packMessages(msgs []channel.Message) (system string, out [][]byte) {
 		text := trimSpace(m.Content)
 		switch m.Role {
 		case "assistant":
-			// 把残留的结构化工具调用降级成可读文本（正常情况已被 toolshim 处理）。
 			if len(m.ToolCalls) > 0 {
-				text = foldToolCalls(text, m.ToolCalls)
+				if text != "" {
+					out = append(out, buildChatMessage(sourceAssistant, text))
+				}
+				for _, tc := range m.ToolCalls {
+					out = append(out, buildToolCallMessage(tc))
+				}
+				continue
 			}
 			if text == "" {
 				continue // 空 assistant 轮：丢掉
 			}
 			out = append(out, buildChatMessage(sourceAssistant, text))
 		case "tool":
-			// 工具结果没有独立 role：拼成 user 文本并保留调用 id，模型才对得上号。
-			label := "[tool result"
 			if m.ToolCallID != "" {
-				label += " for " + m.ToolCallID
+				out = append(out, buildToolResultMessage(m.ToolCallID, text))
+				continue
 			}
+			// 没有 id：对不上是哪次调用，只能退化成 user 文本。
 			if text == "" {
 				text = "[空结果]"
 			}
-			out = append(out, buildChatMessage(sourceUser, label+"]: "+text))
+			out = append(out, buildChatMessage(sourceUser, "[tool result]: "+text))
 		default:
 			// user（以及任何未知 role 的降级）：原样作为 user 轮。
 			out = append(out, buildChatMessage(sourceUser, text))
@@ -340,20 +504,139 @@ func sameTextTurn(m channel.Message) bool {
 	return len(m.ToolCalls) == 0 && m.ToolCallID == ""
 }
 
-// foldToolCalls 把 assistant 的 tool_calls 降级成文本标记（toolshim 不介入时的兜底）。
-func foldToolCalls(text string, calls []channel.ToolCall) string {
-	parts := make([]string, 0, len(calls)+1)
-	if text != "" {
-		parts = append(parts, text)
+// ---------------------------------------------------------------------------
+// ToolDef 参数 schema 规整（参考实现 normalizeToolSchema 的移植）
+// ---------------------------------------------------------------------------
+
+// normalizeToolSchema 把一个 OpenAI/MCP 形态的 function parameters JSON Schema 规整成
+// 上游能接受、且不触发 MCP 指纹拦截的最小合法形状。
+//
+// 逐条对齐参考实现 WindsurfAPI/src/devin-connect.js:462-548：
+//   - 非对象 / 数组 / null → 规范的 {type:"object", properties:{}}（:463-466）；
+//   - 丢 $schema 元键（上游 schema 从不带它，:468-469）；
+//   - 顶层 oneOf/anyOf/allOf 组合子：删掉，并在原本没有 properties 时，从第一个
+//     type:object 变体里回收 properties/required/additionalProperties/description
+//     （:495-530）——否则把裸组合子硬压成空对象会丢掉真实参数；
+//   - 强制 type=object、properties 是对象（:476-481）；
+//   - required 必须是「只含真实属性名的 string[]」，否则整个删掉（:482-491）；
+//   - 最后递归去掉所有 description 注解（名叫 description 的属性保留，:532-548）。
+//
+// 入参用 any（不假定形状）：客户端发的 schema 可能是任意 JSON，全部按 map/slice 走。
+func normalizeToolSchema(schema any) any {
+	obj, ok := schema.(map[string]any)
+	if !ok || obj == nil {
+		return map[string]any{"type": "object", "properties": map[string]any{}}
 	}
-	for _, tc := range calls {
-		args := trimSpace(tc.Function.Arguments)
-		if args == "" {
-			args = "{}"
+	out := make(map[string]any, len(obj))
+	for k, v := range obj {
+		out[k] = v
+	}
+	delete(out, "$schema")
+	stripTopLevelCombinators(out)
+	if t, _ := out["type"].(string); t != "object" {
+		out["type"] = "object"
+	}
+	if props, ok := out["properties"].(map[string]any); !ok || props == nil {
+		out["properties"] = map[string]any{}
+	}
+	if req, ok := out["required"]; ok {
+		arr, isArr := req.([]any)
+		if !isArr {
+			delete(out, "required")
+		} else {
+			props := out["properties"].(map[string]any)
+			kept := make([]any, 0, len(arr))
+			for _, r := range arr {
+				name, isStr := r.(string)
+				if !isStr {
+					continue
+				}
+				if _, exists := props[name]; exists {
+					kept = append(kept, name)
+				}
+			}
+			if len(kept) > 0 {
+				out["required"] = kept
+			} else {
+				delete(out, "required")
+			}
 		}
-		parts = append(parts, "[called tool "+tc.Function.Name+" with "+args+"]")
 	}
-	return joinNonEmpty(parts, "\n")
+	return stripSchemaDescriptions(out, false)
+}
+
+// stripTopLevelCombinators 就地删掉顶层 oneOf/anyOf/allOf，并（仅在根上没有自己的
+// properties 时）从第一个 type:object 变体里回收真实参数。与参考实现 or_insert 语义
+// 一致：绝不用变体覆盖根上已有的键（devin-connect.js:505-530）。
+func stripTopLevelCombinators(out map[string]any) {
+	_, hadProps := out["properties"]
+	recovered := false
+	for _, key := range []string{"oneOf", "anyOf", "allOf"} {
+		variants, ok := out[key].([]any)
+		if !ok {
+			continue
+		}
+		delete(out, key)
+		if hadProps || recovered {
+			continue
+		}
+		for _, v := range variants {
+			ov, ok := v.(map[string]any)
+			if !ok {
+				continue
+			}
+			if t, _ := ov["type"].(string); t != "object" {
+				continue
+			}
+			for _, field := range []string{"properties", "required", "additionalProperties", "description"} {
+				if _, has := out[field]; has {
+					continue
+				}
+				if val, exists := ov[field]; exists {
+					out[field] = val
+				}
+			}
+			recovered = true
+			break
+		}
+	}
+}
+
+// stripSchemaDescriptions 递归去掉 schema 注解里的 description。
+//
+// 只删「和 type/properties/required 同级的注解 description」，保留名字就叫 description
+// 的**属性**（真实参数，如 Cursor 的 Task 工具有一个 description 属性）——靠 inProperties
+// 区分层次。数组元素按参考实现重置为 false（devin-connect.js:539-548）。
+func stripSchemaDescriptions(value any, inProperties bool) any {
+	switch v := value.(type) {
+	case []any:
+		out := make([]any, len(v))
+		for i := range v {
+			out[i] = stripSchemaDescriptions(v[i], false)
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for k, child := range v {
+			if k == "description" && !inProperties {
+				continue
+			}
+			out[k] = stripSchemaDescriptions(child, k == "properties")
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+// mustJSON 序列化规整后的 schema。规整后是纯 map/slice/标量，不可能失败；真失败了
+// 也返回一个空对象 schema，绝不 panic（这是请求构造热路径）。
+func mustJSON(v any) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return []byte("{}")
+	}
+	return b
 }
 
 func joinNonEmpty(parts []string, sep string) string {

@@ -72,6 +72,13 @@ func writeErrFromErr(w http.ResponseWriter, err error) {
 	e := errs.New(k, "上游请求失败")
 	if ee, ok := err.(*errs.Error); ok {
 		e = ee
+	} else if err != nil {
+		// 非结构化错误（适配器/底层库漏归一的那些）也要把**原话**带出去。
+		// 只回一句「上游请求失败」等于把原因吞掉：实测 TraeWork 额度耗尽时，
+		// 上游原话「Your requests have exceeded the quota.」就是这样被换成一句
+		// 无从定位的 Parse 的（红线一：失败必带原因）。
+		text := truncate(err.Error(), 300)
+		e = errs.New(k, "上游请求失败："+text).WithUpstream(text)
 	}
 	code := httpStatusFor(k)
 	writeJSON(w, code, errPayload(e))
@@ -96,6 +103,11 @@ func writeSSEErr(w http.ResponseWriter, err error, flush func()) {
 		if ee.Upstream != "" {
 			payload["error"].(map[string]any)["upstream"] = ee.Upstream
 		}
+	} else if err != nil {
+		// 同上：非结构化错误也要带原话，否则客户端只看到「上游流式错误」。
+		text := truncate(err.Error(), 300)
+		payload["error"].(map[string]any)["message"] = "上游流式错误：" + text
+		payload["error"].(map[string]any)["upstream"] = text
 	}
 	raw, _ := json.Marshal(payload)
 	_, _ = w.Write([]byte("data: " + string(raw) + "\n\n"))

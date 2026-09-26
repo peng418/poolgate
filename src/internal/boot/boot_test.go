@@ -104,9 +104,13 @@ func TestSpecsAreHonest(t *testing.T) {
 		{channel.Antigravity, true, false, true, true, channel.CategoryChat},
 		// iFlow 上游流式/非流式都支持，所以不声明 SSEOnly（非流式请求直接透传）
 		{channel.IFlow, true, false, false, true, channel.CategoryChat},
-		// ChatGPT 网页版 / Windsurf：都没有可靠的原生工具调用 → toolshim
+		// ChatGPT 网页版：没有可靠的原生工具调用 → toolshim
 		{channel.ChatGPT, false, true, true, true, channel.CategoryChat},
-		{channel.Windsurf, false, true, true, true, channel.CategoryCoding},
+		// Windsurf：参考实现已用**付费实弹标定**了 ToolDef 的内部 tag
+		// （WindsurfAPI/src/devin-connect.js 的 DEFAULT_DEF_TAGS：outer #10 / name=1 /
+		// description=2 / parameters=3，2026-07-04 opus-4-8 实弹确认）→ 走原生工具调用
+		// （请求 #10、响应 #6 ChatToolCall），不再是 toolshim 模拟。
+		{channel.Windsurf, true, false, true, true, channel.CategoryCoding},
 	}
 	for _, c := range cases {
 		got, ok := registry.GetSpec(c.kind)

@@ -30,7 +30,9 @@ func packMessages(msgs []channel.Message) string {
 		texts = append(texts, t)
 	}
 	if len(texts) < 2 {
-		return strings.Join(texts, "\n")
+		// 参考实现透传分支的原文是 `content + \`${message.content}\n\``（chat.ts:827-835），
+		// 段末带一个换行 —— 这是真正发给上游的 text 字节，照抄。
+		return strings.Join(texts, "\n") + "\n"
 	}
 
 	var b strings.Builder
@@ -177,9 +179,9 @@ func (s *streamState) render() (string, string) {
 			if m == nil {
 				continue
 			}
-			// meta_data 放 item 级还是 part 级，参考实现里两处写法不一致（一处从 part 取、
-			// 一处从 item 取）—— 我们没有真实抓包可判，所以**两级都认**：
-			// 认错级别的表现是「检索结果凭空消失」，多认一级比漏认便宜得多。
+			// 参考实现一律从 **part 级** 取 meta_data（chat.ts:1118、1321 `const { content, meta_data } = part`），
+			// item 级它没看过。我们在 part 级为空时额外认一次 item 级：纯属防御性放宽 ——
+			// 认错级别的表现是「检索结果凭空消失」，多认一级不会把对的读错（item 级只在 part 级缺失时生效）。
 			meta := mergeMeta(pmeta, itemMeta(m))
 			switch typ, _ := m["type"].(string); typ {
 			case "text":
@@ -192,11 +194,17 @@ func (s *streamState) render() (string, string) {
 					tb.WriteString("\n```\n")
 				}
 			case "execution_output":
-				if status == "finish" {
-					tb.WriteString(str(m["content"]) + "\n")
+				// 参考实现要求 content 是字符串、且 part 已 finish（chat.ts:1215-1220）——
+				// 少了字符串判断，非字符串的 content 会被拼成 "undefined" 喂给客户端。
+				if out, ok := m["content"].(string); ok && status == "finish" {
+					tb.WriteString(out + "\n")
 				}
 			case "image":
-				tb.WriteString(s.renderImages(m))
+				// 参考实现要求该 part 已经 finish 才渲染图片（chat.ts:1210 `type=="image" && isArray(image) && part.status=="finish"`）：
+				// 生成中的占位图不该发给客户端。
+				if status == "finish" {
+					tb.WriteString(s.renderImages(m))
+				}
 			case "tool_result":
 				rb.WriteString(searchLines(meta, "tool_result_extra"))
 			case "quote_result":
@@ -218,6 +226,10 @@ func (s *streamState) render() (string, string) {
 
 // collectSearchRefs 先把所有联网检索结果收集起来，供正文里的引用标记替换用。
 // 同样要两级都看（见 mergeMeta 的说明）。
+//
+// 索引键用 `match_key`：参考实现 chat.ts:1301-1305 就是 `if (res.match_key) searchMap.set(res.match_key, res)`，
+// 而正文里的标记形态是 `turn\d+[a-zA-Z]+\d+` —— 两边对得上才说明 match_key 就是这个标记本身。
+// （`id` 作为兜底：我们先前只认 id，没有证据支持，保留它不会误伤 match_key 命中的情形。）
 func (s *streamState) collectSearchRefs() {
 	for _, id := range s.order {
 		part := s.parts[id]
@@ -239,7 +251,10 @@ func (s *streamState) collectSearchRefs() {
 				if rm == nil {
 					continue
 				}
-				key, _ := rm["id"].(string)
+				key, _ := rm["match_key"].(string)
+				if key == "" {
+					key, _ = rm["id"].(string)
+				}
 				if key == "" {
 					continue
 				}
@@ -329,7 +344,10 @@ func (s *streamState) renderImages(m map[string]any) string {
 	return b.String() + "\n"
 }
 
-// searchLines 把检索结果渲染成「> 检索 标题(链接)」的引用行（进思考流，不进正文）。
+// searchLines 把检索结果渲染成「> 检索 标题(链接) ...」的引用行（进思考流，不进正文）。
+//
+// 行尾那个 ` ...` 是参考实现的原文（chat.ts:1168、1176 模板串 `> 检索 ${v.title}(${v.url}) ...\n`），
+// 照抄 —— 它是展示给用户的思考流内容，不留神会被当成我们自己的省略号而删掉。
 //
 // 两种 item 的嵌套层级不一样，别写成一个（写错的表现是「检索结果凭空消失」）：
 //   - tool_result：meta_data.tool_result_extra.**search_results**[]（多一层对象）
@@ -354,7 +372,7 @@ func searchLines(meta map[string]any, key string) string {
 		}
 		title, _ := rm["title"].(string)
 		url, _ := rm["url"].(string)
-		b.WriteString("> 检索 " + title + "(" + url + ")\n")
+		b.WriteString("> 检索 " + title + "(" + url + ") ...\n")
 	}
 	return b.String()
 }

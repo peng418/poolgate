@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"poolgate/internal/channel"
 	"poolgate/internal/errs"
@@ -282,6 +283,42 @@ func TestChatEmptyUpstreamStreamIsError(t *testing.T) {
 	}
 	if !strings.Contains(w2.Body.String(), "Parse") {
 		t.Fatalf("非流式空流应带结构化 kind，实际 %s", w2.Body.String())
+	}
+}
+
+// 上游「有帧、没内容」也要判失败：适配器认不出新帧形态时，流里照样有帧、照样正常结束。
+// chatgpt 网页渠道 2026-09-26 就是这样整轮空的（客户端拿到空的 200 + stop，以为模型没话说）。
+func TestChatFramesWithoutContentAreError(t *testing.T) {
+	// 只带 role 与 finish_reason 的帧：形状合法、内容为零。
+	empty := channel.ChatCompletionChunk{ID: "chatcmpl-1", Model: "qwen3.8-max"}
+	var ch0 channel.ChunkChoice
+	ch0.Delta.Role = "assistant"
+	ch0.FinishReason = "stop"
+	empty.Choices = append(empty.Choices, ch0)
+
+	ch := &fakeChannel{
+		kind: channel.QoderCN,
+		spec: channel.Spec{Kind: channel.QoderCN, Status: channel.Active},
+		chat: func(ctx context.Context, c *channel.Credential, req channel.ChatRequest) (channel.Stream, error) {
+			return &sliceStream{chunks: []channel.ChatCompletionChunk{empty}}, nil
+		},
+	}
+	srv, _ := newTestGateway(t, ch, true)
+
+	// 流式：必须写错误帧，而不是发个空 delta 再 [DONE]。
+	w := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, chatReqBody(t, "qodercn/qwen3.8-max", true))
+	body := w.Body.String()
+	if !strings.Contains(body, "空帧") || !strings.Contains(body, "Parse") {
+		t.Fatalf("只有空帧时必须回错误帧，实际 %s", body)
+	}
+
+	// 非流式：同样不能是 content 为空的 200。
+	srv2, _ := newTestGateway(t, ch, true)
+	w2 := httptest.NewRecorder()
+	srv2.Routes().ServeHTTP(w2, chatReqBody(t, "qodercn/qwen3.8-max", false))
+	if w2.Code < 400 || !strings.Contains(w2.Body.String(), "空内容") {
+		t.Fatalf("非流式空内容应返回错误，实际 %d body=%s", w2.Code, w2.Body.String())
 	}
 }
 
@@ -789,5 +826,59 @@ func TestToolsShimChannel(t *testing.T) {
 	}
 	if out.Choices[0].FinishReason != "tool_calls" {
 		t.Fatalf("finish_reason 应为 tool_calls，got %q", out.Choices[0].FinishReason)
+	}
+}
+
+// stallStream 在 release 被关闭前一直阻塞（模拟上游长时间不出字）。
+type stallStream struct {
+	release chan struct{}
+	sent    bool
+}
+
+func (s *stallStream) Next() (channel.ChatCompletionChunk, error) {
+	<-s.release
+	if s.sent {
+		return channel.ChatCompletionChunk{}, io.EOF
+	}
+	s.sent = true
+	return chunk("好"), nil
+}
+func (s *stallStream) Close() error { return nil }
+
+// 上游长时间不出字时，网关必须发 SSE 保活注释帧。
+//
+// 为什么：思考型档位（豆包深度思考、TraeWork 长推理）在出字前可能静默几十秒，
+// 夹在中间的 nginx/飞牛网关/CDN 会按空闲超时把连接掐掉，客户端表现成「莫名其妙断开」。
+// 参考实现 doubao2api（新版）为此专门发 `: keep-alive` 注释帧。
+// 注释帧以 `:` 开头，按 SSE 规范客户端必须忽略，正文不受影响。
+func TestStreamSendsHeartbeatWhileWaitingUpstream(t *testing.T) {
+	release := make(chan struct{})
+	ch := &fakeChannel{
+		kind: channel.QoderCN,
+		spec: channel.Spec{Kind: channel.QoderCN, Status: channel.Active},
+		chat: func(ctx context.Context, c *channel.Credential, req channel.ChatRequest) (channel.Stream, error) {
+			return &stallStream{release: release}, nil
+		},
+	}
+	srv, _ := newTestGateway(t, ch, true)
+	srv.heartbeat = 20 * time.Millisecond // 测试里把间隔调小，别真等 15 秒
+
+	go func() {
+		time.Sleep(90 * time.Millisecond)
+		close(release)
+	}()
+	w := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, chatReqBody(t, "qodercn/qwen3.8-max", true))
+
+	body := w.Body.String()
+	if !strings.Contains(body, ": keep-alive") {
+		t.Fatalf("等上游期间应发保活注释帧，got %q", body)
+	}
+	if !strings.Contains(body, "好") || !strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("保活之后正文仍要正常透传，got %q", body)
+	}
+	// 保活帧必须排在正文之前（说明它是「等待期间」发出来的）。
+	if strings.Index(body, ": keep-alive") > strings.Index(body, "好") {
+		t.Fatalf("保活帧应在正文之前，got %q", body)
 	}
 }

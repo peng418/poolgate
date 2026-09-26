@@ -105,9 +105,11 @@ func (a *Adapter) Models(context.Context, *channel.Credential) ([]channel.ModelI
 			name += "（" + m.Note + "）"
 		}
 		out = append(out, channel.ModelInfo{
-			ID:            m.ID,
-			DisplayName:   name,
-			ContextWindow: 131072,
+			ID:          m.ID,
+			DisplayName: name,
+			// 参考实现 default 档 max_input_tokens = 1048576（src/config.rs:231-233）。
+			// 之前填的 131072 是臆造值，对齐到参考实现。
+			ContextWindow: 1048576,
 			Source:        channel.SourceLocal,
 			Tools:         channel.CapYes, // 客户端可用（由网关模拟）
 			Reasoning:     channel.CapYes,
@@ -148,15 +150,18 @@ func (a *Adapter) Chat(ctx context.Context, c *channel.Credential, req channel.C
 		a.deleteSession(c, session)
 		return nil, err
 	}
+	// parent_message_id：参考实现是 `Option<i64>` + `skip_serializing_if = "Option::is_none"`
+	// （client.rs:252-253），首轮**整个字段省略**，而不是发一个 `null`。
+	// 空值形态不一致可能被上游当成非法参数（豆包 710020202 common invalid param 的教训）；
+	// 我们每轮都新建会话，parent_message_id 恒为首轮 → 不写这个键。
 	body, _ := json.Marshal(map[string]any{
-		"chat_session_id":   session,
-		"parent_message_id": nil,
-		"model_type":        typ,
-		"prompt":            packMessages(req.Messages),
-		"ref_file_ids":      []any{},
-		"thinking_enabled":  think,
-		"search_enabled":    false,
-		"preempt":           false,
+		"chat_session_id":  session,
+		"model_type":       typ,
+		"prompt":           packMessages(req.Messages),
+		"ref_file_ids":     []any{},
+		"thinking_enabled": think,
+		"search_enabled":   false,
+		"preempt":          false,
 	})
 	resp, err := a.do(ctx, c, http.MethodPost, a.base+"/chat/completion", body, header)
 	if err != nil {
@@ -368,6 +373,13 @@ func bizError(raw []byte, what string) error {
 		// 信封级 40003「Authorization Failed (invalid token)」= userToken 已失效
 		// （改密码/被下线都会让老 token 变这样）→ SessionDead，让用户重新粘一次。
 		kind = errs.SessionDead
+	case env.Code == 1001, env.Code == 1201:
+		// 参考实现 response.rs:644-648：信封级 1001/1201 是上游过载/限流 → 当归 SoftRate。
+		kind = errs.SoftRate
+	case env.Code == 40301:
+		// 参考实现 response.rs:646：40301 = INVALID_POW_RESPONSE（PoW 没通过）。
+		// 这是上游判定我们的求解结果无效（不是账号坏），归 UpstreamFault。
+		kind = errs.UpstreamFault
 	case env.Data.BizCode == 10:
 		kind = errs.SessionDead // USER_IS_BANNED
 	case env.Data.BizCode == 5:
@@ -463,40 +475,56 @@ func (s *stream) pump() {
 	br := bufio.NewReaderSize(s.rc, 256*1024)
 	state := &patchState{}
 	var event, data strings.Builder
-	flush := func() {
+
+	// raw 保留流开头的一小段原文，只用于「一个有效帧都没解析出来」时把上游原话带出去
+	// —— 参考实现 request.rs:654-684 在空流时就是回头翻已收到的字节找 biz_code / JSON 信封。
+	const rawCap = 8 << 10
+	var raw strings.Builder
+	sawSignal := false
+
+	// flush 返回 true 表示应立刻停止读取（上游已通过 hint 明确报错）。
+	flush := func() bool {
 		ev := strings.TrimSpace(event.String())
 		payload := strings.TrimSpace(data.String())
 		event.Reset()
 		data.Reset()
 		if payload == "" {
-			return
+			return false
 		}
 		var val map[string]any
 		if json.Unmarshal([]byte(payload), &val) != nil {
-			return
+			return false
 		}
-		// hint = 上游的提示/错误通道（限流、超长等都在这里）
+		// hint = 上游的提示/错误通道（限流、超长等都在这里）。参考实现把**任何** hint 帧
+		// 都当错误、并立即终止（response.rs:143-146 + hint_to_error:511-526），不能静默放过。
 		if ev == "hint" {
-			if h := hintError(val); h != nil {
-				s.ch <- chunkOrErr{err: h}
-			}
-			return
+			s.ch <- chunkOrErr{err: hintError(val, payload)}
+			return true
 		}
 		think, content, finished := state.feed(val)
 		if think != "" || content != "" || finished {
+			sawSignal = true
 			s.ch <- chunkOrErr{chunk: chunkOf(s.model, think, content, finished)}
 		}
+		return false
 	}
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil && err != io.EOF {
-			s.ch <- chunkOrErr{err: err}
+			// 读流中断也必须给结构化错误（普通 error 会被网关换成通用文案，红线一）。
+			s.ch <- chunkOrErr{err: errs.New(errs.Transport, "读取上游流失败").
+				WithChannel(string(channel.DeepSeek)).WithCause(err)}
 			return
+		}
+		if raw.Len() < rawCap {
+			raw.WriteString(line)
 		}
 		trimmed := strings.TrimRight(line, "\r\n")
 		switch {
 		case trimmed == "":
-			flush()
+			if flush() {
+				return
+			}
 		case strings.HasPrefix(trimmed, "event:"):
 			event.WriteString(strings.TrimSpace(strings.TrimPrefix(trimmed, "event:")))
 		case strings.HasPrefix(trimmed, "data:"):
@@ -506,27 +534,78 @@ func (s *stream) pump() {
 			data.WriteString(strings.TrimPrefix(trimmed, "data:"))
 		}
 		if err == io.EOF {
-			flush()
+			if flush() {
+				return
+			}
+			// 一个有效帧都没产出：上游多半是「HTTP 200 + JSON 业务错误信封」（DeepSeek 的业务
+			// 错误就藏在 200 里）。必须把上游原话（biz_code/biz_msg 或 code/msg）带出去，
+			// 否则网关只能回一句通用的「上游返回空流」，原话整句丢失（红线一，TraeWork 教训）。
+			if !sawSignal {
+				s.ch <- chunkOrErr{err: streamEnvelopeError(raw.String())}
+			}
 			return
 		}
 	}
 }
 
-// hintError 把 hint 帧里的错误转成可读错误（限流/超长最常见）。
-func hintError(val map[string]any) error {
+// hintError 把 hint 帧归一成结构化错误（限流/超长最常见）。
+//
+// 对齐参考实现 hint_to_error（response.rs:511-526）：优先看 content、其次 finish_reason；
+// 两者都取不到时也用**原文**兜底，而不是返回 nil 把这一帧丢掉 —— hint 帧本身就是失败信号。
+func hintError(val map[string]any, payload string) error {
 	content, _ := val["content"].(string)
 	fr, _ := val["finish_reason"].(string)
-	if content == "" && fr == "" {
-		return nil
-	}
+	detail := firstNonEmpty(content, fr, truncate(payload, 200))
+	lower := strings.ToLower(detail)
 	kind := errs.UpstreamFault
 	switch {
-	case strings.Contains(fr, "rate_limit"), strings.Contains(content, "rate limit"):
+	case strings.Contains(lower, "rate_limit"), strings.Contains(lower, "rate limit"):
 		kind = errs.SoftRate
-	case strings.Contains(fr, "input_exceeds_limit"), strings.Contains(content, "too long"):
+	case strings.Contains(lower, "input_exceeds_limit"), strings.Contains(lower, "too long"):
 		kind = errs.PromptTooLong
 	}
-	return errs.New(kind, "上游提示："+firstNonEmpty(content, fr)).WithChannel(string(channel.DeepSeek))
+	return errs.New(kind, "上游提示："+detail).WithChannel(string(channel.DeepSeek)).
+		WithUpstream(truncate(payload, 200))
+}
+
+// streamEnvelopeError 在「整条流没有任何有效 patch 帧」时，从原文里挖出上游错误信封。
+//
+// 对齐参考实现 request.rs:654-684 的兜底：先逐行找 JSON（SSE 的 `data:` 行或整包 JSON），
+// 有 biz_code/code 就用 bizError 归一（保留上游原话）；挖不到才认账为空流（Parse），
+// 但同样把原文摘要带上 —— 不猜、不静默。这条路径专门解决「HTTP 200 + 业务错误码」：
+// HTTP 层看不出失败（见 Classify 注释），以前会被当成「成功但没内容」。
+func streamEnvelopeError(raw string) error {
+	raw = strings.TrimSpace(raw)
+	var cands []string
+	for _, ln := range strings.Split(raw, "\n") {
+		ln = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(ln), "data:"))
+		if strings.HasPrefix(ln, "{") {
+			cands = append(cands, ln)
+		}
+	}
+	if strings.HasPrefix(raw, "{") {
+		cands = append(cands, raw)
+	}
+	for _, c := range cands {
+		var env struct {
+			Code int `json:"code"`
+			Data *struct {
+				BizCode int `json:"biz_code"`
+			} `json:"data"`
+		}
+		if json.Unmarshal([]byte(c), &env) != nil {
+			continue
+		}
+		if env.Code != 0 || (env.Data != nil && env.Data.BizCode != 0) {
+			return bizError([]byte(c), "上游流内错误")
+		}
+	}
+	msg := "上游返回空流（HTTP 200 但没有任何内容）"
+	if raw != "" {
+		msg = "上游响应不是可解析的 patch 流"
+	}
+	return errs.New(errs.Parse, msg).WithChannel(string(channel.DeepSeek)).
+		WithUpstream(truncate(raw, 200))
 }
 
 func (s *stream) Next() (channel.ChatCompletionChunk, error) {

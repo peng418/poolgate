@@ -288,12 +288,17 @@ func (a *Adapter) fetchDeviceToken(ctx context.Context, refreshToken string) (st
 
 type chatModesResp struct {
 	Qwork []struct {
-		Key           string  `json:"key"`
-		PriceFactor   float64 `json:"price_factor"`
-		Enable        bool    `json:"enable"`
-		IsReasoning   bool    `json:"is_reasoning"`
-		IsVL          bool    `json:"is_vl"`
-		MaxInputToken int     `json:"max_input_tokens"`
+		Key         string  `json:"key"`
+		PriceFactor float64 `json:"price_factor"`
+		Enable      bool    `json:"enable"`
+		IsReasoning bool    `json:"is_reasoning"`
+		IsVL        bool    `json:"is_vl"`
+		// DisplayName 是**扁平**字段。实测上游 /api/chat-modes 返回的档位形如
+		// {"key":"flash","display_name":"标准",...}（wild-work 备忘 §6.4 的实测报文，
+		// 它的 modelEntry 也是按扁平 display_name 解析的）。只解析嵌套的
+		// i18n.display_name 会取不到值，面板上就会把 key（pro/flash）当展示名。
+		DisplayName   string `json:"display_name"`
+		MaxInputToken int    `json:"max_input_tokens"`
 		I18n          struct {
 			DisplayName map[string]string `json:"display_name"`
 		} `json:"i18n"`
@@ -318,9 +323,13 @@ func (a *Adapter) Models(ctx context.Context, c *channel.Credential) ([]channel.
 		if !m.Enable || m.Key == "" {
 			continue
 		}
+		// 展示名优先级：i18n.zh（若上游确实给了）→ 扁平 display_name（实测口径）→ key。
+		// 兜底顺序照 wild-work 的 displayName()：i18n 缺失时回退 display_name。
 		name := m.Key
 		if n := m.I18n.DisplayName["zh"]; n != "" {
 			name = n
+		} else if m.DisplayName != "" {
+			name = m.DisplayName
 		}
 		mi := channel.ModelInfo{
 			ID:            m.Key,
@@ -366,7 +375,9 @@ func (a *Adapter) Balance(ctx context.Context, c *channel.Credential) (channel.B
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &resp); err != nil {
-		return channel.Balance{}, errs.New(errs.Parse, "余额响应无法解析").WithCause(err).WithChannel("qwenwork")
+		// 带上游原话（红线一：账户类错误必须能定位到上游说了什么）。
+		return channel.Balance{}, errs.New(errs.Parse, "余额响应无法解析").
+			WithCause(err).WithChannel("qwenwork").WithUpstream(truncate(string(raw), 300))
 	}
 	if resp.Code != "ok" {
 		return channel.Balance{Known: false}, nil
@@ -624,6 +635,14 @@ func (s *wsStream) handleFrame(raw []byte) bool {
 		})
 		return false
 	}
+	// JSON-RPC 的错误有两种帧形态：错误通知（method="error"）与错误响应
+	// （只有 id + error，没有 method）。这里按 spec 在 method 分派之前统一判 error，
+	// 否则错误响应会被当成无关帧丢掉，用户最终只等到一条通用的「连接中断/超时」文案，
+	// 上游原话（红线一）就没了 —— 与 TraeWork 流内错误未归一导致文案被网关换掉是同一类问题。
+	if env.Error != nil {
+		s.fail(s.classifyRPC(env.Error.Code, env.Error.Message))
+		return true
+	}
 	switch env.Method {
 	case "session/update":
 		s.emitUpdate(env.Params)
@@ -638,11 +657,6 @@ func (s *wsStream) handleFrame(raw []byte) bool {
 			if p.SessionStatus == "idle" && s.started {
 				return true
 			}
-		}
-	case "error":
-		if env.Error != nil {
-			s.fail(s.classifyRPC(env.Error.Code, env.Error.Message))
-			return true
 		}
 	}
 	return false
@@ -737,15 +751,18 @@ func (s *wsStream) sendRaw(v any) error {
 }
 
 // classifyRPC 把上游 JSON-RPC 错误归一成 errs.Kind。
+// 标记词与 Classify 共用同一套（wild-work 的 hardMarkers 等），
+// 避免流内错误和 HTTP 错误对同一句上游原话给出不同分类。
 func (s *wsStream) classifyRPC(code int, msg string) error {
 	low := strings.ToLower(msg)
 	k := errs.UpstreamFault
 	switch {
-	case strings.Contains(low, "credits") || strings.Contains(low, "quota") ||
-		strings.Contains(low, "balance") || strings.Contains(low, "insufficient"):
+	case hasAnyMarker(low, hardMarkers):
 		k = errs.HardCredit
-	case strings.Contains(low, "rate") || strings.Contains(low, "too many"):
+	case hasAnyMarker(low, rateMarkers):
 		k = errs.SoftRate
+	case hasAnyMarker(low, contentBlockMarkers):
+		k = errs.ContentBlocked
 	case strings.Contains(low, "unauthor") || strings.Contains(low, "token") ||
 		strings.Contains(low, "expired") || code == 4001:
 		k = errs.SessionDead
@@ -770,7 +787,11 @@ func (a *Adapter) do(ctx context.Context, c *channel.Credential, method, path st
 	}
 	req, err := http.NewRequestWithContext(ctx, method, a.base+path, rdr)
 	if err != nil {
-		return nil, 0, errs.New(errs.Parse, "构造上游请求失败").WithCause(err).WithChannel("qwenwork")
+		// 构造请求失败属「本地/传输」范畴，不是「响应解析不了」。
+		// 归 Transport 与同文件 fetchDeviceToken（及全仓 http.NewRequestWithContext
+		// 失败的通行做法，如 chatglm/copilot/deepseek）一致；此前错标 Parse 会把
+		// 这类错误说成「上游回了看不懂的东西」，误导排查方向。
+		return nil, 0, errs.New(errs.Transport, "构造上游请求失败").WithCause(err).WithChannel("qwenwork")
 	}
 	req.Header.Set("Cookie", "token="+c.AccessToken)
 	req.Header.Set("User-Agent", userAgent)
@@ -796,28 +817,92 @@ func (a *Adapter) do(ctx context.Context, c *channel.Credential, method, path st
 	return raw, resp.StatusCode, nil
 }
 
+// 下列标记词表逐条对照 wild-work internal/qwenwork/client.go 的 Classify/hardMarkers
+// （真上游实测过的清单）。早期移植只留了几个英文宽匹配词，上游用中文措辞
+// （「积分不足」「余额不足」）或其它英文说法（"not enough credit"）时会被误判成 Parse
+// ——「上游故障」与「账号额度耗尽」在冷却策略上处置完全不同，分类错了会误杀好号（红线一）。
+var (
+	// hardMarkers 余额/权益不足。
+	hardMarkers = []string{
+		// wild-work hardMarkers 原表（含中文）。
+		"insufficient credit", "no credit", "credit exhausted", "out of credit",
+		"quota exceeded", "quota exhaust", "payment required", "credit not enough",
+		"not enough credit", "credit is not enough",
+		"积分不足", "额度不足", "余额不足", "积分用完", "额度用尽", "没有积分",
+		// 移植时原有的宽匹配词，保留以免回归。
+		"credits", "quota", "insufficient", "balance",
+	}
+	// rateMarkers 限流。429 之外，上游也常用 200/400 带这些文案回。
+	rateMarkers = []string{
+		"rate limit", "too many requests", "too many", "usage limit", "请求过于频繁",
+		// 同账号并发建会话被拒：限流性质，短冷却后重试即可，不算账号故障。
+		"concurrent_operation",
+	}
+	// contentBlockMarkers 内容拦截。marker 取自 wild-work Classify 的 400 分支。
+	contentBlockMarkers = []string{
+		"blocked by security policy", "content filter", "content blocked",
+		"检测到敏感内容", "敏感内容",
+	}
+	// promptTooLongMarkers 超出上下文窗口（wild-work Classify 同款判据）。
+	promptTooLongMarkers = []string{"prompt is too long", "context length", "maximum context"}
+)
+
+// hasAnyMarker 报告低文化后的 body 是否含任一标记词。
+func hasAnyMarker(low string, markers []string) bool {
+	for _, m := range markers {
+		if strings.Contains(low, m) {
+			return true
+		}
+	}
+	return false
+}
+
 // Classify 把上游错误归一成有限枚举（D4）。
+// 判定顺序与 wild-work 的 Classify 对齐：状态码先定「明确的」，再看 body 标记；
+// 403 先排除内容拦截，避免把「内容违规」当成账号失效去冷却好号。
 func (a *Adapter) Classify(status int, body []byte) errs.Kind {
 	low := strings.ToLower(string(body))
-	switch {
-	case status == 401 || status == 403:
+	// 402 Payment Required 直接是额度不足（wild-work client.go:622 首判）。
+	if status == http.StatusPaymentRequired {
+		return errs.HardCredit
+	}
+	// 401 是明确的登录态失效。
+	if status == http.StatusUnauthorized {
 		return errs.SessionDead
-	case status == 429:
+	}
+	// 403 不一定是账号问题：内容拦截也常用 403（wild-work 会先看 body 标记再归类）。
+	if status == http.StatusForbidden {
+		if hasAnyMarker(low, contentBlockMarkers) {
+			return errs.ContentBlocked
+		}
+		if hasAnyMarker(low, hardMarkers) {
+			return errs.HardCredit
+		}
+		return errs.SessionDead
+	}
+	// 429 优先于额度标记：限流响应常带 quota exceeded（wild-work 备忘 §6.15 的取舍）。
+	if status == http.StatusTooManyRequests {
 		return errs.SoftRate
-	case status >= 500:
+	}
+	// 5xx 是上游故障，先于 body 标记判定：body 里偶然出现 "balance"/"quota" 这类宽匹配词
+	// 也不能把服务端故障算到账号头上（记错账会冷却好号）。
+	if status >= 500 {
 		return errs.UpstreamFault
 	}
-	switch {
-	case strings.Contains(low, "credits") || strings.Contains(low, "quota") ||
-		strings.Contains(low, "insufficient") || strings.Contains(low, "balance"):
+	if hasAnyMarker(low, hardMarkers) {
 		return errs.HardCredit
-	case strings.Contains(low, "concurrent_operation"):
-		// 同账号并发建会话被拒：是限流性质，短冷却后重试即可，不算账号故障。
+	}
+	if hasAnyMarker(low, rateMarkers) {
 		return errs.SoftRate
-	case strings.Contains(low, "not available for this user"):
-		return errs.ModelUnavailable
-	case strings.Contains(low, "content") && strings.Contains(low, "block"):
+	}
+	if hasAnyMarker(low, contentBlockMarkers) {
 		return errs.ContentBlocked
+	}
+	if hasAnyMarker(low, promptTooLongMarkers) {
+		return errs.PromptTooLong
+	}
+	if strings.Contains(low, "not available for this user") {
+		return errs.ModelUnavailable
 	}
 	if status == 404 {
 		return errs.ModelUnavailable

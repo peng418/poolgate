@@ -159,7 +159,8 @@ func (a *Adapter) Refresh(ctx context.Context, c *channel.Credential) (*channel.
 	body, _ := json.Marshal(map[string]string{"refresh_token": c.RefreshToken})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.base+EpDTRefresh, strings.NewReader(string(body)))
 	if err != nil {
-		return nil, err
+		// 归一成 errs.Error：普通 error 到网关只会按兜底 Parse 处理（红线一）。
+		return nil, errs.New(errs.Transport, "构造刷新请求失败").WithAccount(c.UID).WithCause(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -221,7 +222,7 @@ func (a *Adapter) Models(ctx context.Context, c *channel.Credential) ([]channel.
 func (a *Adapter) Balance(ctx context.Context, c *channel.Credential) (channel.Balance, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.base+EpQuotaUsage, nil)
 	if err != nil {
-		return channel.Balance{}, err
+		return channel.Balance{}, errs.New(errs.Transport, "构造余额请求失败").WithAccount(c.UID).WithCause(err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.AccessToken)
 	req.Header.Set("Accept", "application/json")

@@ -180,12 +180,21 @@ func readVarint(buf []byte, off int) (uint64, int, error) {
 // 真重复了也只取先到的那个，不会把后到的当覆盖（protobuf 语义上是后者覆盖，
 // 但这条路上没有可重复的候选字段，二者等价）。
 func getBytes(fields []pfield, n int) []byte {
+	b, _ := getBytesOK(fields, n)
+	return b
+}
+
+// getBytesOK 同 getBytes，但额外报告「字段到底在不在」。
+//
+// 两者对 wire 2 不同：字段不存在与「存在但长度为 0」取到的都是空串，而工具调用里
+// 空字符串（比如 arguments_json 缺席）与「显式空值」语义不同 —— 需要区分时用这个。
+func getBytesOK(fields []pfield, n int) ([]byte, bool) {
 	for _, f := range fields {
 		if f.field == n && f.wire == wireBytes {
-			return f.bytes
+			return f.bytes, true
 		}
 	}
-	return nil
+	return nil, false
 }
 
 // getString 取第一个匹配的 wire 2 字段并按 UTF-8 解释。

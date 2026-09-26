@@ -15,7 +15,7 @@
 // 响应解析直接复用 channel.ParseOpenAIChunk。
 //
 // 为什么必须伪装成 VS Code 插件：Copilot 的 API 只对「官方客户端」开放，上游按请求头识别
-// 客户端（Copilot-Version / editor-version / user-agent / openai-intent / X-Initiator 等）。
+// 客户端（Copilot-Integration-Id / editor-version / user-agent / openai-intent / X-Initiator 等）。
 // 缺了这些头会被判为第三方调用而拒绝。这些版本号会随上游客户端更新而失效，见下面的版本常量。
 package copilot
 
@@ -59,7 +59,7 @@ const (
 // ---------------------------------------------------------------------------
 
 // copilotVersion 是伪装的 Copilot Chat 扩展版本，同时用于 user-agent
-// （GitHubCopilotChat/<v>）、editor-plugin-version（copilot-chat/<v>）与 Copilot-Version 头。
+// （GitHubCopilotChat/<v>）与 editor-plugin-version（copilot-chat/<v>）两个头。
 //
 // 参考实现（copilot-api）把编辑器版本**联网去 AUR 抓**（PKGBUILD 里的 pkgver），抓不到才回落到常量。
 // 我们**故意不联网抓**：一个渠道适配器不该在启动时去打第三个域名，而且抓来的版本照样会过期，
@@ -72,6 +72,34 @@ const vsCodeVersion = "1.104.3"
 
 // githubAPIVersion 是 x-github-api-version 头的取值（GitHub REST 的版本标识，不是凭证）。
 const githubAPIVersion = "2025-04-01"
+
+// ── 版本常量的交叉验证（2026-09，任务补充）──────────────────────────────────
+//
+// 上面这三个版本常量取自 copilot-api（最后一次提交 2025-10-05）。任务补充里更新的实现取值
+// **不一致**，按「各实现取值不同就【不】盲换」处理：原样保留 copilot-api 这一套，把各家取值与
+// 依据强度记在这里，供上游收紧时决策。
+//
+//	Copilot 客户端版本（user-agent / editor-plugin-version）：
+//	  copilot-api  0.26.7 / copilot-chat/0.26.7   ← 我们采用
+//	  BYOKEY       0.67.0 / copilot-chat/0.67.0（配 VS Code 1.139，2026-09-25 提交）
+//	  gpt4free     1.250.0 / copilot/1.250.0（注意是 copilot/，且明显过时）
+//	editor-version：
+//	  copilot-api  vscode/1.104.3  ← 我们采用（它启动时去 AUR 抓 PKGBUILD，抓不到才用这个兜底）
+//	  BYOKEY       vscode/1.139.0
+//	  gpt4free     vscode/1.95.0
+//	x-github-api-version：
+//	  copilot-api  两处（api.github.com 与 api.githubcopilot.com）都用 2025-04-01  ← 我们采用
+//	  BYOKEY       **分开**——api.github.com 用 2025-04-01（与我们一致）、
+//	               api.githubcopilot.com 用 2026-08-01
+//	  gpt4free     2024-12-15
+//	Copilot-Integration-Id：三家都是 vscode-chat（无分歧）。
+//
+// 依据强度：BYOKEY（crates/provider/src/executor/copilot/headers.rs:7-14,25-31）自称逐行对照
+// microsoft/vscode 1.139 与 @vscode/copilot-api 的 CAPIClient，provenance 最硬；copilot-api 是
+// 被广泛使用、仍在维护的代理，但它把同一份 GitHub 头也用在 chat 上，且 VS Code 版本是运行时抓的
+// （services/get-vscode-version.ts:1-31）。两者都无法证明对方取值已失效，而我们没有真上游样本，
+// 所以不换。上游若开始按客户端版本收紧（表现是 400/403 且报文提到版本），下一手是换成 BYOKEY 那一套
+// （VS Code 1.139 / copilot-chat 0.67.0，并把 chat 的 x-github-api-version 提到 2026-08-01）。
 
 // ---------------------------------------------------------------------------
 // 超时与节奏
@@ -133,17 +161,29 @@ func githubHeaders(githubToken string) map[string]string {
 // copilotHeaders 是打 api.githubcopilot.com 用的「伪装成 VS Code 插件」的头。
 //
 // 这些头不是可选项：上游按它们判断「这是不是官方客户端」。逐个都有出处 ——
-//   - Copilot-Version：Copilot 服务端的客户端版本校验；
 //   - copilot-integration-id: vscode-chat：标识走的是 VS Code 聊天面板这一路；
 //   - editor-version / editor-plugin-version / user-agent：VS Code 与插件版本（见上面的版本注释）；
 //   - openai-intent: conversation-panel：告诉上游这是聊天面板请求，而不是补全；
 //   - x-request-id：每次请求一个 UUID（参考实现如此，上游用它做链路追踪）。
+//
+// 注意这里**没有** Copilot-Version 头。0.5.0 移植时曾按记忆加过一个，逐字段核对参考实现后删掉：
+// copilot-api 的 copilotHeaders（src/lib/api-config.ts:20-37）和 gpt4free 的 get_headers
+// （g4f/Provider/github/GithubCopilot.py:202-208）都没有它，客户端版本是靠 Copilot-Integration-Id
+// 加 editor-plugin-version 一起表达的。多一个来源不明的头只会让请求看起来不像原版客户端 ——
+// 不要再加回来，除非参考实现里出现它。
+//
+// 交叉验证（2026-09，任务补充）：更近的 BYOKEY（crates/provider/src/executor/copilot/headers.rs:100-158
+// 配 device.rs:66-74）在 VS Code 档下**还多带**三个设备身份头 `vscode-sessionid`（uuid+毫秒）、
+// `vscode-machineid`（MAC 的 SHA-256，64 hex）、`editor-device-id`（uuid4），外加
+// `x-interaction-id` / `x-agent-task-id` / `x-interaction-type`；openai-intent 取 `conversation-agent`
+// （我们与 copilot-api 都用 `conversation-panel`）。copilot-api 与 gpt4free 都不发这些头且工作正常，
+// 说明**不是必需**；且伪造设备 ID 还牵扯「稳定、不与别号重复、不泄露凭证」的一堆细节
+// （BYOKEY 用 SHA256(salt+凭证) 派生），所以**暂不实现**，留作上游收紧时的候补。
 func copilotHeaders(copilotToken string) map[string]string {
 	return map[string]string{
 		"Authorization":                       "Bearer " + copilotToken,
 		"Content-Type":                        "application/json",
 		"Accept":                              "application/json",
-		"Copilot-Version":                     copilotVersion,
 		"Copilot-Integration-Id":              "vscode-chat",
 		"Editor-Version":                      "vscode/" + vsCodeVersion,
 		"Editor-Plugin-Version":               "copilot-chat/" + copilotVersion,

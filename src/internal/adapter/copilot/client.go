@@ -150,6 +150,16 @@ func (a *Adapter) forgetToken(githubToken string) {
 // 响应形如 {token, expires_at, refresh_in}。我们**只信 refresh_in**（秒，距下次该刷新还有多久）：
 // expires_at 的类型在两份参考实现里就不一致（copilot-api 当数字、gpt4free 当 ISO 字符串），
 // 去兼容一个各家都说不准的字段不如直接用上游明确给的 refresh_in（任务要求也是这么说的）。
+//
+// 交叉验证（2026-09，任务补充）：更近的 BYOKEY 反而用 expires_at（当 unix 秒整数）算 TTL，
+// 且**不减提前量**、只在缺失时回落到 25 分钟（crates/provider/src/executor/copilot/mod.rs:230-242，
+// 与我们的 copilotTokenFallback 巧合一致）。三家对 expires_at 的类型都不统一，正好印证了
+// 「别去信它」这个判断；提前量仍按 copilot-api 的 refresh_in - 60 秒。
+//
+// 另：BYOKEY 还会读响应里的 `endpoints.api` 并**用它覆盖 API 基址**（mod.rs:244-250，VS Code 就是
+// 这么做的）。我们与 copilot-api/gpt4free 一样按账号类型拼 api.<type>.githubcopilot.com，
+// 没有采信该字段 —— 后果是只有 business/enterprise 账号可能打到错误 host（个人版两个域等价）。
+// 真上游样本到位后若发现端点不对，这里就是落点。
 func (a *Adapter) exchangeCopilotToken(ctx context.Context, c *channel.Credential, githubToken string) (string, error) {
 	status, raw, err := a.do(ctx, c, http.MethodGet, a.githubAPIBase+epCopilotToken, githubHeaders(githubToken), nil)
 	if err != nil {

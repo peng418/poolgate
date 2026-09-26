@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"poolgate/internal/channel"
 	"poolgate/internal/errs"
@@ -405,5 +406,140 @@ func TestParseSOLOToolCalls(t *testing.T) {
 	ev = parseSOLOLine("output", `{"tool_calls":[{"function_call":{"name":"g","arguments":"{\"a\":1}"}}]}`)
 	if len(ev.ToolCalls) != 1 || ev.ToolCalls[0].Function.Name != "g" {
 		t.Fatalf("SOLO 形态解析失败：%+v", ev.ToolCalls)
+	}
+}
+
+// SOLO 流里的 event:error 必须归一成**带 Kind + 上游原话**的结构化错误。
+//
+// 实测依据（2026-09-26，真实凭证打 trae-api-cn）：额度用完后上游每次对话都在流里回
+// `event:error {"code":4008,"message":"Your requests have exceeded the quota."}`
+// —— 以前这条是普通 error，网关取 Kind 落到兜底的 Parse、消息换成通用的
+// 「上游请求失败」，上游原话整句丢掉（违反红线一：失败必带原因）。
+func TestSoloErrorCarriesKindAndUpstream(t *testing.T) {
+	err := soloError(4008, "Your requests have exceeded the quota.")
+	if k, _ := errs.KindOf(err); k != errs.HardCredit {
+		t.Fatalf("4008 应归 HardCredit，得到 %v", k)
+	}
+	ee, ok := err.(*errs.Error)
+	if !ok {
+		t.Fatalf("应为 *errs.Error，得到 %T", err)
+	}
+	if !strings.Contains(ee.Upstream, "exceeded the quota") {
+		t.Fatalf("upstream 字段丢了上游原话：%+v", ee)
+	}
+	if !strings.Contains(ee.Message, "exceeded the quota") {
+		t.Fatalf("message 应带上游原话：%q", ee.Message)
+	}
+	if got := soloKind(0, "Too many requests, slow down"); got != errs.SoftRate {
+		t.Fatalf("限流文案应归 SoftRate，得到 %v", got)
+	}
+	if got := soloKind(5001, "something odd"); got != errs.UpstreamFault {
+		t.Fatalf("未知流内错误应归 UpstreamFault（不是 Parse），得到 %v", got)
+	}
+}
+
+// 流里回 event:error 时，Next() 必须把结构化错误原样交出来（不是「流结束」）。
+func TestStreamSurfacesSoloError(t *testing.T) {
+	st := newStream(sseBody(
+		"event:error\ndata:{\"code\":4008,\"message\":\"exceeded the quota\"}\n\n",
+		"event:done\ndata:{\"finish_reason\":\"stop\"}\n\n",
+	), "qwen3.8-max")
+	defer st.Close()
+	_, err := st.Next()
+	if err == nil || !strings.Contains(err.Error(), "exceeded the quota") {
+		t.Fatalf("应把上游错误抛出来，得到 %v", err)
+	}
+	if k, _ := errs.KindOf(err); k != errs.HardCredit {
+		t.Fatalf("Kind 应传到流错误上，得到 %v", k)
+	}
+}
+
+// 客户端给的采样参数必须到达上游（移植自 wild-work payload.go 的原样透传；
+// 重建请求体时漏掉它们 = 客户端设了 temperature/max_tokens 却不起作用）。
+func TestBuildBodyForwardsSamplingParams(t *testing.T) {
+	temp := 0.3
+	raw := buildBody(channel.ChatRequest{
+		Model:       "glm-5.2",
+		Temperature: &temp,
+		MaxTokens:   256,
+		Messages:    []channel.Message{{Role: "user", Content: "hi"}},
+	})
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("请求体不是合法 JSON: %v", err)
+	}
+	if obj["max_tokens"] != float64(256) {
+		t.Fatalf("max_tokens 应透传给上游，实际 %v", obj["max_tokens"])
+	}
+	if obj["temperature"] != 0.3 {
+		t.Fatalf("temperature 应透传给上游，实际 %v", obj["temperature"])
+	}
+
+	// 客户端没给时不能出现：max_tokens=0 在 OpenAI 语义里是「一个 token 都不许生成」，
+	// 上游会当成非法参数（同 codebuddy 的守卫）。
+	raw = buildBody(channel.ChatRequest{Model: "glm-5.2", Messages: []channel.Message{{Role: "user", Content: "hi"}}})
+	obj = nil
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("请求体不是合法 JSON: %v", err)
+	}
+	if _, ok := obj["max_tokens"]; ok {
+		t.Fatal("客户端没给 max_tokens 时不该带这个字段")
+	}
+	if _, ok := obj["temperature"]; ok {
+		t.Fatal("客户端没给 temperature 时不该带这个字段")
+	}
+}
+
+// 上游只回 TokenExpireDuration（不给绝对到期时间）时，也要算出到期时间
+// （依据：wild-work client.go RefreshToken 的 Duration 分支）。
+func TestRefreshDurationFallback(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"Result":{"Token":"t","RefreshToken":"r","TokenExpireDuration":3600}}`)
+	}))
+	defer srv.Close()
+
+	a := NewWithBase(srv.URL, srv.URL, srv.Client())
+	nc, err := a.Refresh(context.Background(), &channel.Credential{UID: "u1", RefreshToken: "rt"})
+	if err != nil {
+		t.Fatalf("刷新失败: %v", err)
+	}
+	if d := time.Until(nc.ExpiresAt); d < 55*time.Minute || d > 65*time.Minute {
+		t.Fatalf("应有约 1h 的到期时间，实际 %s", nc.ExpiresAt)
+	}
+}
+
+// 刷新遇到上游 5xx 不能当 SessionDead：那会把好号误判成要重新授权踢下线
+// （依据：wild-work client.go doJSON 走 Classify，以及 errs.AccountBlamed 的解耦）。
+func TestRefreshServerErrorIsNotSessionDead(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"message":"upstream boom"}`)
+	}))
+	defer srv.Close()
+
+	a := NewWithBase(srv.URL, srv.URL, srv.Client())
+	_, err := a.Refresh(context.Background(), &channel.Credential{UID: "u1", RefreshToken: "rt"})
+	if err == nil {
+		t.Fatal("500 必须报错")
+	}
+	if k, _ := errs.KindOf(err); k != errs.UpstreamFault {
+		t.Fatalf("上游 5xx 应归 UpstreamFault，实际 %s", k)
+	}
+	ee, _ := err.(*errs.Error)
+	if ee == nil || !strings.Contains(ee.Upstream, "boom") {
+		t.Fatalf("应带上游原话，实际 %+v", ee)
+	}
+}
+
+// 目录请求连不通也必须归一成 errs.Transport（红线一：不能漏出普通 error）。
+func TestFetchModelsTransportErrorIsStructured(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	srv.Close() // 立刻关掉 → 连接被拒
+
+	a := NewWithBase(srv.URL, srv.URL, srv.Client())
+	if _, err := a.Models(context.Background(), &channel.Credential{UID: "u1"}); err == nil {
+		t.Fatal("连不通必须报错")
+	} else if k, _ := errs.KindOf(err); k != errs.Transport {
+		t.Fatalf("传输失败应归 Transport，实际 %s（%v）", k, err)
 	}
 }

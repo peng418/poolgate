@@ -18,12 +18,16 @@
 //     语焉不详的 `internal` 错误。这个值**只校验长度、不校验内容**，随机 hex 即可
 //     （参考实现默认就是每请求随机 366 字节）。
 //
-//  3. 工具调用在这条路上有原生字段位（请求 `GetChatMessageRequest.tools` #10、响应
-//     `ChatToolCall` #6），但参考实现**默认关闭**原生工具，走提示词模拟 —— 因为
-//     `ToolDef` 的**内部子字段 tag 未标定**（recon 只知道「3 个字段、名字/描述/schema 之类」，
-//     没有确认字段号）。猜错不会报错，只会静默失败（请求发出去、模型不调工具），
-//     所以我们的 Spec 声明 `Tools=false + ToolsShim=true`，工具调用交给网关模拟层，
-//     **绝不去猜那两个未标定的子 tag**。
+//  3. 工具调用在这条路上是**原生**的，且内部 tag 已被参考实现付费实弹标定：
+//     请求 `GetChatMessageRequest.tools` #10，每个 ToolDef 的子 tag 为
+//     name=1 / description=2 / parameters=3；响应 `ChatToolCall` #6，子 tag 为
+//     id=1 / name=2 / arguments_json=3（devin-connect.js:394-397 与 :1489-1492）。
+//     所以本适配器声明 `Tools=true`、原生透传，不再走 toolshim。
+//     两个必须照抄的配套细节：(a) 上游对工具描述做 MCP 指纹匹配，命中就整请求回
+//     permission_denied（"Unable to process request due to an MCP configuration issue."），
+//     处置是把顶层描述换成工具名、并去掉参数 schema 里的 description（:572-608）；
+//     (b) 响应侧 ChatToolCall 的 name 字段参考实现自己都存疑（:1462-1470 vs :1489），
+//     解不到就用「本轮只下发了一个工具」反查，再退回 "unknown"。
 //
 // 风险（必读，也是 Spec.Docs 要写清的东西）：
 //   - 本渠道复用第三方客户端（Windsurf/Devin）的登录态与私有 Connect-RPC 协议，
@@ -130,6 +134,17 @@ type modelEntry struct {
 // 但它的 selector 名册有一百多个、且随上游增删（参考实现是拿一份快照 + 运行时同步来兜的）。
 // 我们只列**参考实现里确认存在**的这一小撮 SWE（Cognition 自研）档位，
 // 并逐档标注「免费可用 / 付费」，避免用户点了才发现要升级。
+//
+// 逐档来源（参考实现 WindsurfAPI）：
+//   - swe-1-6-slow：免费的兜底 selector（devin-connect-models.js:171 FREE_TIER_SELECTOR；
+//     它**不在**目录快照里，是账户层级的免费档）。
+//   - swe-1-6 / swe-1-6-fast / swe-1-7 / swe-1-7-lightning：选择器映射表
+//     （devin-connect-models.js:23-148 SELECTOR_MAP）与随仓库提交的目录快照
+//     （src/data/devin-catalog-snapshot.json，provider=cognition）里都在。
+//
+// 快照里同属 Cognition 家族的还有 swe-2-{medium,high,max} 与 MODEL_SWE_1_5*（参考实现
+// 支持但本清单未列）：它们的「是否单独吐思考」在参考实现里没有可验证的结论，我们
+// 不猜，所以不下发；用户直接点名这些 selector 仍会被原样转发（见 resolveModel）。
 //
 // 不在清单里的 selector 不会「回落到别的模型」（那会让用户拿到一个不是自己点的模型），
 // 而是原样转发给上游 —— 上游认就认，不认就回升级提示或 internal 错误，如实归一。

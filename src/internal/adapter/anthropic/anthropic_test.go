@@ -196,11 +196,14 @@ func TestChatHeadersToolsAndStream(t *testing.T) {
 		if got := r.Header.Get("x-api-key"); got != "" {
 			t.Errorf("OAuth 令牌不能用 x-api-key（混了只会 401）：%q", got)
 		}
-		if got := r.Header.Get("anthropic-beta"); got != oauthBeta {
-			t.Errorf("anthropic-beta 应为 %q，得到 %q", oauthBeta, got)
+		if got := r.Header.Get("anthropic-beta"); !strings.Contains(got, oauthBeta) || !strings.Contains(got, cliBeta) {
+			t.Errorf("anthropic-beta 应同时含 %q 与 %q（官方 CLI 两项都带），得到 %q", cliBeta, oauthBeta, got)
 		}
 		if got := r.Header.Get("anthropic-version"); got != anthropicVersion {
 			t.Errorf("anthropic-version 应为 %q，得到 %q", anthropicVersion, got)
+		}
+		if got := r.Header.Get("anthropic-dangerous-direct-browser-access"); got != "true" {
+			t.Errorf("官方 SDK 会注入 anthropic-dangerous-direct-browser-access: true，得到 %q", got)
 		}
 		if got := r.Header.Get("X-App"); got != "cli" {
 			t.Errorf("应伪装成官方 CLI（x-app: cli），得到 %q", got)
@@ -374,6 +377,10 @@ func TestChatRefreshesOnceOn401(t *testing.T) {
 			if body["refresh_token"] != "ort-old" {
 				t.Errorf("应带手里的 refresh token：%v", body["refresh_token"])
 			}
+			// scope 是官方 CLI refresh 报文固定带的一项（services/oauth/client.ts）。
+			if s, _ := body["scope"].(string); !strings.Contains(s, "user:inference") {
+				t.Errorf("refresh 应带完整 scope（官方 CLI 会带）：%v", body["scope"])
+			}
 			_, _ = w.Write([]byte(`{"access_token":"oat-new","refresh_token":"ort-new","expires_in":3600}`))
 			return
 		}
@@ -494,6 +501,9 @@ func TestClassify(t *testing.T) {
 		{401, `{"type":"error","error":{"type":"authentication_error"}}`, errs.SessionDead},
 		// 403 的两副面孔：权限类判死账号，出口 IP 被拦算上游故障（判反会误杀好号）。
 		{403, `{"type":"error","error":{"type":"permission_error","message":"no access"}}`, errs.SessionDead},
+		// 令牌被撤销：官方 CLI 对这个 403 报文同样强制刷新（utils/http.ts:112-129），
+		// 说明上游有时用 403 而非 401 表达撤销 —— 必须判死，别当成出口 IP 问题。
+		{403, `{"type":"error","error":{"message":"OAuth token has been revoked"}}`, errs.SessionDead},
 		{403, `{"type":"forbidden","message":"Request not allowed"}`, errs.UpstreamFault},
 		{429, `{"message":"rate limited"}`, errs.SoftRate},
 		{429, `{"message":"your credit balance is too low"}`, errs.HardCredit},

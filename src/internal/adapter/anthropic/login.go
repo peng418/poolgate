@@ -236,6 +236,13 @@ func (a *Adapter) refreshToken(ctx context.Context, c *channel.Credential) (toke
 		"grant_type":    "refresh_token",
 		"refresh_token": strings.TrimSpace(c.RefreshToken),
 		"client_id":     oauthClientID,
+		// scope 是官方 CLI refresh 报文里固定带的一项（claude-code-cli/services/oauth/client.ts
+		// 的 refreshOAuthToken：grant_type / refresh_token / client_id / scope 四项）。
+		// 它的作用是让换回来的令牌带上完整 scope 集（CLI 注释：refresh grant 允许把 scope
+		// 扩到本客户端注册过的范围，所以对旧令牌也安全）。带上它我们才不必假设上游默认
+		// 会原样继承初次授权的 scope。auth2api / teamclaude 的精简实现都省略了它 ——
+		// 它们能跑通，但按本包「官方配置为准」的取舍规则，这里跟官方 CLI。
+		"scope": oauthScopes,
 	}
 	var out tokenResp
 	status, raw, err := a.postJSON(ctx, c, a.tokenURL, payload, &out)

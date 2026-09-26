@@ -31,6 +31,22 @@ import (
 // defaultDeviceTTL 是上游没给 expires_in 时的设备码有效期兜底（GitHub 实测 900 秒）。
 const defaultDeviceTTL = 15 * time.Minute
 
+// defaultPollInterval 是上游没给 interval 时的轮询间隔兜底。
+//
+// 5 秒不是我们拍的：RFC 8628 §3.5 规定未给 interval 时按 5 秒，三份参考实现也都以此为准
+// （copilot-api poll-access-token.ts:17 用 interval 再 +1 秒；gpt4free oauthFlow.py:60 写
+// `device_auth.get("interval", 5)`；BYOKEY crates/auth/src/provider/copilot.rs:25 的 default_expires_in
+// 与 device_code.rs:98-101 用 dc.interval 睡）。
+const defaultPollInterval = 5 * time.Second
+
+// slowDownStep 是上游回 slow_down 时轮询间隔的增量。
+//
+// RFC 8628 §3.5：收到 slow_down 必须把间隔 +5 秒；gpt4free oauthFlow.py:79-80 是 `interval += 5`，
+// BYOKEY 的 `apply_slow_down` 默认也是 +5.0（crates/auth/src/flow/device_code.rs:55-58,120-122）。
+// 参考实现 copilot-api 没区分 slow_down（一律 interval+1），我们按 RFC + 另两家处理，
+// 因为控制台是固定节奏轮询，不主动降速就会一直撞 slow_down。
+const slowDownStep = 5 * time.Second
+
 // deviceSession 是一次进行中的设备码授权。
 type deviceSession struct {
 	a *Adapter
@@ -42,6 +58,10 @@ type deviceSession struct {
 	userCode  string
 	authURL   string
 	expiresAt time.Time
+	// interval 是两次「真的向上游问一次」之间的最小间隔（来自设备码响应的 interval）。
+	interval time.Duration
+	// nextPoll 是下一次允许真正打上游的时刻；不到点就只回 ErrPending，不碰上游。
+	nextPoll time.Time
 	// pasted 是兜底路径的 token：用户没走设备码，直接把已有的 GitHub token 粘回来。
 	pasted string
 	done   bool
@@ -92,12 +112,22 @@ func (a *Adapter) StartLogin(ctx context.Context, _ channel.LoginOptions) (chann
 	if ttl <= 0 {
 		ttl = defaultDeviceTTL
 	}
+	// 轮询节奏取自上游给的 interval；缺失/非法时按 RFC 8628 的 5 秒兜底。
+	interval := time.Duration(dc.Interval) * time.Second
+	if interval <= 0 {
+		interval = defaultPollInterval
+	}
+	now := time.Now()
 	return &deviceSession{
 		a:          a,
 		deviceCode: dc.DeviceCode,
 		userCode:   dc.UserCode,
 		authURL:    auth,
-		expiresAt:  time.Now().Add(ttl),
+		expiresAt:  now.Add(ttl),
+		interval:   interval,
+		// 首次轮询也要等满 interval（参考实现 copilot-api 就是这样）——
+		// 授权页还没打开就抢先问，只会白白撞上游的限流。
+		nextPoll: now.Add(interval),
 	}, nil
 }
 
@@ -180,6 +210,20 @@ func (s *deviceSession) Poll(ctx context.Context) (*channel.Credential, error) {
 			return nil, errs.New(errs.SessionDead, "设备码已过期（约 15 分钟），请重新发起授权").
 				WithChannel(string(channel.Copilot))
 		}
+		// 轮询节奏在这里兜住：控制台是固定节奏反复调 Poll 的（前端每 2 秒一次），
+		// 而上游要求两次轮询至少隔 interval 秒。不拦的话 github.com 的设备码端点
+		// 会被打快，上游回 slow_down 甚至限流 —— mock 测不出来，真上游才现形。
+		// 交叉验证（2026-09）：BYOKEY 就是每轮先 `sleep(interval)` 再 poll
+		// （crates/auth/src/flow/device_code.rs:100-101），与这里的门限一致。
+		now := time.Now()
+		s.mu.Lock()
+		if now.Before(s.nextPoll) {
+			s.mu.Unlock()
+			return nil, channel.ErrPending // 还没到点：不碰上游，对控制台仍是「等」
+		}
+		s.nextPoll = now.Add(s.interval)
+		s.mu.Unlock()
+
 		out, status, raw, err := s.a.pollAccessToken(ctx, deviceCode)
 		if err != nil {
 			return nil, err
@@ -187,8 +231,15 @@ func (s *deviceSession) Poll(ctx context.Context) (*channel.Credential, error) {
 		switch {
 		case strings.TrimSpace(out.AccessToken) != "":
 			githubToken = out.AccessToken
-		case out.Error == "authorization_pending", out.Error == "slow_down":
-			// 用户还没在浏览器里点完（slow_down 只是要求放慢轮询，语义上同样是「等」）。
+		case out.Error == "authorization_pending":
+			// 用户还没在浏览器里点完。
+			return nil, channel.ErrPending
+		case out.Error == "slow_down":
+			// 上游明确要求放慢：把间隔永久 +5 秒并重新计时（RFC 8628 §3.5；gpt4free 同）。
+			s.mu.Lock()
+			s.interval += slowDownStep
+			s.nextPoll = time.Now().Add(s.interval)
+			s.mu.Unlock()
 			return nil, channel.ErrPending
 		case out.Error == "expired_token":
 			return nil, errs.New(errs.SessionDead, "设备码已过期，请重新发起授权").

@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -265,5 +266,69 @@ func TestPackMessagesMarksTools(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("拼装缺 %q：%s", want, got)
 		}
+	}
+}
+
+// 请求体的 id 类字段必须是**有值的 UUID 形态**，不能是空串。
+//
+// 实测依据（2026-09-26，真实 Cookie 打 www.doubao.com）：这些字段是空串时上游回
+// `{"error_code":710020202,"error_msg":"common invalid param"}`，整条渠道不可用；
+// 照参考实现 doubao2api 的 `_build_completion_payload` / `_build_completion_content_blocks`
+// 补上 uuid4 形态的值（并补 is_finish/patch_type/icon_url 等键）后真出字。
+// 这条用例就是防止以后又把它们改回空串。
+func TestBuildBodyCarriesUUIDFields(t *testing.T) {
+	c, err := parseCred("sessionid=abc123; s_v_web_id=verify_x")
+	if err != nil {
+		t.Fatalf("凭证解析失败：%v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(buildBody("你好", 0, c), &body); err != nil {
+		t.Fatalf("请求体不是 JSON：%v", err)
+	}
+
+	uuidRe := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+	convID := body["client_meta"].(map[string]any)["local_conversation_id"].(string)
+	if !strings.HasPrefix(convID, "local_") || len(convID) != len("local_")+16 {
+		t.Fatalf("local_conversation_id 形态不对（参考实现是 local_+uuid4.hex[:16]）：%q", convID)
+	}
+
+	msg := body["messages"].([]any)[0].(map[string]any)
+	if got := msg["local_message_id"].(string); !uuidRe.MatchString(got) {
+		t.Fatalf("local_message_id 必须是 uuid4，得到 %q", got)
+	}
+
+	block := msg["content_block"].([]any)[0].(map[string]any)
+	if got := block["block_id"].(string); !uuidRe.MatchString(got) {
+		t.Fatalf("block_id 必须是 uuid4，得到 %q", got)
+	}
+	if block["is_finish"] != true || block["patch_type"] != float64(2) {
+		t.Fatalf("块收尾字段缺失：is_finish=%v patch_type=%v", block["is_finish"], block["patch_type"])
+	}
+	content := block["content"].(map[string]any)
+	if _, ok := content["pc_event_block"]; !ok {
+		t.Fatal("content.pc_event_block 缺失（参考实现里恒存在）")
+	}
+	tb := content["text_block"].(map[string]any)
+	for _, k := range []string{"icon_url", "icon_url_dark", "summary"} {
+		if _, ok := tb[k]; !ok {
+			t.Fatalf("text_block.%s 缺失（参考实现里恒存在）", k)
+		}
+	}
+
+	opt := body["option"].(map[string]any)
+	if got := opt["unique_key"].(string); !uuidRe.MatchString(got) {
+		t.Fatalf("option.unique_key 必须是 uuid4，得到 %q", got)
+	}
+	if _, ok := opt["create_time_ms"]; !ok {
+		t.Fatal("option.create_time_ms 缺失")
+	}
+
+	// 每次请求的 id 必须换新的（复用同一个 id 等于把两轮对话当成同一轮）。
+	var body2 map[string]any
+	_ = json.Unmarshal(buildBody("你好", 0, c), &body2)
+	msg2 := body2["messages"].([]any)[0].(map[string]any)
+	if msg["local_message_id"] == msg2["local_message_id"] {
+		t.Fatal("两次请求的 local_message_id 相同：每次都必须新生成")
 	}
 }

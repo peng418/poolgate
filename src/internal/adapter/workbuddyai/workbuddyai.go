@@ -11,6 +11,7 @@ package workbuddyai
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
@@ -25,6 +26,7 @@ import (
 
 	"poolgate/internal/channel"
 	"poolgate/internal/errs"
+	"poolgate/internal/sanitize"
 )
 
 // 上游域名与端点（国内版）。
@@ -39,6 +41,10 @@ const (
 	EpUserRes   = "/v2/billing/meter/get-user-resource"
 	ProductCode = "p_tcaca"
 	clientUA    = "CLI/2.63.2 CodeBuddy/2.63.2"
+
+	// acceptLanguageIntl 国际版请求头语言。依据 wild-work internal/upstream/headers.go
+	// acceptLanguageFor（global=en-US）与 hub wb_accounts.py（realm=="intl" → "en-US"）。
+	acceptLanguageIntl = "en-US"
 )
 
 // Adapter 实现 channel.Channel（WorkBuddyAI 渠道）。
@@ -94,23 +100,41 @@ func noFollowClient(src *http.Client) *http.Client {
 	}
 }
 
-// staticModels 是国际版的兜底模型表（取自 2026-09-24 实测 /v2/enterprises/personal/models）。
-// 目录接口可用时以动态结果为准，此表只在拉取失败时兜底。
+// staticModels 是国际版的兜底模型表。目录接口可用时以动态结果为准，此表只在拉取失败时兜底。
+//
+// 表项与窗口对齐 wild-work internal/workbuddyai/constants.go staticModels（已实测），
+// 并与 hub v1.5.8 wb_catalog.py 的国际版目录交叉核对（hub 覆盖其中 23 项，窗口值一致；
+// minimax-m3 / deepseek-v3 / glm-5.1 / glm-5v-turbo / kimi-k2.7 是 wild-work extraModels
+// 「目录不返回但实测可用」的补充项）。此前只搬了 13 项、窗口一律写 131072，属移植时缩水。
 // 注意：ContextWindow 是本地声明（上游目录不回该字段）→ Source=local，不冒充上游值。
 var staticModels = []channel.ModelInfo{
-	{ID: "default-model", DisplayName: "Default", ContextWindow: 131072, Source: channel.SourceLocal},
-	{ID: "fast-model", DisplayName: "Fast", ContextWindow: 131072, Source: channel.SourceLocal},
-	{ID: "balanced-model", DisplayName: "Balanced", ContextWindow: 131072, Source: channel.SourceLocal},
-	{ID: "primary-model", DisplayName: "Primary", ContextWindow: 131072, Source: channel.SourceLocal},
-	{ID: "deep-model", DisplayName: "Deep", ContextWindow: 131072, Source: channel.SourceLocal},
-	{ID: "hy4-preview", DisplayName: "Hy4 Preview", ContextWindow: 131072, Source: channel.SourceLocal},
-	{ID: "hy3", DisplayName: "Hy3", ContextWindow: 131072, Source: channel.SourceLocal},
-	{ID: "glm-5.3", DisplayName: "GLM-5.3", ContextWindow: 131072, Source: channel.SourceLocal},
-	{ID: "glm-5.2", DisplayName: "GLM-5.2", ContextWindow: 131072, Source: channel.SourceLocal},
-	{ID: "kimi-k3", DisplayName: "Kimi-K3", ContextWindow: 131072, Source: channel.SourceLocal},
-	{ID: "kimi-k2.6", DisplayName: "Kimi-K2.6", ContextWindow: 131072, Source: channel.SourceLocal},
-	{ID: "gpt-5.5", DisplayName: "GPT-5.5", ContextWindow: 131072, Source: channel.SourceLocal},
-	{ID: "gemini-3.5-flash", DisplayName: "Gemini-3.5-Flash", ContextWindow: 131072, Source: channel.SourceLocal},
+	{ID: "hy3", DisplayName: "Hy3", ContextWindow: 192000, Source: channel.SourceLocal},
+	{ID: "hy4-preview", DisplayName: "Hy4 preview", ContextWindow: 1000000, Source: channel.SourceLocal},
+	{ID: "deepseek-v4.1-flash", DisplayName: "Deepseek-V4.1-Flash", ContextWindow: 1000000, Source: channel.SourceLocal},
+	{ID: "hy4-preview-f", DisplayName: "Hy4 preview F", ContextWindow: 1000000, Source: channel.SourceLocal},
+	{ID: "default-model", DisplayName: "Auto", ContextWindow: 176000, Source: channel.SourceLocal},
+	{ID: "fast-model", DisplayName: "Fast", ContextWindow: 200000, Source: channel.SourceLocal},
+	{ID: "balanced-model", DisplayName: "Balanced", ContextWindow: 256000, Source: channel.SourceLocal},
+	{ID: "primary-model", DisplayName: "Primary", ContextWindow: 272000, Source: channel.SourceLocal},
+	{ID: "deep-model", DisplayName: "Deep", ContextWindow: 176000, Source: channel.SourceLocal},
+	{ID: "gpt-5.6-sol", DisplayName: "GPT-5.6-Sol", ContextWindow: 1000000, Source: channel.SourceLocal},
+	{ID: "gpt-5.6-terra", DisplayName: "GPT-5.6-Terra", ContextWindow: 1000000, Source: channel.SourceLocal},
+	{ID: "gpt-5.6-luna", DisplayName: "GPT-5.6-Luna", ContextWindow: 1000000, Source: channel.SourceLocal},
+	{ID: "gpt-6-astra", DisplayName: "GPT-6-Astra", ContextWindow: 1000000, Source: channel.SourceLocal},
+	{ID: "gpt-5.5", DisplayName: "GPT-5.5", ContextWindow: 1000000, Source: channel.SourceLocal},
+	{ID: "gpt-5.4", DisplayName: "GPT-5.4", ContextWindow: 272000, Source: channel.SourceLocal},
+	{ID: "gpt-5.3-codex", DisplayName: "GPT-5.3-Codex", ContextWindow: 272000, Source: channel.SourceLocal},
+	{ID: "gemini-3.5-flash", DisplayName: "Gemini-3.5-Flash", ContextWindow: 1000000, Source: channel.SourceLocal},
+	{ID: "glm-5.3", DisplayName: "GLM-5.3", ContextWindow: 1000000, Source: channel.SourceLocal},
+	{ID: "glm-5.2", DisplayName: "GLM-5.2", ContextWindow: 1000000, Source: channel.SourceLocal},
+	{ID: "kimi-k3", DisplayName: "Kimi-K3", ContextWindow: 1000000, Source: channel.SourceLocal},
+	{ID: "kimi-k2.6", DisplayName: "Kimi-K2.6", ContextWindow: 256000, Source: channel.SourceLocal},
+	{ID: "kimi-k2.8-preview", DisplayName: "Kimi-K2.8-Preview", ContextWindow: 1000000, Source: channel.SourceLocal},
+	{ID: "kimi-k2.7", DisplayName: "Kimi-K2.7", ContextWindow: 1000000, Source: channel.SourceLocal},
+	{ID: "minimax-m3", DisplayName: "MiniMax-M3", ContextWindow: 256000, Source: channel.SourceLocal},
+	{ID: "deepseek-v3", DisplayName: "Deepseek-V3", ContextWindow: 192000, Source: channel.SourceLocal},
+	{ID: "glm-5.1", DisplayName: "GLM-5.1", ContextWindow: 1000000, Source: channel.SourceLocal},
+	{ID: "glm-5v-turbo", DisplayName: "GLM-5V-Turbo", ContextWindow: 256000, Source: channel.SourceLocal},
 }
 
 // Spec 返回能力声明。
@@ -138,9 +162,31 @@ func (a *Adapter) Spec() channel.Spec { return Spec() }
 func commonHeaders(req *http.Request) {
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	// X-CodeBuddy-Request / Accept-Language：wild-work internal/upstream/headers.go
+	// CommonHeaders 与 hub wb_accounts.py Account.headers 都固定带。
+	req.Header.Set("X-CodeBuddy-Request", "1")
+	req.Header.Set("Accept-Language", acceptLanguageIntl)
 	req.Header.Set("Origin", OriginAI)
 	req.Header.Set("Referer", OriginAI+"/")
 	req.Header.Set("User-Agent", clientUA)
+}
+
+// enterpriseID 取授权时落下的企业 ID（可能为空，空则不猜）。
+func enterpriseID(c *channel.Credential) string {
+	if c == nil || c.Extra == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.Extra["enterprise_id"])
+}
+
+// stableID 由 uid 稳定派生 36 位 hex 设备/会话标识（X-Machine-ID / X-Session-ID）。
+// 依据 wild-work internal/upstream/headers.go injectAccountStableHeaders +
+// deriveStableID（sha256("wb2a:"+purpose+":"+uid) 取前 18 字节 hex）与 hub
+// wb_fingerprint.py derive_id（同账号恒同值，防上游风控关联）。两参考算法不同，
+// 但都要求「同一 uid 恒定、36 hex、账号间隔离」——这里采用 wild-work 的实现。
+func stableID(uid, purpose string) string {
+	sum := sha256.Sum256([]byte("wb2a:" + purpose + ":" + uid))
+	return hex.EncodeToString(sum[:18])
 }
 
 func chatHeaders(req *http.Request, c *channel.Credential) {
@@ -154,11 +200,29 @@ func chatHeaders(req *http.Request, c *channel.Credential) {
 	req.Header.Set("X-IDE-Type", "WorkBuddy")
 	req.Header.Set("X-IDE-Version", "5.5.4")
 	req.Header.Set("X-Product", "WorkBuddy")
+	// X-Enterprise-Id：wild-work workbuddyai chatHeaders（有则发、无则 X-No-Enterprise-Id）
+	// 与 hub 都对；此前漏掉，企业账号身份信息丢失。
+	if ent := enterpriseID(c); ent != "" {
+		req.Header.Set("X-Enterprise-Id", ent)
+	} else {
+		req.Header.Set("X-No-Enterprise-Id", "1")
+	}
+	if c.UID != "" {
+		req.Header.Set("X-Machine-ID", stableID(c.UID, "machine"))
+		req.Header.Set("X-Session-ID", stableID(c.UID, "session"))
+	}
+	// 会话头族：X-Conversation-Request-ID 与 X-Request-ID 是两个不同的 id
+	// （wild-work internal/upstream/headers.go injectConversationHeaders）。
 	mid := messageID()
-	req.Header.Set("X-Conversation-Request-ID", mid)
+	cid := messageID()
+	req.Header.Set("X-Conversation-Request-ID", cid)
 	req.Header.Set("X-Conversation-Message-ID", mid)
 	req.Header.Set("X-Request-ID", mid)
-	req.Header.Set("X-Root-Request-ID", mid)
+	req.Header.Set("X-Root-Request-ID", cid)
+	// B3 链路头（wild-work headers.go 同款）。
+	req.Header.Set("X-B3-TraceId", mid)
+	req.Header.Set("X-B3-SpanId", mid[:16])
+	req.Header.Set("X-B3-Sampled", "1")
 }
 
 func messageID() string {
@@ -194,6 +258,10 @@ func (a *Adapter) Refresh(ctx context.Context, c *channel.Credential) (*channel.
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Refresh-Token", c.RefreshToken)
 	req.Header.Set("X-Auth-Refresh-Source", "plugin")
+	// X-Enterprise-Id：wild-work workbuddyai refreshHeaders 与 hub Account._refresh_locked 都带。
+	if ent := enterpriseID(c); ent != "" {
+		req.Header.Set("X-Enterprise-Id", ent)
+	}
 	data, err := a.doJSON(req)
 	if err != nil {
 		return nil, err
@@ -315,13 +383,34 @@ func (a *Adapter) ModelsSnapshot() []channel.ModelInfo {
 }
 
 func (a *Adapter) Balance(ctx context.Context, c *channel.Credential) (channel.Balance, error) {
-	body, _ := json.Marshal(map[string]any{"PageNumber": 1, "PageSize": 100, "ProductCode": ProductCode, "Status": []int{0, 3}})
+	// PackageEndTimeRangeBegin/End：两份参考都固定带（wild-work internal/upstream
+	// client.go 与 internal/workbuddyai client.go 的 userResource 请求体）。
+	// 此前漏掉，上游可能因缺范围参数少回套餐条目。
+	now := time.Now()
+	body, _ := json.Marshal(map[string]any{
+		"PageNumber":               1,
+		"PageSize":                 100,
+		"ProductCode":              ProductCode,
+		"Status":                   []int{0, 3},
+		"PackageEndTimeRangeBegin": now.Format("2006-01-02 15:04:05"),
+		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format("2006-01-02 15:04:05"),
+	})
+	// 国际版 chat/billing 同域（www.workbuddy.ai），故仍用 a.base —— 与
+	// wild-work ChatBaseGlobal=BillingBaseGlob=www.workbuddy.ai、hub REALM_CONFIGS["intl"] 一致。
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, a.base+EpUserRes, bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+c.AccessToken)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-User-Id", c.UID)
 	req.Header.Set("X-Domain", DomainAI)
+	req.Header.Set("X-CodeBuddy-Request", "1")
+	req.Header.Set("Accept-Language", acceptLanguageIntl)
+	// X-Enterprise-Id / X-Tenant-Id：wild-work billingHeaders 与 hub
+	// Account.headers(purpose="billing") 都带。
+	if ent := enterpriseID(c); ent != "" {
+		req.Header.Set("X-Enterprise-Id", ent)
+		req.Header.Set("X-Tenant-Id", ent)
+	}
 	data, err := a.doJSON(req)
 	if err != nil {
 		return channel.Balance{}, err
@@ -332,6 +421,7 @@ func (a *Adapter) Balance(ctx context.Context, c *channel.Credential) (channel.B
 				Accounts []struct {
 					CycleCapacitySize   int64 `json:"CycleCapacitySize"`
 					CycleCapacityRemain int64 `json:"CycleCapacityRemain"`
+					CycleCapacityUsed   int64 `json:"CycleCapacityUsed"`
 					CapacitySize        int64 `json:"CapacitySize"`
 					CapacityRemain      int64 `json:"CapacityRemain"`
 				} `json:"Accounts"`
@@ -343,11 +433,23 @@ func (a *Adapter) Balance(ctx context.Context, c *channel.Credential) (channel.B
 	}
 	var total int64
 	for _, acct := range resp.Response.Data.Accounts {
-		if acct.CycleCapacitySize > 0 {
-			total += acct.CycleCapacityRemain
-		} else {
-			total += acct.CapacityRemain
+		// 三档口径与参考一致（wild-work internal/workbuddyai client.go userResource）：
+		// 周期总量 >0 用周期剩余；否则周期剩余或已用非 0 也用周期剩余；
+		// 都没有才回退容量剩余。此前只判 CycleCapacitySize>0，中间档会错取常为 0 的
+		// CapacityRemain，把真实余额读成 0。剩余负数钳 0。
+		var remain int64
+		switch {
+		case acct.CycleCapacitySize > 0:
+			remain = acct.CycleCapacityRemain
+		case acct.CycleCapacityRemain > 0 || acct.CycleCapacityUsed > 0:
+			remain = acct.CycleCapacityRemain
+		default:
+			remain = acct.CapacityRemain
 		}
+		if remain < 0 {
+			remain = 0
+		}
+		total += remain
 	}
 	return channel.Balance{Credits: total, Known: true}, nil
 }
@@ -429,17 +531,79 @@ func buildBody(req channel.ChatRequest) []byte {
 		"model":          req.Model,
 		"messages":       msgs,
 		"stream":         true,
-		"max_tokens":     req.MaxTokens,
 		"stream_options": map[string]any{"include_usage": true},
+	}
+	// max_tokens 只在客户端真的给了（>0）时才发：网关在客户端没写时传 0，
+	// 而 `"max_tokens": 0` 在 OpenAI 语义里是「一个 token 都不许生成」，上游可能直接拒。
+	// 依据两份参考一致：wild-work internal/upstream/payload.go 从不注入 max_tokens，
+	// hub v1.5.8 translate_max_completion_tokens 只在值 >0 时设置；
+	// 同族 codebuddy 适配器 buildBody 同样是 >0 才发。
+	if req.MaxTokens > 0 {
+		obj["max_tokens"] = req.MaxTokens
+	}
+	// temperature 透传（客户端给了才发）：wild-work 整包透传、hub build_upstream_body
+	// body=dict(payload) 都保留该字段。
+	if req.Temperature != nil {
+		obj["temperature"] = *req.Temperature
 	}
 	if tools := req.ForwardTools(); len(tools) > 0 {
 		obj["tools"] = tools
+		// tool_choice 必须归一成**字符串**再发（上游把该字段声明为 string，
+		// 发对象会 400 code=11101）。依据 wild-work payload.go normalizeToolChoice
+		// 与 hub v1.5.8 wb_proxy.py normalize_tool_choice。
+		if tc := normalizeToolChoice(req.ToolChoice); tc != nil {
+			obj["tool_choice"] = tc
+		}
 	}
 	if len(msgs) == 0 || msgs[0]["role"] != "system" {
 		obj["messages"] = append([]map[string]any{{"role": "system", "content": "You are a helpful assistant."}}, msgs...)
 	}
 	raw, _ := json.Marshal(obj)
-	return raw
+	// 出站脱敏（body 组装完、发出去之前，落点与 wild-work internal/workbuddyai/wb_utils.go
+	// PrepareBody 一致）：剥离上游内容审核黑名单指纹（Claude Code / Codex CLI 注入的模板句、
+	// billing header、裸 11128 等）。上游对指纹做逐字精确匹配，命中即回
+	// HTTP 400 code=11128 "Illegal API invocation from an unapproved channel" —— 从
+	// Claude Code / Studio 调本渠道会被原样挡掉，见 internal/sanitize 文件头依据。
+	return sanitize.Messages(raw)
+}
+
+// normalizeToolChoice 把 OpenAI tool_choice 归一成上游认的字符串形态。
+// 语义照 hub v1.5.8 wb_proxy.py normalize_tool_choice + wild-work payload.go normalizeToolChoice：
+//   - "auto"/"required" → 原样字符串
+//   - {"type":"function","function":{"name":"x"}}（或 {"name":"x"}）→ 字符串 "x"，无名则 "auto"
+//   - {"type":"auto"/"required"} → 对应字符串
+//   - {"type":"none"} / 其他对象 / 非标量 → 删（返回 nil）
+//
+// "none" 的取舍见 CN 适配器同名列注释（tools 由 channel.ForwardTools() 决定）。
+func normalizeToolChoice(v any) any {
+	switch t := v.(type) {
+	case string:
+		s := strings.ToLower(strings.TrimSpace(t))
+		if s == "auto" || s == "required" {
+			return s
+		}
+		return nil
+	case map[string]any:
+		typ, _ := t["type"].(string)
+		switch strings.ToLower(strings.TrimSpace(typ)) {
+		case "auto", "required":
+			return strings.ToLower(strings.TrimSpace(typ))
+		case "function":
+			name := ""
+			if fn, ok := t["function"].(map[string]any); ok {
+				name, _ = fn["name"].(string)
+			}
+			if name == "" {
+				name, _ = t["name"].(string)
+			}
+			if name = strings.TrimSpace(name); name != "" {
+				return name
+			}
+			return "auto"
+		}
+		return nil
+	}
+	return nil
 }
 
 func truncate(s string, n int) string {
@@ -463,6 +627,18 @@ func codeQuotaExhausted(lowerBody string) bool {
 	return false
 }
 
+// sessionDeadMarkers 会话失效标记（需重新登录而非换号重试）。
+// 依据 wild-work internal/workbuddyai/models.go 与 internal/upstream/client.go
+// 同款 sessionDeadMarkers。
+var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
+
+// contentBlockedMarkers 内容审核拦截标记（wild-work internal/upstream/client.go 同款）。
+var contentBlockedMarkers = []string{
+	"blocked by security policy",
+	"unapproved channel",
+	"illegal api invocation",
+}
+
 // Classify 按 HTTP 状态 + body 判定错误类别（对齐 QoderCN 的枚举映射）。
 func Classify(status int, body string) errs.Kind {
 	lower := strings.ToLower(body)
@@ -477,6 +653,15 @@ func Classify(status int, body string) errs.Kind {
 		strings.Contains(lower, "额度已用尽") || strings.Contains(lower, "额度用尽") {
 		return errs.HardCredit
 	}
+	// 402 Payment Required 一律判额度不足（wild-work 两处 Classify 的首个判据）。
+	if status == http.StatusPaymentRequired {
+		return errs.HardCredit
+	}
+	for _, m := range sessionDeadMarkers {
+		if strings.Contains(body, m) {
+			return errs.SessionDead
+		}
+	}
 	if status == http.StatusUnauthorized {
 		return errs.SessionDead
 	}
@@ -490,6 +675,20 @@ func Classify(status int, body string) errs.Kind {
 		return errs.UpstreamFault
 	}
 	if status >= 400 {
+		// 专项分类在通用 4xx 之前（标记来自 wild-work 两处 Classify）。
+		for _, m := range contentBlockedMarkers {
+			if strings.Contains(lower, m) {
+				return errs.ContentBlocked
+			}
+		}
+		if strings.Contains(lower, "prompt is too long") || strings.Contains(body, `"code":11115`) {
+			return errs.PromptTooLong
+		}
+		// 11102 service info not found：模型在该账号不可用
+		// （wild-work workbuddyai constants.go brokenModels 注释实测）。
+		if strings.Contains(body, `"code":11102`) || strings.Contains(lower, "service info not found") {
+			return errs.ModelUnavailable
+		}
 		return errs.UpstreamFault
 	}
 	return errs.Parse

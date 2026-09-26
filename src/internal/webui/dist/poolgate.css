@@ -212,6 +212,21 @@ td .muted { color: var(--ink-3); }
    看起来像「有些渠道的点没渲染出来」。 */
 .ch.k-off .k { background: var(--ink-3); }
 
+/* 渠道 / 来源的品牌图标（有就用它，没有就退回上面的身份色方块）。
+   为什么要垫一块浅色底板：① 不少品牌标是「深色透明底」（Kimi、xAI、OpenRouter、Perplexity…），
+   直接放在暗色主题上等于看不见；② 各家图标的配色与留白差异极大，垫一块统一底板，
+   一列图标才像一套。底板固定浅色而不是跟随主题 —— 品牌标的颜色是按浅底设计的。 */
+.ch .logo {
+  width: 20px; height: 20px; flex: none;
+  padding: 2px; border-radius: 5px;
+  background: #fff; border: 1px solid var(--border);
+  object-fit: contain;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) .ch .logo { border-color: rgba(255, 255, 255, 0.20); }
+}
+:root[data-theme="dark"] .ch .logo { border-color: rgba(255, 255, 255, 0.20); }
+
 /* 条形（单色阶，量值编码） */
 .bars { display: grid; gap: 8px; }
 .bar-row { display: grid; grid-template-columns: 150px 1fr 62px; align-items: center; gap: 10px; }

@@ -90,7 +90,10 @@ for (const [name, w, h] of [["桌面", 1400, 900], ["手机", 390, 844]]) {
 
   for (const [k, label] of [["overview", "总览"], ["providers", "接入源"], ["accounts", "账号"], ["models", "模型与费率"],
     ["benchmark", "测速与体检"], ["logs", "日志"], ["settings", "设置"]]) {
-    await p.locator(".nav a", { hasText: label }).first().click({ timeout: 5000 });
+    const nav = p.locator(".nav a", { hasText: label }).first();
+    // 入口不在就跳过（例如「接入源」被 SHOW_PROVIDERS 隐藏）；恢复入口后自动重新覆盖。
+    if (await nav.count() === 0) { console.log(`  跳过「${label}」：导航里没有这个入口`); continue; }
+    await nav.click({ timeout: 5000 });
     await p.waitForTimeout(900);
     // 设置页多戳几下：Key 的两态（掩码/明文）文案不同，两态都要渲染一遍。
     if (k === "settings") {

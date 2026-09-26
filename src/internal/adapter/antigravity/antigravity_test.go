@@ -784,3 +784,125 @@ func TestFingerprintIsStablePerAccount(t *testing.T) {
 		t.Fatal("不同账号应当能派生出不同指纹（全都一样说明派生没起作用）")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 4. 请求体的思考配置与 systemInstruction 形态（按参考实现逐字段对齐）
+// ---------------------------------------------------------------------------
+
+// thinkingConfig 必须按型号分流：Gemini 3 用字符串 thinkingLevel、Claude 思考系用数字
+// thinkingBudget（且 maxOutputTokens 必须大于它），非思考型号**完全不带** thinkingConfig。
+// 旧实现不分型号一律塞 includeThoughts:true，与两份参考实现都不符。
+func TestThinkingConfigPerModel(t *testing.T) {
+	genCfg := func(model string, maxTok int) map[string]any {
+		raw, err := buildRequest(channel.ChatRequest{
+			Model: model, MaxTokens: maxTok,
+			Messages: []channel.Message{{Role: "user", Content: "hi"}},
+		}, "proj", "agent-x")
+		if err != nil {
+			t.Fatalf("buildRequest(%s) 失败：%v", model, err)
+		}
+		var body map[string]any
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatalf("请求体不是 JSON：%v", err)
+		}
+		inner, _ := body["request"].(map[string]any)
+		gc, _ := inner["generationConfig"].(map[string]any)
+		if gc == nil {
+			t.Fatalf("%s 缺 generationConfig：%v", model, body)
+		}
+		return gc
+	}
+
+	// Gemini 3 Pro：thinkingLevel 跟着型号后缀走，且不带数字 budget。
+	for _, c := range []struct{ model, level string }{
+		{"gemini-3-pro-high", "high"},
+		{"gemini-3-pro-low", "low"},
+	} {
+		tc, _ := genCfg(c.model, 4096)["thinkingConfig"].(map[string]any)
+		if tc == nil || tc["includeThoughts"] != true || tc["thinkingLevel"] != c.level {
+			t.Fatalf("%s 的 thinkingConfig 应为 thinkingLevel=%s：%v", c.model, c.level, tc)
+		}
+		if _, has := tc["thinkingBudget"]; has {
+			t.Fatalf("Gemini 3 不该带数字 thinkingBudget：%v", tc)
+		}
+	}
+
+	// Claude 思考系：数字 thinkingBudget，且 maxOutputTokens 必须大于它。
+	gc := genCfg("claude-opus-4-6-thinking", 2048)
+	tc, _ := gc["thinkingConfig"].(map[string]any)
+	if tc == nil || tc["thinkingBudget"] != float64(claudeThinkingBudget) {
+		t.Fatalf("Claude 思考系应带 thinkingBudget：%v", tc)
+	}
+	if mo, _ := gc["maxOutputTokens"].(float64); int(mo) <= claudeThinkingBudget {
+		t.Fatalf("maxOutputTokens 必须大于 thinkingBudget，得到 %v", gc["maxOutputTokens"])
+	}
+
+	// 非思考型号：一个 thinkingConfig 都不许带。
+	for _, model := range []string{"claude-sonnet-4-6", "gpt-oss-120b-medium"} {
+		if tc, _ := genCfg(model, 2048)["thinkingConfig"].(map[string]any); tc != nil {
+			t.Fatalf("%s 是非思考型号，不应带 thinkingConfig：%v", model, tc)
+		}
+	}
+}
+
+// systemInstruction 必须是带 role:"user" 的对象（参考实现都显式带 role），parts 形态不变。
+func TestSystemInstructionHasRole(t *testing.T) {
+	raw, err := buildRequest(channel.ChatRequest{
+		Model: "gemini-3-pro-high",
+		Messages: []channel.Message{
+			{Role: "system", Content: "s"},
+			{Role: "user", Content: "u"},
+		},
+	}, "p", "agent-x")
+	if err != nil {
+		t.Fatalf("buildRequest 失败：%v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("请求体不是 JSON：%v", err)
+	}
+	inner, _ := body["request"].(map[string]any)
+	si, _ := inner["systemInstruction"].(map[string]any)
+	if si == nil || si["role"] != "user" {
+		t.Fatalf("systemInstruction 必须是带 role=user 的对象：%v", si)
+	}
+	parts, _ := si["parts"].([]any)
+	if len(parts) != 1 || parts[0].(map[string]any)["text"] != "s" {
+		t.Fatalf("systemInstruction parts 不对：%v", si)
+	}
+}
+
+// Claude 系的 toolConfig 必须用 VALIDATED（opencode 与 AIClient2API 两份独立实现一致），
+// Gemini 系仍保留标准 AUTO/ANY/NONE。
+func TestClaudeToolConfigUsesValidated(t *testing.T) {
+	fc := func(model, choice string) map[string]any {
+		raw, err := buildRequest(channel.ChatRequest{
+			Model: model, ToolChoice: choice,
+			Messages: []channel.Message{{Role: "user", Content: "hi"}},
+			Tools: []map[string]any{{
+				"type": "function",
+				"function": map[string]any{"name": "f",
+					"parameters": map[string]any{"type": "object", "properties": map[string]any{}}},
+			}},
+		}, "p", "agent-x")
+		if err != nil {
+			t.Fatalf("buildRequest 失败：%v", err)
+		}
+		var body map[string]any
+		_ = json.Unmarshal(raw, &body)
+		inner, _ := body["request"].(map[string]any)
+		cfg, _ := inner["toolConfig"].(map[string]any)["functionCallingConfig"].(map[string]any)
+		return cfg
+	}
+
+	if cfg := fc("claude-opus-4-6-thinking", "auto"); cfg == nil || cfg["mode"] != "VALIDATED" {
+		t.Fatalf("Claude 系 toolConfig 应为 VALIDATED：%v", cfg)
+	}
+	// 客户端没给 tool_choice 时，Claude 系也要补出 VALIDATED（opencode/ACP 都这么做）。
+	if cfg := fc("claude-sonnet-4-6", ""); cfg == nil || cfg["mode"] != "VALIDATED" {
+		t.Fatalf("Claude 系即使没给 tool_choice 也应带 VALIDATED：%v", cfg)
+	}
+	if cfg := fc("gemini-3-pro-high", "required"); cfg == nil || cfg["mode"] != "ANY" {
+		t.Fatalf("Gemini 系应保留标准 ANY：%v", cfg)
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -186,8 +187,11 @@ func TestChatSendsCLIShapeAndParsesTools(t *testing.T) {
 
 	a := testAdapter(srv)
 	st, err := a.Chat(context.Background(), &channel.Credential{UID: "u", AccessToken: "at-1"}, channel.ChatRequest{
-		Model:     "qwen3.5-plus", // 应被重定向到 coder-model
-		Messages:  []channel.Message{{Role: "user", Content: "北京天气"}},
+		Model: "qwen3.5-plus", // 应被重定向到 coder-model
+		Messages: []channel.Message{
+			{Role: "system", Content: "你是助手"},
+			{Role: "user", Content: "北京天气"},
+		},
 		MaxTokens: 256,
 		Tools: []map[string]any{{
 			"type": "function",
@@ -216,20 +220,31 @@ func TestChatSendsCLIShapeAndParsesTools(t *testing.T) {
 	if gotBody["tools"] == nil || gotBody["tool_choice"] != "auto" {
 		t.Fatalf("工具定义应原样透传：%v %v", gotBody["tools"], gotBody["tool_choice"])
 	}
-	// 首条 system 的 content 必须以「空 text + cache_control: ephemeral」开头
+	// 流式必须带 stream_options.include_usage，否则上游不回 usage
+	// （来源：qwen-code-oai-proxy src/qwen/api.ts 流式 payload）。
+	so, _ := gotBody["stream_options"].(map[string]any)
+	if so == nil || so["include_usage"] != true {
+		t.Fatalf("流式请求应带 stream_options.include_usage=true：%v", gotBody["stream_options"])
+	}
+	// system 的 content 必须是「带 cache_control: ephemeral 的 text part 数组」，
+	// 且只在客户端给了 system 时才发（不凭空造一条）——来源：qwen-code-oai-proxy
+	// src/qwen/api.ts transformMessagesForPortal。
 	msgs, _ := gotBody["messages"].([]any)
-	if len(msgs) < 2 {
-		t.Fatalf("消息数组不对：%v", gotBody["messages"])
+	if len(msgs) != 2 {
+		t.Fatalf("消息数组应原样对应（不插空 system）：%v", gotBody["messages"])
 	}
 	head, _ := msgs[0].(map[string]any)
 	parts, _ := head["content"].([]any)
-	if head["role"] != "system" || len(parts) == 0 {
-		t.Fatalf("首条应为 system 且 content 是数组：%v", head)
+	if head["role"] != "system" || len(parts) != 1 {
+		t.Fatalf("首条应为 system 且 content 是单元素数组：%v", head)
 	}
 	p0, _ := parts[0].(map[string]any)
 	cc, _ := p0["cache_control"].(map[string]any)
-	if p0["type"] != "text" || p0["text"] != "" || cc["type"] != "ephemeral" {
-		t.Fatalf("缓存锚点不对：%v", p0)
+	if p0["type"] != "text" || p0["text"] != "你是助手" || cc["type"] != "ephemeral" {
+		t.Fatalf("system 的缓存锚点不对：%v", p0)
+	}
+	if u, _ := msgs[1].(map[string]any); u["role"] != "user" || u["content"] != "北京天气" {
+		t.Fatalf("user 消息应保持扁平字符串：%v", u)
 	}
 
 	var content strings.Builder
@@ -265,6 +280,80 @@ func TestChatSendsCLIShapeAndParsesTools(t *testing.T) {
 	}
 	if finish != "tool_calls" || !usageSeen {
 		t.Fatalf("finish_reason/usage 不对：%q %v", finish, usageSeen)
+	}
+}
+
+// 流内错误帧必须归一成 *errs.Error（带 Kind + 上游原话），不能被当成空帧丢掉。
+// 教训：TraeWork 就是因为流内错误没归一，上游原话被网关换成通用文案（红线一）。
+func TestChatSurfacesInStreamError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `data: {"id":"c1","choices":[{"index":0,"delta":{"content":"好"}}]}`+"\n\n")
+		fmt.Fprint(w, `data: {"error":{"message":"free allocated quota exceeded","type":"insufficient_quota"}}`+"\n\n")
+	}))
+	defer srv.Close()
+
+	a := testAdapter(srv)
+	st, err := a.Chat(context.Background(), &channel.Credential{UID: "u", AccessToken: "at"},
+		channel.ChatRequest{Model: "coder-model", Messages: []channel.Message{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatalf("Chat 失败：%v", err)
+	}
+	defer st.Close()
+
+	var got error
+	for {
+		_, err := st.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			got = err
+			break
+		}
+	}
+	if got == nil {
+		t.Fatal("流内错误必须被归一上报，不能静默结束成空流")
+	}
+	var ee *errs.Error
+	if !errors.As(got, &ee) {
+		t.Fatalf("必须是 *errs.Error（普通 error 会被网关换掉原话），got %T: %v", got, got)
+	}
+	if ee.Kind != errs.UpstreamFault || !strings.Contains(ee.Upstream, "quota exceeded") {
+		t.Fatalf("错误应带 Kind 与上游原话：%+v", ee)
+	}
+}
+
+// 客户端没给 system 就不凭空造一条；max_tokens 超过档位上限要本地夹住
+// （来源：qwen-code-oai-proxy src/qwen/api.ts transformMessagesForPortal / MODEL_LIMITS）。
+func TestChatKeepsMessagesAndClampsMaxTokens(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		json.Unmarshal(raw, &gotBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	a := testAdapter(srv)
+	st, err := a.Chat(context.Background(), &channel.Credential{UID: "u", AccessToken: "at"}, channel.ChatRequest{
+		Model: "coder-model", Messages: []channel.Message{{Role: "user", Content: "hi"}}, MaxTokens: 999999,
+	})
+	if err != nil {
+		t.Fatalf("Chat 失败：%v", err)
+	}
+	defer st.Close()
+
+	msgs, _ := gotBody["messages"].([]any)
+	if len(msgs) != 1 {
+		t.Fatalf("没有 system 时不该插入 system：%v", gotBody["messages"])
+	}
+	if m, _ := msgs[0].(map[string]any); m["content"] != "hi" {
+		t.Fatalf("user 消息应保持扁平字符串：%v", m)
+	}
+	if gotBody["max_tokens"] != float64(65536) {
+		t.Fatalf("超过档位上限的 max_tokens 应被夹到 65536，got %v", gotBody["max_tokens"])
 	}
 }
 

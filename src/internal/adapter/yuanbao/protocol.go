@@ -4,7 +4,7 @@ package yuanbao
 //
 // 元宝的凭证形态在几个参考实现里都是「把浏览器那一次请求的头原样重放」——
 // 因为它的鉴权就是这一份头（含 x-uskey）。我们从里面只需要两样东西：x-uskey 与 cookie。
-// 其余头（UA / Origin / Referer / Accept）由我们按浏览器形态补上。
+// 其余头（UA / Origin / Referer / X-Agentid / Accept）由我们按浏览器形态补上。
 
 import (
 	"encoding/json"
@@ -27,7 +27,9 @@ type cred struct {
 //  2. JSON：{"uskey":"…","cookie":"…"}；
 //  3. 只有 uskey 值的裸串。
 //
-// 只要求 x-uskey：两份参考实现都表明它是唯一被上游校验的东西（cookie 是顺带）。
+// 只要求 x-uskey：free-api 是整段头重放（其中就含它），chat2api 走 Cookie 的
+// hy_user/hy_token 并不发 x-uskey —— 两份不一致，我们选 x-uskey 作主凭证，
+// cookie 有就带上（见 constants.go 顶部说明）。
 func parseCred(raw string) (*cred, error) {
 	s := strings.TrimSpace(raw)
 	if s == "" {

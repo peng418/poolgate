@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"poolgate/internal/channel"
+	"poolgate/internal/errs"
 )
 
 // parseNestedSSE 逐行解析嵌套 SSE，每个有效 chunk 调 onChunk。
@@ -82,7 +83,10 @@ func (s *stream) pump() {
 		return nil
 	})
 	if err != nil {
-		send(channel.ChatCompletionChunk{}, err)
+		// 流中读取失败必须归一成 errs.Error：普通 error 到了网关会被按兜底 Parse
+		// 处理，客户端的错误帧连分类都拿不到（红线一）。
+		send(channel.ChatCompletionChunk{}, errs.New(errs.Transport, "读取上游流失败").
+			WithChannel(string(channel.QoderCOM)).WithCause(err))
 	}
 }
 

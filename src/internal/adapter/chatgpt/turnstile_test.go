@@ -4,9 +4,10 @@ package chatgpt
 //
 // 样例分两类：
 //  1. **参考实现里的那条**（ChatGPT2API-GO/internal/app/upstream_test.go:129）——
-//     `[[3,"ok"]]` → "b2s="，认证态下异或密钥为空串；
+//     `[[3,"ok"]]` → "b2s="；
 //  2. 我们自己按 opcode 表构造的小程序，逐条压容易写错的语义：
-//     set/xor/index/append/reenter/reject/cond-call/subprogram/window 取值。
+//     set/xor/index/append/reenter/reject/cond-call/subprogram/window 取值、以及
+//     混淆用的**小数槽位**（9.23 与 9 必须是两个槽位）。
 //
 // 边界必须说清楚：/tmp/refs 里的四份参考实现都**没有**留下真实的 dx 挑战体，
 // 所以「解释器对真实程序是否够用」只能在真上游验（见 solveTurnstileToken 的注释）。
@@ -31,18 +32,44 @@ func blob(program, xorKey string) string {
 
 func solveBlob(t *testing.T, program, xorKey string) (string, bool) {
 	t.Helper()
-	return solveTurnstileToken(blob(program, xorKey), xorKey, []string{defaultPowScript}, defaultUserAgent)
+	got, err := solveTurnstileToken(blob(program, xorKey), xorKey, []string{defaultPowScript}, defaultUserAgent)
+	return got, err == nil
 }
 
-// 参考实现自带的样例：认证态（密钥为空串）。
+// 参考实现自带的样例（明文程序、无密钥）。
 func TestSolveTurnstileReferenceSample(t *testing.T) {
 	dx := base64.StdEncoding.EncodeToString([]byte(`[[3,"ok"]]`))
-	got, ok := solveTurnstileToken(dx, "", nil, defaultUserAgent)
-	if !ok {
-		t.Fatal("参考实现给的样例必须能解出")
+	got, err := solveTurnstileToken(dx, "", nil, defaultUserAgent)
+	if err != nil {
+		t.Fatalf("参考实现给的样例必须能解出：%v", err)
 	}
 	if got != "b2s=" { // base64("ok")
 		t.Fatalf("样例结果应为 b2s=，得到 %q", got)
+	}
+}
+
+// **混淆槽位回归**：上游把 opcode 与数据绑到随机**小数**槽位上（实测程序里有 `[84.18, 9.23, 7]`）。
+// regs 必须按 JS 属性名存：9.23 与 9 是两个槽位。曾经用 map[int]any（截断），于是 9.23 → 9
+// 正好砸中程序队列寄存器，队列被换成字符串、程序当场停摆 —— 这才是本渠道整体不可用的根因。
+func TestSolveTurnstileFloatSlotsAreDistinct(t *testing.T) {
+	// 先往 9.23 写一个值（旧实现会写到 9 = 程序队列），再正常结束。
+	got, ok := solveBlob(t, `[[2,9.23,"x"],[2,36,"ok"],[7,3,36]]`, "")
+	if !ok || got != "b2s=" {
+		t.Fatalf("小数槽位被截断成整数槽位了：%q（ok=%v）", got, ok)
+	}
+	// 整数 9 本身仍要是程序队列：写它就该把队列换掉（这里换成空 → 跑不出结果）。
+	if _, ok := solveBlob(t, `[[2,9,[]],[3,"ok"]]`, ""); ok {
+		t.Fatal("写槽位 9 应当换掉程序队列，不该还能解出结果")
+	}
+}
+
+// 用错异或密钥要明确说「解出来不是程序」，而不是含糊地说解释器不支持。
+func TestSolveTurnstileWrongKeySaysWhy(t *testing.T) {
+	dx := blob(`[[3,"ok"]]`, "right-key")
+	if _, err := solveTurnstileToken(dx, "wrong-key", nil, defaultUserAgent); err == nil {
+		t.Fatal("用错密钥不该解出")
+	} else if !strings.Contains(err.Error(), "不是合法程序") {
+		t.Fatalf("错误文本没说明真实原因：%v", err)
 	}
 }
 
@@ -145,7 +172,7 @@ func TestSolveTurnstileFailsExplicitly(t *testing.T) {
 		{"程序里没有 op3", base64.StdEncoding.EncodeToString([]byte(`[[2,36,"x"]]`))},
 	}
 	for _, c := range cases {
-		if got, ok := solveTurnstileToken(c.dx, "", nil, defaultUserAgent); ok {
+		if got, err := solveTurnstileToken(c.dx, "", nil, defaultUserAgent); err == nil {
 			t.Fatalf("%s：不该判为解出，得到 %q", c.name, got)
 		}
 	}

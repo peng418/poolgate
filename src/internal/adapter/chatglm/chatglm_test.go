@@ -40,6 +40,10 @@ func TestMakeSignMatchesAlgorithm(t *testing.T) {
 	if len(sign.nonce) != 32 {
 		t.Fatalf("nonce 应是 32 位无横线 uuid：%s", sign.nonce)
 	}
+	// 版本位：参考实现用的是 uuid v1（util.ts:10 `import { v1 as uuid }`），第 13 位 hex 必须是 '1'。
+	if sign.nonce[12] != '1' {
+		t.Fatalf("nonce 应是 v1 uuid（第 13 位为 '1'），得到：%s", sign.nonce)
+	}
 	sum := md5.Sum([]byte(sign.timestamp + "-" + sign.nonce + "-secret-under-test"))
 	if want := hex.EncodeToString(sum[:]); sign.sign != want {
 		t.Fatalf("签名原文拼法不对：got %s want %s", sign.sign, want)
@@ -67,9 +71,9 @@ func TestPackMessagesRoleMarks(t *testing.T) {
 }
 
 func TestPackMessagesSingleMessagePassesThrough(t *testing.T) {
-	// 只有一条消息时不加角色标记（参考实现的分支）。
-	if got := packMessages([]channel.Message{{Role: "user", Content: "就一句"}}); got != "就一句" {
-		t.Fatalf("单条消息应原样透传，得到：%q", got)
+	// 只有一条消息时不加角色标记（参考实现的分支），但段末的换行照参考实现要带（chat.ts:827-835）。
+	if got := packMessages([]channel.Message{{Role: "user", Content: "就一句"}}); got != "就一句\n" {
+		t.Fatalf("单条消息应原样透传（段末带换行），得到：%q", got)
 	}
 }
 
@@ -106,7 +110,7 @@ func TestStreamStateRewritesSearchRefs(t *testing.T) {
 	var ev map[string]any
 	_ = json.Unmarshal([]byte(`{"parts":[{"logic_id":"p1","status":"wip","content":[
 		{"type":"tool_result","meta_data":{"tool_result_extra":{"search_results":[
-			{"id":"turn1search1","title":"标题","url":"https://example.com/a"}]}}},
+			{"match_key":"turn1search1","title":"标题","url":"https://example.com/a"}]}}},
 		{"type":"text","text":"参考【turn1search1】"}]}]}`), &ev)
 	txt, rsn := st.feed(ev)
 	if !strings.Contains(txt, "[1](https://example.com/a)") {
@@ -138,6 +142,10 @@ func TestChatEndToEnd(t *testing.T) {
 			if got := r.Header.Get("X-Device-Id"); len(got) != 32 {
 				t.Errorf("每请求都要新的设备 id（32 位）：%q", got)
 			}
+			// 对话请求要带网页端形态的 Referer（chat.ts:424-428），默认智能体走 alltoolsdetail。
+			if got := r.Header.Get("Referer"); got != "https://chatglm.cn/main/alltoolsdetail" {
+				t.Errorf("对话请求的 Referer 不对：%q", got)
+			}
 			raw, _ := io.ReadAll(r.Body)
 			var body struct {
 				AssistantID string `json:"assistant_id"`
@@ -166,8 +174,8 @@ func TestChatEndToEnd(t *testing.T) {
 			if body.Meta.ChatMode != "zero" {
 				t.Errorf("-think 档应把 chat_mode 设成 zero，得到 %q", body.Meta.ChatMode)
 			}
-			// 单条消息不加角色标记（只有多轮才需要区分谁说的）
-			if body.Messages[0].Content[0].Text != "你好" {
+			// 单条消息不加角色标记（只有多轮才需要区分谁说的），段末带换行（chat.ts:827-835）
+			if body.Messages[0].Content[0].Text != "你好\n" {
 				t.Errorf("历史拼接不对：%q", body.Messages[0].Content[0].Text)
 			}
 
@@ -230,6 +238,62 @@ func TestChatEndToEnd(t *testing.T) {
 	}
 	if chatCalls != 1 || refreshCalls != 1 {
 		t.Fatalf("调用次数不对：chat=%d refresh=%d", chatCalls, refreshCalls)
+	}
+}
+
+// 默认档位（非 think / 非 deepresearch）的请求体里**不能出现 chat_mode 键**（空串也不行）：
+// 参考实现是 `chat_mode: chatMode || undefined`，空串会被 JSON.stringify 整个删掉（chat.ts:285）。
+func TestChatOmitsChatModeOnDefaultSpec(t *testing.T) {
+	var rawBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == epRefresh {
+			_, _ = w.Write([]byte(`{"code":0,"result":{"access_token":"access-tok"}}`))
+			return
+		}
+		rawBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`data: {"status":"finish","conversation_id":"c1"}` + "\n\n"))
+	}))
+	defer srv.Close()
+
+	a := New()
+	a.base = srv.URL
+	cred := &channel.Credential{UID: "chatglm-test", RefreshToken: "refresh-tok"}
+	st, err := a.Chat(context.Background(), cred, channel.ChatRequest{
+		Model: "glm-4.6", Messages: []channel.Message{{Role: "user", Content: "你好"}},
+	})
+	if err != nil {
+		t.Fatalf("Chat 失败：%v", err)
+	}
+	defer st.Close()
+	if strings.Contains(string(rawBody), "chat_mode") {
+		t.Fatalf("默认档位不应带 chat_mode 键：%s", rawBody)
+	}
+}
+
+// 上游轮换 refresh token 时，新值必须写回凭证。
+// 网页端是靠 Set-Cookie 覆盖 chatglm_refresh_token 持久化新值的；参考实现 chat.ts:143-148
+// 解构了 refresh_token 却没用它 —— 我们不留这个缺陷（旧值继续用迟早失效）。
+func TestRefreshPersistsRotatedToken(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == epRefresh {
+			_, _ = w.Write([]byte(`{"code":0,"result":{"access_token":"access-new","refresh_token":"refresh-new"}}`))
+			return
+		}
+		t.Errorf("未预期的路径：%s", r.URL.Path)
+	}))
+	defer srv.Close()
+
+	a := New()
+	a.base = srv.URL
+	cred := &channel.Credential{UID: "chatglm-test", RefreshToken: "refresh-old"}
+	nc, err := a.Refresh(context.Background(), cred)
+	if err != nil {
+		t.Fatalf("Refresh 失败：%v", err)
+	}
+	if nc == nil || nc.RefreshToken != "refresh-new" || nc.AccessToken != "access-new" {
+		t.Fatalf("轮换后的 refresh token 没写回：%+v", nc)
 	}
 }
 

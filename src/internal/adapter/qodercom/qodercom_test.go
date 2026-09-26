@@ -2,6 +2,8 @@ package qodercom
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -48,6 +50,21 @@ func TestDomainsAreCOM(t *testing.T) {
 		if !contains(v, "qoder.sh") {
 			t.Fatalf("%s 应为 COM 域名（qoder.sh），实际 %s", name, v)
 		}
+	}
+}
+
+// 模型目录必须走 api2.qoder.sh（ModelsBase），不能误用推理网关 api1.qoder.sh ——
+// COM 是两个域名，CN 才是同一个（wild-work internal/qodercom/client.go 的 ModelsBase +
+// models.go `rawURL := c.ModelsBase + EpModels`）。复制改域名时最容易漏的就是这一处。
+func TestModelsBaseIsDedicatedHost(t *testing.T) {
+	if got := New().modelsBase; got != ModelsBase {
+		t.Fatalf("New() 的模型目录域名应为 %s，实际 %s", ModelsBase, got)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	a := NewWithBase(srv.URL, srv.URL, srv.Client())
+	if a.modelsBase != srv.URL {
+		t.Fatalf("NewWithBase 应把模型目录也指向测试服务，否则测试会打到真上游：%s", a.modelsBase)
 	}
 }
 

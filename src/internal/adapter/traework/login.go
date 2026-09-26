@@ -273,6 +273,7 @@ func (a *Adapter) exchangeAuthCode(ctx context.Context, callbackHost, authCode, 
 			"ClientVersion":   IdeVersion,
 			"DevicePublicKey": pubPEM,
 			"DeviceBrand":     DeviceBrand,
+			"DeviceCPU":       "", // 官方客户端 DeviceInfo 固定带这个空字段（依据：wild-work traework/authcode.go DeviceInfo.DeviceCPU）
 			"OSInfo":          "windows",
 			"OSVersion":       OSVersion,
 		},
@@ -496,6 +497,7 @@ func buildAuthURL(callback, machineID, deviceID, challenge string) string {
 	v.Set("x_device_brand", DeviceBrand)
 	v.Set("x_device_type", "windows")
 	v.Set("x_os_version", OSVersion)
+	v.Set("x_env", "") // 官方客户端 bb() 会带这个空值参数（依据：wild-work login_trae/login.go:138），漏了它授权页的环境校验可能不认
 	v.Set("x_app_version", IdeVersion)
 	v.Set("x_app_type", "stable")
 	v.Set("code_challenge", challenge)

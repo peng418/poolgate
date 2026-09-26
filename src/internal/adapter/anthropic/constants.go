@@ -8,11 +8,15 @@ package anthropic
 //	claude-code-cli/constants/oauth.ts
 //	    从 Claude Code 本体抽出的**官方配置**：授权地址、令牌地址、client_id、
 //	    回调地址、scope 全集。最权威的一份。
+//	claude-code-cli/utils/betas.ts、services/api/client.ts、services/oauth/client.ts
+//	    官方 CLI 真正发出的 anthropic-beta 组合、伪装头，以及 refresh 的报文。
+//	    Messages 请求里 beta 头不止一个值（见 cliBeta）。
 //	KarpelesLab/teamclaude（src/oauth.js）
 //	    完整跑通 PKCE + 手工粘回授权码的授权码流程，并且用 Bearer + oauth beta
-//	    头调 Messages API。
+//	    头调账号接口（usage/profile）。
 //	AmazingAng/auth2api（src/auth/oauth.ts、src/upstream/anthropic-api.ts）
-//	    令牌兑换的报文形态，以及**scope 里的冒号不能编码**这个坑。
+//	    令牌兑换的报文形态，**scope 里的冒号不能编码**这个坑，以及订阅令牌走
+//	    Messages API 时的完整伪装头清单。
 //
 // 三份互相印证；冲突处以「从 Claude Code 抽出的官方配置」为准（见 epToken 的说明）。
 
@@ -75,6 +79,19 @@ const (
 	// API key 走 x-api-key + anthropic-version。两者用反了上游只回 401，
 	// 看起来像「令牌无效」，实际是认证方式搞混了。
 	oauthBeta = "oauth-2025-04-20"
+
+	// cliBeta 是官方 CLI 在**非 haiku** 模型上固定追加的 beta 头。
+	//
+	// 依据：claude-code-cli/utils/betas.ts:240-252 的 getAllModelBetas —— 非 haiku
+	// 模型先 push 'claude-code-20250219'（constants/betas.ts:3，betas.ts:241），
+	// 订阅账号再 push OAUTH_BETA_HEADER（betas.ts:252）；auth2api 的 buildBetaHeader
+	// （src/upstream/anthropic-api.ts:29-32）也是这两项并列。所以真实 Claude Code 的
+	// Messages 请求头是「claude-code-20250219,oauth-2025-04-20,…」而不是只带 oauth 一项。
+	//
+	// 我们只跟这两项，**不带**参考实现里属于具体功能的 beta（interleaved-thinking /
+	// redact-thinking / effort / structured-outputs / context-management 等）：
+	// 那些是「打开某个功能」，不是认证所需，带上等于替客户端改了行为（红线一）。
+	cliBeta = "claude-code-20250219"
 
 	// anthropicVersion 是 Messages API 的版本头。Anthropic 要求每个请求都带，
 	// 语义是「按日期锁定行为」—— 不能省，也不能乱升。

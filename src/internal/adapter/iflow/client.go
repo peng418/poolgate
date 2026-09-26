@@ -166,11 +166,19 @@ func (a *Adapter) Chat(ctx context.Context, c *channel.Credential, req channel.C
 		resp.Body.Close()
 		// 注意：这里**不重试**。apiKey 没有刷新链路，401 就是凭证真的失效了，
 		// 重试只会把同一个死凭证再打一遍（不会变好，只会多一条上游错误）。
-		return nil, errs.New(a.Classify(resp.StatusCode, raw), "上游返回错误").
+		// iFlow 的错误文案在**顶层 msg**（proxy.py:694 / app.py:1220），取出来当人话；
+		// 取不到就把原报文放进 Upstream（红线一：错误可见）。
+		msg := "上游返回错误"
+		if txt := errorTextFromBytes(raw); txt != "" {
+			msg = "上游返回错误：" + txt
+		}
+		return nil, errs.New(a.Classify(resp.StatusCode, raw), msg).
 			WithChannel(string(channel.IFlow)).WithAccount(uidOf(c)).
 			WithUpstream(truncate(string(raw), 200))
 	}
-	return newStream(resp.Body, resp.Header.Get("Content-Type"), model), nil
+	// wantStream 决定「content-type 是 application/octet-stream 时按不按 SSE 解」
+	// （参考实现 proxy.py:687 只在流式分支把 octet-stream 当流），所以要把流式意图传下去。
+	return newStream(resp.Body, resp.Header.Get("Content-Type"), model, req.Stream), nil
 }
 
 // probeCredential 用一个**最小对话请求**确认这串 apiKey 现在真的能用。
@@ -208,20 +216,32 @@ func (a *Adapter) probeCredential(ctx context.Context, c *channel.Credential) er
 			WithChannel(string(channel.IFlow)).WithAccount(uidOf(c)).
 			WithUpstream(truncate(string(raw), 200))
 	}
-	// 200 但信封里带 error：上游有「HTTP 200 + 业务错误」的先例，不能当成功（红线二）。
+	// 200 但信封里带错误：上游有「HTTP 200 + 业务错误」的先例，不能当成功（红线二）。
+	// iFlow 的错误信封装在**顶层 `msg`**（参考实现一律读 error_data.get("msg")：
+	// proxy.py:694、app.py:1184/1220/1547），OpenAI 风格的 {"error":{...}} 也认 ——
+	// upstreamError 两种都处理。
 	var env map[string]any
-	if json.Unmarshal(raw, &env) == nil {
-		if e, ok := env["error"].(map[string]any); ok {
-			msg, _ := e["message"].(string)
-			if strings.TrimSpace(msg) == "" {
-				msg = truncate(string(raw), 200)
-			}
-			// 默认归 UpstreamFault 而不是 SessionDead：只有报文里明确是身份/鉴权问题时
-			// 才算凭证死了；否则会把「上游临时抽风」误判成「key 坏了」，逼用户白重登一次。
-			return errs.New(classifyBody(errs.UpstreamFault, msg), "凭证校验失败："+msg).
-				WithChannel(string(channel.IFlow)).WithAccount(uidOf(c)).
-				WithUpstream(truncate(string(raw), 200))
+	if json.Unmarshal(raw, &env) != nil {
+		return errs.New(errs.UpstreamFault, "凭证校验失败：上游响应不是合法 JSON").
+			WithChannel(string(channel.IFlow)).WithAccount(uidOf(c)).
+			WithUpstream(truncate(string(raw), 200))
+	}
+	if msg, isErr := upstreamError(env); isErr {
+		if strings.TrimSpace(msg) == "" {
+			msg = truncate(string(raw), 200)
 		}
+		// 默认归 UpstreamFault 而不是 SessionDead：只有报文里明确是身份/鉴权问题时
+		// 才算凭证死了；否则会把「上游临时抽风」误判成「key 坏了」，逼用户白重登一次。
+		return errs.New(classifyBody(errs.UpstreamFault, msg), "凭证校验失败："+msg).
+			WithChannel(string(channel.IFlow)).WithAccount(uidOf(c)).
+			WithUpstream(truncate(string(raw), 200))
+	}
+	// 一次成功的对话回包必然带非空 choices（参考实现同样把「没有 choices」当失败：
+	// app.py:1194 `if not result.get("choices")`）。没有就是没拿到有效结果，不能当成功。
+	if choices, ok := env["choices"].([]any); !ok || len(choices) == 0 {
+		return errs.New(errs.UpstreamFault, "凭证校验失败：上游响应缺少 choices").
+			WithChannel(string(channel.IFlow)).WithAccount(uidOf(c)).
+			WithUpstream(truncate(string(raw), 200))
 	}
 	return nil
 }
@@ -292,6 +312,18 @@ func classifyBody(def errs.Kind, msg string) errs.Kind {
 // 头名大小写说明：参考实现里全小写，那是 httpx 自动归一的结果（HTTP 头本身大小写不敏感），
 // 所以在 Go 里用标准写法即可 —— 上游不会因为 `User-Agent` 与 `user-agent` 的差别拒请求。
 // 但**参与签名的原文**必须用常量 cliUserAgent，不能用被改写过的头值。
+//
+// 头集合照抄参考实现 _get_headers（proxy.py:104-129）：Content-Type / Authorization /
+// user-agent / session-id / conversation-id / accept / accept-language / sec-fetch-mode /
+// traceparent（Aone 内网端点的 X-Client-Type·X-Client-Version 不带，我们只打 apis.iflow.cn）。
+// 交叉印证：第二份独立实现 AIClient2API（iflow-core.js:764-794）只发前五项 + Accept +
+// x-iflow-*，**不带** conversation-id / accept-language / sec-fetch-mode / traceparent；
+// 可见这几项是「指纹增强」而非必需 —— 两份实现都能跑通，故按更全的那份保留，无副作用。
+//
+// **故意不抄 `accept-encoding: br, gzip, deflate`**：Go 的 net/http 只要发现请求头里已有
+// Accept-Encoding，就既不自动补 gzip、也不自动解压（见 net/http roundTrip 的透明解压条件）。
+// 照抄会让上游可能回 brotli，而标准库解不了，正文直接变乱码 —— 不设它，Go 自动用 gzip 并解码，
+// 行为上更稳。这个头不参与签名，也不影响 UA 解锁高级模型。
 func (a *Adapter) send(ctx context.Context, c *channel.Credential, key string, body []byte) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.base+epChat, bytes.NewReader(body))
 	if err != nil {
@@ -303,6 +335,9 @@ func (a *Adapter) send(ctx context.Context, c *channel.Credential, key string, b
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "*")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Traceparent", traceparent())
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("User-Agent", cliUserAgent)
 	req.Header.Set("Session-Id", session)

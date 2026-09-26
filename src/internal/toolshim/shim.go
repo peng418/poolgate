@@ -116,8 +116,35 @@ func BuildRequest(req channel.ChatRequest) channel.ChatRequest {
 		msgs = append(msgs, channel.Message{Role: "system", Content: strings.Join(systems, "\n\n")})
 	}
 	msgs = append(msgs, rest...)
-	out.Messages = msgs
+	out.Messages = withReminder(msgs, ReminderSuffix)
 	return out
+}
+
+// ReminderSuffix 是接在**对话末尾**的格式提醒（不是写进系统提示词的那份）。
+//
+// 为什么末尾还要再说一遍：实测（2026-09-26，豆包网页渠道，30 个工具 + 2 万字 agent 系统
+// 提示词、真实口吻的请求）只把约定放在系统提示词里时，4/4 次都直接用自然语言回答、
+// 一个工具都不调；同一份请求只在最后一条消息末尾补这句，4/4 次都正确调用工具
+// （doubao 另一个档位 2/3）。系统提示词一长，那里的约定就被淹没了，
+// 而紧挨着生成位置的那句话才起作用。所以两份都留着：系统里那份给完整说明，末尾这份保命中率。
+const ReminderSuffix = "\n\n[工具调用格式提醒] 只要这个任务需要动作（读文件、查日志、执行命令、搜索等），" +
+	"你必须**先调用工具**再作答：只输出 " + OpenTag + `{"name":"工具名","arguments":{…}}` + CloseTag + "，" +
+	"不要用自然语言描述你打算怎么做，也不要凭已有知识直接回答。可用工具见系统提示词。"
+
+// withReminder 把提醒接在最后一条消息末尾；末尾不是用户侧消息时补一条。
+//
+// 接在末尾而不是新建一条：agent 循环里最后一条通常就是刚回填的工具结果，
+// 那句话本来就该紧跟着它；新建一条又会把上游的「单轮」结构撑成两轮。
+func withReminder(msgs []channel.Message, reminder string) []channel.Message {
+	if reminder == "" || len(msgs) == 0 {
+		return msgs
+	}
+	last := &msgs[len(msgs)-1]
+	if last.Role == "user" {
+		last.Content = strings.TrimRight(last.Content, "\n") + reminder
+		return msgs
+	}
+	return append(msgs, channel.Message{Role: "user", Content: strings.TrimLeft(reminder, "\n")})
 }
 
 // rewriteMessage 把工具语义的消息改写成纯文本形态。

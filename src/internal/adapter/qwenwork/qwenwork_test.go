@@ -81,6 +81,35 @@ func TestModelsSourceIsHonest(t *testing.T) {
 	}
 }
 
+// 展示名要取上游的**扁平** display_name（实测报文形态，wild-work modelEntry 同款字段）：
+// 只解析 i18n.display_name 会拿不到值，面板会把 key（pro/flash）当名字显示。
+func TestModelsUsesUpstreamDisplayName(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"qwork":[
+			{"key":"flash","display_name":"标准","enable":true,"max_input_tokens":200000},
+			{"key":"pro","i18n":{"display_name":{"zh":"高级"}},"enable":true,"max_input_tokens":200000}
+		]}`))
+	}))
+	defer srv.Close()
+
+	a := NewWithBase(srv.URL, nil)
+	cred := channel.Credential{UID: "u1", AccessToken: "t"}
+	models, err := a.Models(context.Background(), &cred)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]string{}
+	for _, m := range models {
+		byID[m.ID] = m.DisplayName
+	}
+	if byID["flash"] != "标准" {
+		t.Fatalf("应取扁平 display_name，实际 %q", byID["flash"])
+	}
+	if byID["pro"] != "高级" {
+		t.Fatalf("i18n.display_name.zh 存在时优先，实际 %q", byID["pro"])
+	}
+}
+
 // 目录接口不可用时要回退静态表，而不是返回空（空目录会让面板看起来「没有模型」）。
 func TestModelsFallsBackToStatic(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -168,6 +197,14 @@ func TestClassify(t *testing.T) {
 		{500, `internal`, errs.UpstreamFault},
 		{200, `{"msg":"credits exhausted"}`, errs.HardCredit},
 		{200, `{"msg":"insufficient balance"}`, errs.HardCredit},
+		// 中文额度文案（wild-work hardMarkers 原表）不能落成 Parse，否则会被当上游故障。
+		{200, `{"msg":"积分不足"}`, errs.HardCredit},
+		{400, `{"msg":"not enough credit"}`, errs.HardCredit},
+		// 402 Payment Required 是额度不足（wild-work Classify 首判）。
+		{402, `payment required`, errs.HardCredit},
+		// 403 带内容拦截标记时是内容拦截，不是账号失效（不然会误冷却好号）。
+		{403, `{"msg":"检测到敏感内容"}`, errs.ContentBlocked},
+		{403, `{"msg":"blocked by security policy"}`, errs.ContentBlocked},
 		{200, `{"msg":"Model is not available for this user"}`, errs.ModelUnavailable},
 		{404, `not found`, errs.ModelUnavailable},
 	}
@@ -234,6 +271,9 @@ func TestClassifyRPC(t *testing.T) {
 	}
 	if k, _ := errs.KindOf(s.classifyRPC(4001, "token expired")); k != errs.SessionDead {
 		t.Fatalf("会话失效应归 SessionDead，实际 %v", k)
+	}
+	if k, _ := errs.KindOf(s.classifyRPC(0, "内容被 blocked by security policy")); k != errs.ContentBlocked {
+		t.Fatalf("流内内容拦截应归 ContentBlocked，实际 %v", k)
 	}
 	if k, _ := errs.KindOf(s.classifyRPC(0, "weird upstream thing")); k != errs.UpstreamFault {
 		t.Fatalf("其余应归 UpstreamFault，实际 %v", k)

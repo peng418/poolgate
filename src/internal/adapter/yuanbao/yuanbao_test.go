@@ -85,12 +85,49 @@ func TestBuildBodyMatchesConsensus(t *testing.T) {
 	}
 }
 
+func TestWebModelsMatchFreeAPI(t *testing.T) {
+	// 档位清单以较新的 free-api 为准（src/const.py:3-12）：8 档，含 4 个联网变体；
+	// chat2api 只列两档且没实现联网（src/service.rs:87-103、src/yuanbao.rs:163）。
+	want := map[string]struct {
+		upward string
+		search bool
+	}{
+		"deepseek-v3":        {"deep_seek_v3", false},
+		"deepseek-r1":        {"deep_seek", false},
+		"deepseek-v3-search": {"deep_seek_v3", true},
+		"deepseek-r1-search": {"deep_seek", true},
+		"hunyuan":            {"hunyuan_gpt_175B_0404", false},
+		"hunyuan-t1":         {"hunyuan_t1", false},
+		"hunyuan-search":     {"hunyuan_gpt_175B_0404", true},
+		"hunyuan-t1-search":  {"hunyuan_t1", true},
+	}
+	if len(webModels) != len(want) {
+		t.Fatalf("档位数应为 %d，得到 %d", len(want), len(webModels))
+	}
+	for _, m := range webModels {
+		w, ok := want[m.ID]
+		if !ok {
+			t.Errorf("多出来的档位：%s", m.ID)
+			continue
+		}
+		if m.Upward != w.upward || m.Search != w.search {
+			t.Errorf("%s：期望 %s/%v，得到 %s/%v", m.ID, w.upward, w.search, m.Upward, m.Search)
+		}
+	}
+}
+
 func TestChatEndToEndFrameRouting(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == epCreate:
 			if got := r.Header.Get("x-uskey"); got != "u-1" {
 				t.Errorf("建会话也要带 x-uskey，得到 %q", got)
+			}
+			if got := r.Header.Get("X-Agentid"); got != agentID {
+				t.Errorf("缺/错 X-Agentid（chat2api src/yuanbao.rs:270-273）：%q", got)
+			}
+			if got := r.Header.Get("Referer"); got != apiBase+"/chat/"+agentID {
+				t.Errorf("Referer 应带 agent id（chat2api src/yuanbao.rs:264-269）：%q", got)
 			}
 			_, _ = w.Write([]byte(`{"id":"conv-1"}`))
 

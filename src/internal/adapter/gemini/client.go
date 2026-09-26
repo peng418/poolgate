@@ -122,7 +122,7 @@ func (a *Adapter) Chat(ctx context.Context, c *channel.Credential, req channel.C
 		}
 		project = p
 	}
-	body, err := buildRequest(req, project, "poolgate-"+c.UID)
+	body, err := buildRequest(req, project)
 	if err != nil {
 		return nil, errs.New(errs.Parse, "构造请求体失败").WithChannel(string(channel.Gemini)).
 			WithAccount(c.UID).WithCause(err)
@@ -149,7 +149,7 @@ func (a *Adapter) Chat(ctx context.Context, c *channel.Credential, req channel.C
 		return nil, errs.New(a.Classify(resp.StatusCode, raw), "上游返回错误").
 			WithChannel(string(channel.Gemini)).WithAccount(c.UID).WithUpstream(truncate(string(raw), 200))
 	}
-	return newStream(resp.Body, req.Model), nil
+	return newStream(a, resp.Body, req.Model), nil
 }
 
 // Classify 把上游错误归一成有限枚举。
@@ -199,6 +199,7 @@ func (a *Adapter) Classify(status int, body []byte) errs.Kind {
 // 两个细节与别家不同：① 每帧外面还包了一层 `response`，要先解包；
 // ② SSE 允许 `data:` 跨多行，遇到空行才算一帧（按行直接 parse 会解析失败）。
 type stream struct {
+	a     *Adapter // 复用它的 Classify，把流内错误的 code 归一成同一套 Kind
 	rc    io.ReadCloser
 	model string
 	ch    chan chunkOrErr
@@ -210,8 +211,8 @@ type chunkOrErr struct {
 	err   error
 }
 
-func newStream(rc io.ReadCloser, model string) *stream {
-	s := &stream{rc: rc, model: model, ch: make(chan chunkOrErr, 16)}
+func newStream(a *Adapter, rc io.ReadCloser, model string) *stream {
+	s := &stream{a: a, rc: rc, model: model, ch: make(chan chunkOrErr, 16)}
 	go s.pump()
 	return s
 }
@@ -223,7 +224,12 @@ func (s *stream) pump() {
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil && err != io.EOF {
-			s.ch <- chunkOrErr{err: err}
+			// 读流中断（连接被掐 / TLS / 超时）：必须归一成 errs.Error。
+			// 普通 error 走到网关会被当成 Parse（KindOf 认不出就落 Parse），把「连不上」
+			// 误记成「解析失败」；原话也塞进 Upstream —— 网关对结构化的 errs.Error
+			// 只透出 Message + Upstream，不展开 Cause，不写进 Upstream 就等于丢掉原话（红线一）。
+			s.ch <- chunkOrErr{err: errs.New(errs.Transport, "读取上游流失败").
+				WithChannel(string(channel.Gemini)).WithUpstream(truncate(err.Error(), 200)).WithCause(err)}
 			return
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -232,23 +238,47 @@ func (s *stream) pump() {
 			data = append(data, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
 		case line == "":
 			if payload := strings.Join(data, "\n"); payload != "" {
-				s.emit(payload)
+				if !s.emit(payload) {
+					return
+				}
 			}
 			data = data[:0]
 		}
 		if err == io.EOF {
 			if payload := strings.Join(data, "\n"); payload != "" {
-				s.emit(payload) // 收尾：最后一帧可能没有空行结尾
+				_ = s.emit(payload) // 收尾：最后一帧可能没有空行结尾
 			}
 			return
 		}
 	}
 }
 
-func (s *stream) emit(payload string) {
+// emit 处理一帧。返回 false 表示流内出现了不可继续的错误（已投递给调用方）。
+//
+// 流内错误必须**显式**转成 errs.Error：上游的 HTTP 状态已经是 200，错误只能从帧里出。
+// 参考实现专门处理这一支 —— geminicli2api openai_routes.py:81-93（检查 "error" in obj）
+// 与 google_api_client.py:129-137（把上游 message 原样透出）。过去没处理时，
+// `{"error":…}` 帧会被当成「没有 candidates 的普通帧」静默跳过，客户端只看到空回复。
+// 同族 antigravity 适配器已按这个形态处理（antigravity/client.go:485-501），此处对齐。
+func (s *stream) emit(payload string) bool {
 	var frame map[string]any
 	if json.Unmarshal([]byte(payload), &frame) != nil {
-		return // 非 JSON 帧（注释/心跳）跳过
+		return true // 非 JSON 帧（注释/心跳）跳过
+	}
+	if e, ok := frame["error"].(map[string]any); ok {
+		msg, _ := e["message"].(string)
+		if strings.TrimSpace(msg) == "" {
+			msg = truncate(payload, 200)
+		}
+		// code 缺省时按上游故障算；有 code 就复用 Classify（与 HTTP 错误同一套枚举，
+		// 429/欠费/400 都分得对）。
+		kind := errs.UpstreamFault
+		if code := intOf(e["code"]); code > 0 && s.a != nil {
+			kind = s.a.Classify(code, []byte(msg))
+		}
+		s.ch <- chunkOrErr{err: errs.New(kind, "上游流内错误："+msg).
+			WithChannel(string(channel.Gemini)).WithUpstream(truncate(payload, 200))}
+		return false
 	}
 	resp, _ := frame["response"].(map[string]any)
 	if resp == nil {
@@ -257,6 +287,7 @@ func (s *stream) emit(payload string) {
 	if c, ok := chunksFromFrame(resp, s.model, &s.seq); ok {
 		s.ch <- chunkOrErr{chunk: c}
 	}
+	return true
 }
 
 func (s *stream) Next() (channel.ChatCompletionChunk, error) {

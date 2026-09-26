@@ -241,7 +241,10 @@ func identityOf(token string) (uid, nickname string) {
 		}
 		return ""
 	}
-	uid = pick("sub", "uid", "user_id", "userId", "email", "username")
+	// 通义的 JWT 身份字段参考实现读的是 `id`（qwen-free-api internal/qbridge/qwen.go
+	// decodeJWT：claims{ID:"id", Email, Name}），OAuth 令牌常见的是 `sub`；两个都认，
+	// 再退到 email/username。只解析 payload、不验签，仅用于面板标识。
+	uid = pick("sub", "id", "uid", "user_id", "userId", "email", "username")
 	nickname = pick("username", "name", "nickname", "email")
 	return uid, nickname
 }

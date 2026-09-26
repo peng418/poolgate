@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"poolgate/internal/channel"
+	"poolgate/internal/errs"
 )
 
 type soloEvent struct {
@@ -183,7 +184,7 @@ func (s *stream) pump() {
 					// 上游明确报错：立刻把错误交给客户端，不等连接关闭。
 					// 之前是攒到流结束才发 —— 上游报错后若继续压着连接不关，
 					// 客户端就会「既不回复也不报错」（wild-work 的老毛病，红线一）。
-					s.ch <- chunkOrErr{err: &soloErr{code: ev.ErrorCode, msg: ev.ErrorMessage}}
+					s.ch <- chunkOrErr{err: soloError(ev.ErrorCode, ev.ErrorMessage)}
 					return
 				}
 			}
@@ -206,12 +207,39 @@ type contentDelta struct {
 	toolCalls []channel.ToolCall
 }
 
-type soloErr struct {
-	code int64
-	msg  string
+// soloError 把 SOLO 的 `event:error` 归一成结构化错误（errs.Error）。
+//
+// 为什么必须归一：这些错**只出现在 SSE 流里**（HTTP 状态码一律 200），所以走不到
+// Chat 里那条 `resp.StatusCode >= 400` 的分支。以前这里返回的是普通 error，
+// 网关取 Kind 时落到兜底的 Parse、消息被换成通用的「上游请求失败」——
+// 上游原话整句丢掉（实测：额度耗尽时上游回的是
+// `{"code":4008,"message":"Your requests have exceeded the quota."}`，
+// 客户端却只看到「解析失败」，既定位不了原因，也让账号健康判定失去依据）。
+func soloError(code int64, msg string) error {
+	up := "code=" + itoa64(code) + " " + msg
+	return errs.New(soloKind(code, msg), "上游流内错误："+msg).
+		WithChannel(string(channel.TraeWork)).
+		WithUpstream(up)
 }
 
-func (e *soloErr) Error() string { return "solo error code=" + itoa64(e.code) + " msg=" + e.msg }
+// soloKind 把 SOLO 的流内错误码/文案归一成错误分类。
+//
+// 码表来自上游实际回包：4008 = 请求超出配额（"exceeded the quota"，实测额度用完后
+// 每次对话都回它），1005 = 套餐失效（与 HTTP 路径的 Classify 同判据）。
+// 判不出来的一律归 UpstreamFault —— 它是上游自己报的错，不是我们解析不出来，
+// 归 Parse 会误导用户，也会让「上游故障不冷却账号」这条解耦失效。
+func soloKind(code int64, msg string) errs.Kind {
+	lower := strings.ToLower(msg)
+	switch {
+	case code == 4008 || code == 1005,
+		strings.Contains(lower, "quota"),
+		strings.Contains(lower, "exceeded"):
+		return errs.HardCredit
+	case strings.Contains(lower, "rate limit"), strings.Contains(lower, "too many"):
+		return errs.SoftRate
+	}
+	return errs.UpstreamFault
+}
 
 func itoa64(v int64) string {
 	if v == 0 {

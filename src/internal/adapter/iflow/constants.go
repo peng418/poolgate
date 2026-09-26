@@ -55,6 +55,12 @@ const (
 // iflow-cli 源码里的 SUPPORTED_MODELS。上游既然不提供目录接口，我们就不能假装
 // 从上游读到了 —— 照抄清单并标 SourceLocal，比猜一个不存在的接口诚实。
 //
+// 交叉印证：第二份独立实现 AIClient2API（src/providers/provider-models.js:107-134）的 iFlow
+// 清单与上面**不同**（多 qwen3-max / qwen3-vl-plus / qwen3-32b / qwen3-235b-a22b-* /
+// deepseek-v3 / deepseek-r1 / minimax-m2.1，且写作小写 iflow-rome-30ba3b、无 kimi-k2-thinking /
+// qwen-vl-max）。两份清单互相冲突、又都无上游端点可核，故**保持原样** —— 以 iflow2api 的
+// SUPPORTED_MODELS 快照为准，不掺入第二份的私有增补。
+//
 // Think 只用于给 ModelInfo.Reasoning 一个依据（是否要开思考参数），不参与请求路由。
 var localModels = []struct {
 	ID    string
