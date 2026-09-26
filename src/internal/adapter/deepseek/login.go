@@ -27,7 +27,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
-
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -48,6 +48,10 @@ const (
 type session struct {
 	a  *Adapter
 	mu sync.Mutex
+	// flow 是短信验证码登录的状态机（非 nil 时走这条路，面板按 Step() 渲染每一步）。
+	// 用户点「添加账号 → DeepSeek」默认就是这条路 —— 它是三条路里最省事的：
+	// 不用开浏览器、不用复制 token，也不用输密码。
+	flow *smsFlow
 	// token 是用户粘回来（或直登换回）的 userToken；deviceID 由账号派生（每账号一个）。
 	token    string
 	deviceID string
@@ -60,18 +64,30 @@ type session struct {
 	done      bool
 }
 
-// StartLogin 返回「去这儿登录」的地址（粘贴路径用）；直登路径不看这个地址。
+// StartLogin 返回「去这儿登录」的地址（粘贴路径用），并按可用性决定默认路径。
+//
+// 路径优先级：
+//  ① 短信验证码（SMSLoginAvailable 时才开）—— 最省事，但实测被上游数美控件挡住，默认关；
+//  ② 账号密码直登 —— 填一次就换 token，勾「记住密码」还能自动续期；**这是当前主推**；
+//  ③ 粘贴 userToken —— 不想给密码时的兜底。
 func (a *Adapter) StartLogin(context.Context, channel.LoginOptions) (channel.LoginSession, error) {
-	return &session{a: a}, nil
+	s := &session{a: a}
+	if SMSLoginAvailable {
+		s.flow = a.startSMS()
+	}
+	return s, nil
 }
 
 func (s *session) AuthURL() string { return loginPage }
 
 // Hint 是给面板的粘贴引导语（粘贴路径）。实现后控制台在 /api/login/start 的
 // 响应里带上 paste_hint，面板据此切换成「粘贴」形态。
+//
+// 文案必须诚实：短信这条路**当前走不通**（上游数美控件挡住，见 SMSLoginAvailable），
+// 所以不把它列成「首选」——否则用户照做只会白填一次手机号。
 func (s *session) Hint() string {
-	return "方式一（推荐）：直接在下面填 DeepSeek 的账号和密码，点「直接登录」即可，无需开浏览器。\n" +
-		"方式二：在浏览器登录 DeepSeek 后，于控制台执行 JSON.parse(localStorage.getItem(\"userToken\")).value，把结果整段粘到输入框里"
+	return "推荐：填 DeepSeek 的账号和密码点「直接登录」，勾上「记住密码」后 token 过期会自动重登，之后不用再管。\n" +
+		"或者：在浏览器登录 DeepSeek 后，于控制台执行 JSON.parse(localStorage.getItem(\"userToken\")).value，把结果整段粘到输入框里"
 }
 
 // LoginFields 声明直登表单的字段。控制台据此渲染「账号 / 密码」表单
@@ -87,6 +103,43 @@ func (s *session) LoginFields() []channel.LoginField {
 	}
 }
 
+// ── 短信验证码路径：把 StepAcceptor 转发给 flow ─────────────────────────
+//
+// 就是薄薄一层转发。这样 session 同时满足 channel.StepAcceptor（默认路径）、
+// channel.PasswordAcceptor（可选：账号密码）与 channel.CallbackAcceptor（可选：
+// 粘贴 token），控制台按「谁实现了什么」决定面板给哪些入口，核心层无需分支。
+
+// Step 实现 channel.StepAcceptor：默认走短信流程；若用户已经改用「账号密码」或
+// 「粘贴 token」，则不再暴露短信步骤（避免两套输入同时挂在一次授权上）。
+func (s *session) Step() channel.StepView {
+	s.mu.Lock()
+	f := s.flow
+	manual := s.account != "" || s.token != ""
+	s.mu.Unlock()
+	if manual || f == nil {
+		return channel.StepView{Stage: channel.StageIdle}
+	}
+	return f.Step()
+}
+
+// Submit 实现 channel.StepAcceptor：转发给短信流程。
+func (s *session) Submit(values map[string]string) error {
+	s.mu.Lock()
+	f := s.flow
+	manual := s.account != "" || s.token != ""
+	s.mu.Unlock()
+	if manual {
+		return errs.New(errs.Parse,
+			"这次授权已经改用「账号密码 / 粘贴 token」了；要改用验证码登录请重新点「添加账号」").
+			WithChannel(string(channel.DeepSeek))
+	}
+	if f == nil {
+		return errs.New(errs.Parse, "这次授权没有短信验证码流程").
+			WithChannel(string(channel.DeepSeek))
+	}
+	return f.Submit(values)
+}
+
 // AcceptPassword 收面板填的账号密码（直登路径）。
 func (s *session) AcceptPassword(values map[string]string) error {
 	acc := strings.TrimSpace(values[fieldAccount])
@@ -99,6 +152,8 @@ func (s *session) AcceptPassword(values map[string]string) error {
 	s.password = pw
 	s.remember = values[fieldRemember] == "on" || values[fieldRemember] == "true" || values[fieldRemember] == "1"
 	s.usedPaste = false
+	// 改用密码路径了：停掉短信流程，免得两条路同时挂在一次授权上。
+	s.flow = nil
 	s.mu.Unlock()
 	return nil
 }
@@ -115,6 +170,8 @@ func (s *session) AcceptCallback(raw string) error {
 	s.mu.Lock()
 	s.token = tok
 	s.usedPaste = true
+	// 改用粘贴路径了：停掉短信流程，避免两条路同时挂在一次授权上。
+	s.flow = nil
 	// 粘贴路径不落盘密码：设备 id 由 token 派生（与旧行为一致，保证老凭证的 device_id 不变）。
 	if s.deviceID == "" {
 		s.deviceID = deriveDeviceID(tok)
@@ -123,13 +180,35 @@ func (s *session) AcceptCallback(raw string) error {
 	return nil
 }
 
-// Poll 在用户填了表单 / 粘了 token 之后完成凭证组装（并做一次轻量的有效性检查）。
+// Poll 在用户填了表单 / 粘了 token / 走完短信流程之后完成凭证组装
+// （并做一次轻量的有效性检查）。
 func (s *session) Poll(ctx context.Context) (*channel.Credential, error) {
 	s.mu.Lock()
+	flow := s.flow
 	tok, dev, acc, pw, remember, usedPaste, done := s.token, s.deviceID, s.account, s.password, s.remember, s.usedPaste, s.done
 	s.mu.Unlock()
 	if done {
 		return nil, errs.New(errs.Parse, "这次登录已经完成过了").WithChannel(string(channel.DeepSeek))
+	}
+
+	// 短信验证码路径：状态机走到 stageDone 才算数，否则一律「还在等」。
+	// 这里用 ErrPending 表达等待，而不是报错 —— 面板仍在让用户填验证码。
+	if flow != nil {
+		cred, err := flow.credential()
+		if err != nil {
+			return nil, err // 未完成时就是 channel.ErrPending
+		}
+		tok = cred.AccessToken
+		dev = cred.Extra["device_id"]
+		// 短信路径的账号字段填手机号：后面 nickname / checkToken 都要用。
+		acc = ""
+		if err := s.a.checkToken(ctx, cred); err != nil {
+			return nil, err
+		}
+		s.mu.Lock()
+		s.done = true
+		s.mu.Unlock()
+		return cred, nil
 	}
 
 	// 直登路径：有账号密码就先换 token（换完覆盖 s.token，供后续 checkToken）。
@@ -421,8 +500,20 @@ func shortHash(s string) string {
 	return fmt.Sprintf("%08x", h.Sum32())
 }
 
-// 编译期断言：直登能力必须在，且与粘贴能力共存。
+// 编译期断言：三条登录路径的能力都必须在。
+//   ① StepAcceptor     —— 手机号 + 短信验证码（默认路径，含图验那一屏）
+//   ② PasswordAcceptor —— 账号 + 密码（可选）
+//   ③ CallbackAcceptor —— 粘贴 userToken（可选兜底）
 var (
+	_ channel.StepAcceptor     = (*session)(nil)
 	_ channel.PasswordAcceptor = (*session)(nil)
 	_ channel.CallbackAcceptor = (*session)(nil)
 )
+
+// dsLogf 是本包统一的日志出口（带渠道前缀，便于在网关日志里筛）。
+//
+// 单独包一层的原因：这里要保证「日志里只有事件、没有用户输入」—— 手机号、
+// 验证码、密码、token 一律不入日志。直接把 log.Printf 收在这里，审起来只这一处。
+func dsLogf(format string, args ...any) {
+	log.Printf("deepseek: "+format, args...)
+}

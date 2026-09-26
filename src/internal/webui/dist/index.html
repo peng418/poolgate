@@ -70,6 +70,9 @@
 .direct-login .dl-row input[type=text],.direct-login .dl-row input[type=password]{flex:1 1 auto;min-width:0}
 .direct-login .dl-check{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--ink-2);cursor:pointer}
 .direct-login .dl-check input{width:auto}
+/* 图片验证码：图片按原始尺寸显示，不拉伸（拉糊了用户就看不清字符了） */
+.direct-login .captcha-img{display:block;margin:0 0 10px;max-width:100%;height:auto;
+  border:1px solid var(--border);border-radius:6px;background:#fff;image-rendering:crisp-edges}
 
 /* 覆盖层自己滚：内容高过视口时不该把整页撑长（否则背后页面能被滑出来）。 */
 .auth-main{padding:22px 18px 40px}
@@ -275,10 +278,55 @@
           <div class="sub" v-else>这个渠道<b>没法扫码</b>（它的回调地址被上游锁死在本机）：点下面的「打开授权页」在浏览器里完成，
             或者完成之后用「手工回填」把那串地址粘回来</div>
 
-          <!-- 账号密码直登（实现 PasswordAcceptor 的渠道，如 DeepSeek）：
-               填一次账号密码，服务端直接换 token —— 不用开浏览器、不用复制粘贴。
-               密码框 type=password 且不落任何前端持久化状态。 -->
-          <div class="direct-login" v-if="loginFields.length">
+          <!-- 多步 / 验证码授权（实现 StepAcceptor 的渠道，如 DeepSeek 短信登录）：
+               面板不问「现在第几步」，只照服务端给的 step 把当前这一屏渲染出来。
+               加一步、减一步、插一步图片验证码，都是服务端说了算 —— 前端不用改。 -->
+          <div class="direct-login" v-if="authStep && authStep.stage==='input'">
+            <div class="dl-title">{{ authStep.title || '验证' }}</div>
+            <div class="sub" v-if="authStep.hint" style="margin:0 0 10px">{{ authStep.hint }}</div>
+            <div class="dl-row" v-for="f in (authStep.fields||[])" :key="f.name">
+              <label :for="'st-'+f.name">{{ f.label }}</label>
+              <input :id="'st-'+f.name" type="text" v-model="stepForm[f.name]"
+                :placeholder="f.placeholder||''" autocomplete="off"
+                inputmode="numeric" @keyup.enter="submitStep">
+            </div>
+            <div class="row" style="margin-top:10px;align-items:center;gap:10px">
+              <button class="btn primary" @click="submitStep" :disabled="busy">
+                {{ authStep.submit_label || '提交' }}</button>
+              <button class="btn" v-if="authStep.resend_after_secs>0" @click="submitStep"
+                :disabled="busy" title="重新获取验证码">重新获取</button>
+              <span class="hint" style="margin:0">验证码只用于登录，不会显示或保存在页面上。</span>
+            </div>
+          </div>
+
+          <!-- 图片验证码（上游按风控开启）：把图直接显示出来，用户看图填字。
+               图片是服务端包好的 data URL，面板 <img src> 即可，不用另开路由。 -->
+          <div class="direct-login" v-if="authStep && authStep.stage==='image_challenge'">
+            <div class="dl-title">{{ authStep.title || '图片验证码' }}</div>
+            <div class="sub" v-if="authStep.hint" style="margin:0 0 10px">{{ authStep.hint }}</div>
+            <img v-if="authStep.image_url" :src="authStep.image_url" alt="图片验证码"
+              class="captcha-img">
+            <div class="dl-row">
+              <label for="st-captcha">图中字符</label>
+              <input id="st-captcha" type="text" v-model="stepForm[captchaField]"
+                placeholder="照图填写" autocomplete="off"
+                @keyup.enter="submitStep">
+            </div>
+            <div class="row" style="margin-top:10px;align-items:center;gap:10px">
+              <button class="btn primary" @click="submitStep" :disabled="busy">
+                {{ authStep.submit_label || '提交' }}</button>
+            </div>
+          </div>
+
+          <!-- 验证码已发出：显示等待/倒计时提示（真正的输入在下一屏）。 -->
+          <div class="direct-login" v-if="authStep && authStep.stage==='sending'">
+            <div class="dl-title">{{ authStep.title || '正在发送验证码' }}</div>
+            <div class="sub" style="margin:0">{{ authStep.hint || '请稍候…' }}</div>
+          </div>
+
+          <!-- 账号密码直登（实现 PasswordAcceptor 的渠道）：StepAcceptor 没实现时
+               退回这个静态表单。两者互斥显示，不叠加。 -->
+          <div class="direct-login" v-if="!authStep && loginFields.length">
             <div class="dl-title">直接登录（推荐）</div>
             <div class="dl-row" v-for="f in loginFields" :key="f.name">
               <label :for="'dl-'+f.name">{{ f.label }}</label>
@@ -344,7 +392,7 @@
 
           <div class="banner warn" v-if="pasteLogin">
             <span class="ico">🔒</span>
-            <div><b v-if="hasDirectLogin">方式二的凭证从你自己的浏览器里取；本页不显示、不保存你粘进来的内容</b>
+            <div><b v-if="hasDirectLogin">备选方式：凭证要从你自己的浏览器里取；本页不显示、不保存你粘进来的内容</b>
               <b v-else>登录要在你自己的浏览器里完成，面板只收一个凭证，不收密码</b>
               <p>按下面输入框上方的说明拿到凭证后，整段粘进去即可 ——
                  各渠道要粘的东西不一样（token / Cookie / 请求头里的一行），
@@ -1394,6 +1442,13 @@ createApp({
     // loginForm 只活在内存里（用户切走视图即清空），绝不写 localStorage —— 密码不出前端持久层。
     const loginFields=ref([]);
     const loginForm=reactive({});
+    // authStep 是「多步 / 验证码」流程的当前屏（服务端 StepAcceptor 给的状态机视图）。
+    // 面板**不记自己在第几步** —— 每次提交后拿服务端回的 step 重绘，谁都不知道第几步。
+    // stepForm 同理只活在内存里，绝不写 localStorage（里面是手机号/验证码）。
+    const authStep=ref(null);
+    const stepForm=reactive({});
+    // captchaField 是图片验证码输入的保留字段名，与服务端 channel.FieldCaptcha 对齐。
+    const captchaField='captcha_code';
     let authTimer=null, authLeft=0;
 
     // ---------- 面板入口开关 ----------
@@ -1753,6 +1808,50 @@ createApp({
       }finally{
         busy.value=false;
       }
+    };
+
+    // submitStep 交「多步 / 验证码」流程里当前这一步的输入。
+    //
+    // 关键设计：面板**不判断自己在第几步**，也不自己决定下一步显示什么 —— 它只把
+    // 用户填的值交上去，拿服务端回的 step（推进后的新屏）重绘。所以「发码 → 填码」
+    // 还是「图验 → 发码 → 填码」，前端代码完全一样。
+    const submitStep=async()=>{
+      if(busy.value)return;
+      const cur=authStep.value||{};
+      const filled={};
+      for(const f of (cur.fields||[]))filled[f.name]=String(stepForm[f.name]??'');
+      const missing=(cur.fields||[]).filter(f=>f.required&&!(filled[f.name]||'').trim());
+      if(missing.length)return toast('请先填写：'+missing.map(f=>f.label).join('、'));
+      busy.value=true;
+      try{
+        const r=await post('/api/login/step',{values:filled});
+        // 用服务端回的「推进后新屏」重绘（applyStep 会顺手清掉上一步的输入值）。
+        applyStep(r&&r.step);
+        const next=r&&r.step?r.step:{};
+        const st=next.stage||'';
+        if(st==='done'||(st==='input'&&next.submit_label==='登录'))pollAuth();
+        else if(st==='failed')toast(next.message||'这一步失败了');
+        else if(st==='input'&&next.title)toast('已提交 · '+next.title);
+        else toast('已提交');
+      }catch(e){
+        // 失败时服务端不推进状态机：这里只提示原因，界面留在原步骤让用户改了重试。
+        toast(e&&e.message?e.message:'提交失败');
+      }finally{
+        busy.value=false;
+      }
+    };
+
+    // applyStep 把服务端给的步骤视图装进界面状态（含清空上一步的表单值）。
+    //
+    // 为什么要清表单：验证码屏与手机号屏共用 stepForm，不清的话手机号会留在
+    // 验证码输入框里，用户一按回车就把手机号当验证码提交了。
+    const applyStep=st=>{
+      authStep.value=st&&st.stage?st:null;
+      if(!authStep.value)return;
+      const keep={};
+      for(const f of (authStep.value.fields||[]))if(stepForm[f.name]!=null)keep[f.name]=stepForm[f.name];
+      for(const k of Object.keys(stepForm))delete stepForm[k];
+      for(const k of Object.keys(keep))stepForm[k]=keep[k];
     };
 
     const submitCallback=async()=>{
@@ -2173,13 +2272,17 @@ createApp({
         loginFields.value=Array.isArray(r.login_fields)?r.login_fields:[];
         for(const k of Object.keys(loginForm))delete loginForm[k];
         if(loginFields.value.some(f=>f.name==='remember'))loginForm.remember=true;
+        // 多步 / 验证码流程的当前屏（服务端 StepAcceptor 声明）：有则走「按步渲染」。
+        // 注意 authStep 非空时上面的静态表单不显示（两条路互斥，见模板里的 v-if）。
+        applyStep(r.step||null);
         authLeft=r.expires_at?Math.max(0,Math.round((new Date(r.expires_at)-Date.now())/1000)):300;
         // 能出二维码就不抢着开浏览器：用户本该拿手机扫这个码（桌面不用跳转）。
         // 只有「这个渠道出不了码」或「码没生成出来（库没加载/地址过长）」时才自动打开授权页。
         // 粘贴式渠道（DeepSeek 粘 userToken）没有授权地址这回事，直接落到粘贴引导。
-        // awit 一下再判断：authQr 依赖刚写入的 auth.url，等 Vue 重算完再决定。
+        // 走验证码流程的渠道更不需要开浏览器 —— 用户就在这一屏填手机号。
+        // await 一下再判断：authQr 依赖刚写入的 auth.url，等 Vue 重算完再决定。
         await nextTick();
-        if(!authQr.value&&!pasteLogin.value)window.open(r.auth_url,'_blank');
+        if(!authQr.value&&!pasteLogin.value&&!authStep.value)window.open(r.auth_url,'_blank');
         authTimer=setInterval(pollAuth,2000);
       }catch(e){auth.value.status='error';auth.value.message=e.message;}
     };
@@ -2349,6 +2452,7 @@ createApp({
       callbackLockedLocal,callbackViaPanel,pasteLogin,pasteHintText,qrUsable,authQr,qrTip,qrScanHint,cbRaw,cbPlaceholder,submitCallback,
       // 账号密码直登（DeepSeek 这类）：表单字段由服务端声明，面板只负责渲染与提交。
       hasDirectLogin,loginFields,loginForm,submitPassword,
+      authStep,stepForm,captchaField,submitStep,applyStep,
       channelName,channelClass,icoOf,pickChannels,statusPill,statusIcon,statusText,sevLabel,
       accountPill,accountIcon,accountText,checkinPill,checkinText,logPill,logIcon,logText,accountSections,catOf,
       srcLabel,humanCtx,capsText,shortUid,fmtNum,fmtTime,fmtDate,barPct,barColor,

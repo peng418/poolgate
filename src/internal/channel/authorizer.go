@@ -103,3 +103,85 @@ type LoginField struct {
 	// Required 表示必填。
 	Required bool `json:"required"`
 }
+
+// ── 验证码类授权（OTP） ────────────────────────────────────────────────
+
+// LoginStage 是一次授权流程当前处在哪一步。面板据此决定显示什么。
+//
+// 设计要点：面板**不需要知道**渠道内部有几步、每步叫什么 —— 它只按 Stage 渲染
+// 当前这一屏，把渠道声明的字段渲染出来，再调 Submit 交回去。加一个新渠道或给
+// 某个渠道加/减一步，核心层与前端都不改代码（红线三）。
+type LoginStage string
+
+const (
+	// StageIdle 表示流程还没开始（面板显示「开始授权」）。
+	StageIdle LoginStage = "idle"
+	// StageInput 表示正在等用户填字段（含首次填表与第二步填验证码）。
+	StageInput LoginStage = "input"
+	// StageImageChallenge 表示上游要图片验证码：面板显示 ImageURL 的图 + 一个输入框，
+	// 用户看图填字后 Submit 交回。
+	StageImageChallenge LoginStage = "image_challenge"
+	// StageSending 表示正在等上游把验证码发出去（面板显示「发送中」并可轮询）。
+	StageSending LoginStage = "sending"
+	// StageDone 表示授权已拿到凭证，控制台会走正常落盘/入池。
+	StageDone LoginStage = "done"
+	// StageFailed 表示授权失败（Message 里是原因，红线一）。
+	StageFailed LoginStage = "failed"
+)
+
+// StepView 是「当前这一步」的完整描述：面板拿它就能把一个屏渲染出来。
+//
+// 这是把「多步授权」变成一个**通用状态机**的关键：不管是账号密码、手机号验证码、
+// 还是「先过图验再发短信」，对面板而言都只是「一组字段 + 一句提示 + 可选的图片」。
+type StepView struct {
+	// Stage 是当前步骤类型。
+	Stage LoginStage `json:"stage"`
+	// Title 是本步骤的标题，如「填写手机号」「输入短信验证码」。
+	Title string `json:"title,omitempty"`
+	// Hint 是本步骤的说明文字（面板显示在字段上方）。
+	Hint string `json:"hint,omitempty"`
+	// Fields 是本步骤要用户填的字段（面板按顺序渲染）。
+	Fields []LoginField `json:"fields,omitempty"`
+	// SubmitLabel 是提交按钮文字，如「发送验证码」「登录」。空则面板用默认「提交」。
+	SubmitLabel string `json:"submit_label,omitempty"`
+	// ImageURL 仅在 StageImageChallenge 时有值：图片验证码的图片地址。
+	// 用 data URL（data:image/png;base64,…）直接内联，面板 <img src> 即可显示，
+	// 不用另开静态路由、也不依赖面板与网关同机。
+	ImageURL string `json:"image_url,omitempty"`
+	// Message 是失败/提示信息（StageFailed 时必填，红线一）。
+	Message string `json:"message,omitempty"`
+	// ResendAfterSecs > 0 时面板显示「N 秒后可重发」。上游通常在响应里给这个窗口。
+	ResendAfterSecs int `json:"resend_after_secs,omitempty"`
+}
+
+// StepAcceptor 由「多步 / 验证码」类渠道实现：把授权流程暴露成一个可查询的
+// 状态机，面板每一步都调 Step() 拿当前屏、调 Submit() 交这一步的输入。
+//
+// 为什么在 PasswordAcceptor 之外还要这一层：
+//   - PasswordAcceptor 假设「一步完事」（填账号密码，直接换 token）。
+//   - 手机号验证码是**至少两步**（先发码、再验码），中间还可能插一步图片验证码。
+//   - 与其在核心层写死「第几步该显示什么」，不如让渠道自己说「我现在这一步要什么」。
+//
+// 安全边界（与 PasswordAcceptor 一致）：密码/验证码只用于换取 token；面板与日志
+// 永不回显；实现方自己决定是否留存（留存才能自动续期）。
+//
+// 与 PasswordAcceptor 的关系：两者可以并存。同时实现的渠道，面板优先走 StepAcceptor
+// （更通用，能表达密码登录、验证码登录等多条路）。旧渠道不受影响。
+type StepAcceptor interface {
+	// Step 返回当前步骤的视图。任何时候都可调用（面板轮询也用它）。
+	Step() StepView
+
+	// Submit 交回用户在**当前步骤**填的值，并推进状态机（或原地报错）。
+	//   - values 的 key 与 Step().Fields[].Name 对应；图片验证码步骤用保留键 FieldCaptcha。
+	//   - 返回错误时：面板显示错误，状态机**不前进**（用户可改了重试）。
+	//   - 返回 nil 时：状态机可能进入下一步，也可能直接完成 —— 面板再调 Step() 看。
+	Submit(values map[string]string) error
+}
+
+// FieldCaptcha 是图片验证码输入的保留字段名。
+//
+// 约定：上游要图片验证码时，面板在 StageImageChallenge 下把用户填的字用这个 key
+// 交回（配合 Step().ImageURL 显示的图）。之所以用保留名而不是让渠道自定义：
+// 这一屏的形状是固定的（一张图 + 一个输入框），核心层与前端只需认识这一个约定，
+// 各渠道不必各造一套；渠道在 Submit 里把它映射成上游要的字段名即可。
+const FieldCaptcha = "captcha_code"

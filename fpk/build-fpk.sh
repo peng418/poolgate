@@ -82,7 +82,7 @@ M="$PKG/manifest"
   printf 'service_port          = %s\n'   "$PORT"
   printf 'desktop_uidir         = ui\n'
   printf 'desktop_applaunchname = %s.main\n' "$APPNAME"
-  printf 'changelog = DeepSeek 网页版做「好用」：① 新增账号密码直登（面板填一次账号密码即换取 token，无需开浏览器、无需复制 userToken；勾选「记住密码」后 token 过期自动重新登录续期）② 面板渠道选择器放行 DeepSeek（原先被 VISIBLE_CHANNELS 隐藏，根本看不到、加不了号）③ 工具调用保真度强化（工具名清单前置、正例/反例、完整 schema；实测 DSML 原生语法稳定解析回结构化 tool_calls）④ 修复粘贴路径下 userToken 失效被静默放进池子的问题（现在会当场报「凭证校验失败」） | FPK %s\n' "$VERSION"
+  printf 'changelog = 通用多步授权框架 + DeepSeek 短信登录调研结论：① 新增 channel.StepAcceptor / StepView 通用「多步授权」接口（渠道自己声明每一步要什么，面板照渲染；新增支持图片验证码那一屏，图以 data URL 内联显示）② DeepSeek 接入手机号+短信验证码流程（发码/验码/登录三段，含 60 秒重发窗口与图验分支），但实测上游把 shumei_verification 作结构化必填（数美 JS 控件令牌，服务端拿不到）→ 该路径默认关闭并如实告知，代码保留待上游放开 ③ 新增 /api/login/step 逐步提交接口 ④ 修复上游 422 只报「上游返回错误」的问题，现在逐字段翻译成人话 ⑤ 修复 idle 步骤顶掉账号密码表单的缺陷（面板原先只显示粘贴引导、密码框消失） | FPK %s\n' "$VERSION"
 } >> "$M"
 chmod 0644 "$M"
 sed -n '1,20p' "$M" | sed 's/^/  /'

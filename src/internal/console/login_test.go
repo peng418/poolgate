@@ -667,3 +667,285 @@ func TestLoginPasswordUnsupportedChannel(t *testing.T) {
 		t.Fatalf("应说明不支持，实际 %s", w.Body.String())
 	}
 }
+
+// ── 多步 / 验证码授权（StepAcceptor） ──────────────────────────────────
+
+// fakeStepSession 是「多步 / 验证码」渠道的假会话（实现 channel.StepAcceptor）。
+//
+// 故意做成「脚本驱动」：测试给定一串步骤视图，Submit 时依次往前走 ——
+// 这样能验证控制台真的在**转发**服务端的步骤视图，而不是自己猜第几步。
+type fakeStepSession struct {
+	fakeSession
+	script []channel.StepView
+	idx    int
+	got    []map[string]string
+	err    error
+}
+
+func (f *fakeStepSession) Step() channel.StepView {
+	if f.idx >= len(f.script) {
+		return channel.StepView{Stage: channel.StageDone}
+	}
+	return f.script[f.idx]
+}
+
+func (f *fakeStepSession) Submit(v map[string]string) error {
+	if f.err != nil {
+		// 失败时**不推进**（与真实实现一致：用户原地重试）。
+		return f.err
+	}
+	f.got = append(f.got, v)
+	f.idx++
+	return nil
+}
+
+// TestLoginStartOmitsIdleStep 回归测试：实现 StepAcceptor 但当前无活跃步骤时，
+// /api/login/start **不能**把 step 发给面板。
+//
+// 真机踩过的坑：DeepSeek 默认关短信时 Step() 返回 {stage:"idle"}，控制台原样发给面板，
+// 面板把 idle 当成「有步骤」→ 账号密码表单被顶掉 → 用户只看到粘贴引导、密码框消失。
+// 这条锁住「idle 等于没有 step」。
+func TestLoginStartOmitsIdleStep(t *testing.T) {
+	sess := &fakeStepSession{script: []channel.StepView{{Stage: channel.StageIdle}}}
+	ch := &fakeAuthChannel{kind: channel.DeepSeek, sess: &sess.fakeSession, sessOverride: sess}
+	h, token, _, _ := newLoginTestServer(t, ch)
+
+	w := authed(t, h, http.MethodPost, "/api/login/start", channelLoginReq{Channel: "deepseek"}, token)
+	if w.Code != http.StatusOK {
+		t.Fatalf("start 应 200，实际 %d %s", w.Code, w.Body.String())
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("响应解析失败：%v", err)
+	}
+	// 关键：不能有非空 step —— 否则面板会用它顶掉静态表单。
+	if sv, ok := raw["step"]; ok && sv != nil {
+		t.Fatalf("idle 步骤不该发给面板（会把密码表单顶掉），实际 step=%v", sv)
+	}
+}
+
+// TestLoginStepProviderSkipsIdle 直接测 loginManager.StepProvider 对 idle 的处理。
+func TestLoginStepProviderSkipsIdle(t *testing.T) {
+	for _, st := range []channel.LoginStage{channel.StageIdle, ""} {
+		sess := &fakeStepSession{script: []channel.StepView{{Stage: st}}}
+		al := &activeLogin{kind: channel.DeepSeek, sess: sess}
+		m := &loginManager{active: al, now: time.Now}
+		if v, ok := m.StepProvider(); ok {
+			t.Fatalf("stage=%q 时 StepProvider 应当返回 false，实际 %+v", st, v)
+		}
+	}
+	// 非 idle 的要正常返回。
+	sess := &fakeStepSession{script: []channel.StepView{{Stage: channel.StageInput, Title: "填写手机号"}}}
+	m := &loginManager{active: &activeLogin{kind: channel.DeepSeek, sess: sess}, now: time.Now}
+	if v, ok := m.StepProvider(); !ok || v.Title != "填写手机号" {
+		t.Fatalf("活跃步骤应当返回，实际 ok=%v v=%+v", ok, v)
+	}
+}
+
+// TestLoginStartExposesStep 确认 /api/login/start 会把第一步带给面板。
+func TestLoginStartExposesStep(t *testing.T) {
+	sess := &fakeStepSession{script: []channel.StepView{{
+		Stage:       channel.StageInput,
+		Title:       "填写手机号",
+		SubmitLabel: "发送验证码",
+		Fields: []channel.LoginField{
+			{Name: "mobile_number", Label: "手机号", Type: "text", Required: true},
+		},
+	}}}
+	ch := &fakeAuthChannel{kind: channel.DeepSeek, sess: &sess.fakeSession, sessOverride: sess}
+	h, token, _, _ := newLoginTestServer(t, ch)
+
+	w := authed(t, h, http.MethodPost, "/api/login/start", channelLoginReq{Channel: "deepseek"}, token)
+	if w.Code != http.StatusOK {
+		t.Fatalf("start 应 200，实际 %d %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Step *channel.StepView `json:"step"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("响应解析失败：%v（body=%s）", err, w.Body.String())
+	}
+	if resp.Step == nil {
+		t.Fatalf("响应里应当带 step（面板全靠它渲染），实际 %s", w.Body.String())
+	}
+	if resp.Step.Stage != channel.StageInput || resp.Step.Title != "填写手机号" {
+		t.Fatalf("第一步不对：%+v", resp.Step)
+	}
+	if len(resp.Step.Fields) != 1 || resp.Step.Fields[0].Name != "mobile_number" {
+		t.Fatalf("字段没带上来：%+v", resp.Step.Fields)
+	}
+}
+
+// TestLoginStepAdvancesAndReturnsNextView 交一步 → 拿回推进后的新屏。
+//
+// 这是这套设计的关键契约：面板**不需要自己知道第几步**，只要拿服务端回的 step 重绘。
+func TestLoginStepAdvancesAndReturnsNextView(t *testing.T) {
+	sess := &fakeStepSession{script: []channel.StepView{
+		{Stage: channel.StageInput, Title: "填写手机号", SubmitLabel: "发送验证码"},
+		{Stage: channel.StageInput, Title: "输入短信验证码", SubmitLabel: "登录", ResendAfterSecs: 60},
+	}}
+	ch := &fakeAuthChannel{kind: channel.DeepSeek, sess: &sess.fakeSession, sessOverride: sess}
+	h, token, _, _ := newLoginTestServer(t, ch)
+	authed(t, h, http.MethodPost, "/api/login/start", channelLoginReq{Channel: "deepseek"}, token)
+
+	w := authed(t, h, http.MethodPost, "/api/login/step",
+		map[string]any{"values": map[string]any{"mobile_number": "13800138000"}}, token)
+	if w.Code != http.StatusOK {
+		t.Fatalf("step 应 200，实际 %d %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		OK   bool              `json:"ok"`
+		Step *channel.StepView `json:"step"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("响应解析失败：%v", err)
+	}
+	if !resp.OK || resp.Step == nil {
+		t.Fatalf("应当返回 ok + 新一步，实际 %s", w.Body.String())
+	}
+	if resp.Step.Title != "输入短信验证码" {
+		t.Fatalf("应当返回**推进后**的屏，实际 %q", resp.Step.Title)
+	}
+	if resp.Step.ResendAfterSecs != 60 {
+		t.Fatalf("重发窗口没带上来：%d", resp.Step.ResendAfterSecs)
+	}
+	if len(sess.got) != 1 || sess.got[0]["mobile_number"] != "13800138000" {
+		t.Fatalf("提交值没到适配器：%+v", sess.got)
+	}
+}
+
+// TestLoginStepPropagatesRejection 服务端拒了这一步时：报错 + 状态机不前进。
+//
+// 对应红线一：失败必须有原因，且用户能原地重试 —— 控制台不能把拒绝吞掉。
+func TestLoginStepPropagatesRejection(t *testing.T) {
+	sess := &fakeStepSession{
+		script: []channel.StepView{
+			{Stage: channel.StageInput, Title: "输入短信验证码", SubmitLabel: "登录",
+				Message: "验证码不对，请照短信重新输入"},
+		},
+		err: errs.New(errs.AuthFailed, "验证码登录失败：验证码不对，请照短信重新输入"),
+	}
+	ch := &fakeAuthChannel{kind: channel.DeepSeek, sess: &sess.fakeSession, sessOverride: sess}
+	h, token, _, _ := newLoginTestServer(t, ch)
+	authed(t, h, http.MethodPost, "/api/login/start", channelLoginReq{Channel: "deepseek"}, token)
+
+	w := authed(t, h, http.MethodPost, "/api/login/step",
+		map[string]any{"values": map[string]any{"sms_verification_code": "000000"}}, token)
+	if w.Code == http.StatusOK {
+		t.Fatalf("被拒的步骤不该返回 200，实际 %s", w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "验证码不对") {
+		t.Fatalf("错误原因必须带给面板（红线一），实际 %s", body)
+	}
+	if sess.idx != 0 {
+		t.Fatalf("被拒时状态机不该前进，实际 idx=%d", sess.idx)
+	}
+}
+
+// TestLoginStepImageChallengeCarriesDataURL 图验那一屏要把图（data URL）带给面板。
+func TestLoginStepImageChallengeCarriesDataURL(t *testing.T) {
+	const png = "data:image/png;base64,iVBORw0KGgo="
+	sess := &fakeStepSession{script: []channel.StepView{{
+		Stage:       channel.StageImageChallenge,
+		Title:       "图片验证码",
+		ImageURL:    png,
+		SubmitLabel: "提交",
+		Fields: []channel.LoginField{
+			{Name: channel.FieldCaptcha, Label: "图片中的字符", Type: "text", Required: true},
+		},
+	}}}
+	ch := &fakeAuthChannel{kind: channel.DeepSeek, sess: &sess.fakeSession, sessOverride: sess}
+	h, token, _, _ := newLoginTestServer(t, ch)
+
+	w := authed(t, h, http.MethodPost, "/api/login/start", channelLoginReq{Channel: "deepseek"}, token)
+	var resp struct {
+		Step *channel.StepView `json:"step"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Step == nil || resp.Step.Stage != channel.StageImageChallenge {
+		t.Fatalf("应当是图验屏，实际 %+v", resp.Step)
+	}
+	if resp.Step.ImageURL != png {
+		t.Fatalf("图片没带给面板：%q", resp.Step.ImageURL)
+	}
+	if len(resp.Step.Fields) != 1 || resp.Step.Fields[0].Name != channel.FieldCaptcha {
+		t.Fatalf("图验输入字段名不对：%+v", resp.Step.Fields)
+	}
+}
+
+// TestLoginStepRejectsUnsupportedChannel 不支持多步的渠道要明确报错，不静默成功。
+func TestLoginStepRejectsUnsupportedChannel(t *testing.T) {
+	ch := &fakeAuthChannel{kind: channel.QoderCN, sess: &fakeSession{url: "u", pending: 99}}
+	h, token, _, _ := newLoginTestServer(t, ch)
+	authed(t, h, http.MethodPost, "/api/login/start", channelLoginReq{Channel: "qodercn"}, token)
+
+	w := authed(t, h, http.MethodPost, "/api/login/step",
+		map[string]any{"values": map[string]any{"x": "y"}}, token)
+	if w.Code == http.StatusOK {
+		t.Fatal("不支持多步授权的渠道必须报错")
+	}
+	if !strings.Contains(w.Body.String(), "不支持多步验证码授权") {
+		t.Fatalf("应说明不支持，实际 %s", w.Body.String())
+	}
+}
+
+// TestLoginStepAcceptsBoolAndNumber 多步接口同样要宽容类型（与直登表单一个毛病）。
+func TestLoginStepAcceptsBoolAndNumber(t *testing.T) {
+	sess := &fakeStepSession{script: []channel.StepView{
+		{Stage: channel.StageInput, Title: "填写手机号"},
+		{Stage: channel.StageInput, Title: "下一步"},
+	}}
+	ch := &fakeAuthChannel{kind: channel.DeepSeek, sess: &sess.fakeSession, sessOverride: sess}
+	h, token, _, _ := newLoginTestServer(t, ch)
+	authed(t, h, http.MethodPost, "/api/login/start", channelLoginReq{Channel: "deepseek"}, token)
+
+	w := authed(t, h, http.MethodPost, "/api/login/step",
+		map[string]any{"values": map[string]any{"remember": true, "n": 3, "s": "x"}}, token)
+	if w.Code != http.StatusOK {
+		t.Fatalf("布尔/数字字段应被接受，实际 %d %s", w.Code, w.Body.String())
+	}
+	got := sess.got[0]
+	if got["remember"] != "on" {
+		t.Fatalf("布尔 true 应转成 \"on\"，实际 %q", got["remember"])
+	}
+	if got["n"] != "3" {
+		t.Fatalf("数字应转成 \"3\"，实际 %q", got["n"])
+	}
+	if got["s"] != "x" {
+		t.Fatalf("字符串应原样保留，实际 %q", got["s"])
+	}
+}
+
+// TestLoginStepRejectsArrayValue 表单不会产生数组/对象，明确报错而不是静默丢弃。
+func TestLoginStepRejectsArrayValue(t *testing.T) {
+	sess := &fakeStepSession{script: []channel.StepView{{Stage: channel.StageInput}}}
+	ch := &fakeAuthChannel{kind: channel.DeepSeek, sess: &sess.fakeSession, sessOverride: sess}
+	h, token, _, _ := newLoginTestServer(t, ch)
+	authed(t, h, http.MethodPost, "/api/login/start", channelLoginReq{Channel: "deepseek"}, token)
+
+	w := authed(t, h, http.MethodPost, "/api/login/step",
+		map[string]any{"values": map[string]any{"bad": []string{"a"}}}, token)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("数组字段应当报 400，实际 %d %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "类型不被支持") {
+		t.Fatalf("应说明类型不支持，实际 %s", w.Body.String())
+	}
+}
+
+// TestLoginStepNoActiveSession 没有进行中的授权时要报清楚，不是 500。
+func TestLoginStepNoActiveSession(t *testing.T) {
+	ch := &fakeAuthChannel{kind: channel.DeepSeek, sess: &fakeSession{url: "u", pending: 99}}
+	h, token, _, _ := newLoginTestServer(t, ch)
+	// 故意不调 /api/login/start。
+
+	w := authed(t, h, http.MethodPost, "/api/login/step",
+		map[string]any{"values": map[string]any{"a": "b"}}, token)
+	if w.Code == http.StatusOK {
+		t.Fatal("没有进行中的授权时应报错")
+	}
+	if !strings.Contains(w.Body.String(), "没有进行中的渠道授权") {
+		t.Fatalf("应说清原因，实际 %s", w.Body.String())
+	}
+}

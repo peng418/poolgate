@@ -192,6 +192,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/api/login/callback", s.withAuth(s.handleLoginCallback))
 	// 账号密码直登表单（实现 channel.PasswordAcceptor 的渠道，如 DeepSeek）
 	mux.HandleFunc("/api/login/password", s.withAuth(s.handleLoginPassword))
+	// 多步 / 验证码授权（实现 channel.StepAcceptor 的渠道，如 DeepSeek 短信登录、
+	// 以及上游要求图片验证码时的那一步）。面板每交一步，服务端回推进后的新屏。
+	mux.HandleFunc("/api/login/step", s.withAuth(s.handleLoginStep))
 	// 账号操作（F1.7/F1.8/F1.9）
 	mux.HandleFunc("/api/account/enable", s.withAuth(s.handleAccountEnable))
 	mux.HandleFunc("/api/account/remove", s.withAuth(s.handleAccountRemove))

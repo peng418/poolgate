@@ -46,6 +46,10 @@ type loginStartResp struct {
 	// 非空时面板渲染一个表单（如 DeepSeek 的 账号+密码），填完直接换 token，
 	// 用户无需开浏览器、无需复制粘贴 —— 这是对粘贴路径的替代，不是叠加。
 	LoginFields []channel.LoginField `json:"login_fields,omitempty"`
+	// Step 是「多步 / 验证码」流程的当前屏（实现 StepAcceptor 的渠道）。
+	// 面板按它渲染当前这一步：字段、提示、按钮文字，乃至图片验证码的图。
+	// 有 Step 时面板优先走它（比 LoginFields 更通用，能表达多步与图验）。
+	Step *channel.StepView `json:"step,omitempty"`
 }
 
 // loginPollResp 是轮询结果：pending / ok 两态，失败直接走结构化错误。
@@ -290,6 +294,68 @@ func authorizerFor(kind channel.Kind) (channel.Authorizer, bool) {
 	return a, ok
 }
 
+// ── 多步 / 验证码授权（StepAcceptor） ──────────────────────────────────
+
+// StepProvider 返回当前授权会话的步骤视图（实现 channel.StepAcceptor 的渠道）。
+// 没有进行中的授权、渠道不走多步流程、或**当前没有活跃步骤**时 ok=false。
+//
+// 「没有活跃步骤」必须算 false：实现 StepAcceptor 的渠道在未启用多步流程时会返回
+// StageIdle（如 DeepSeek 默认关短信时的样子）。若把 idle 也当有效步骤发给面板，
+// 面板就会把 idle 当成「这一步有内容」，于是**账号密码表单被顶掉**（实测踩过：
+// 面板只显示粘贴引导，密码框整个消失）。宁可在这里判掉，也不让面板去猜 idle 的含义。
+func (m *loginManager) StepProvider() (channel.StepView, bool) {
+	m.mu.Lock()
+	al := m.active
+	m.mu.Unlock()
+	if al == nil {
+		return channel.StepView{}, false
+	}
+	sa, ok := al.sess.(channel.StepAcceptor)
+	if !ok {
+		return channel.StepView{}, false
+	}
+	v := sa.Step()
+	if v.Stage == "" || v.Stage == channel.StageIdle {
+		// 本渠道支持多步，但此刻没有活跃步骤 —— 对面板而言等同「没有 step」，
+		// 它会退回渲染静态表单（账号密码）或粘贴形态。
+		return channel.StepView{}, false
+	}
+	return v, true
+}
+
+// acceptStep 把面板在当前步骤填的值交给授权会话，并返回推进后的新视图。
+//
+// 返回值约定：
+//   - (view, kind, nil)：这一步已受理。view 是**推进后**的当前屏（面板直接拿它重绘，
+//     不用再单独拉一次 Step），kind 是渠道。
+//   - (_, kind, err)：这一步被拒（如验证码不对、手机号格式错）。面板显示 err 的原因，
+//     **状态机不前进**，用户可以改了重试（红线一：失败必带原因）。
+func (m *loginManager) acceptStep(values map[string]string) (channel.StepView, channel.Kind, error) {
+	m.mu.Lock()
+	al := m.active
+	m.mu.Unlock()
+	if al == nil {
+		return channel.StepView{}, "", errs.New(errs.Parse, "没有进行中的渠道授权（先点「添加账号」再操作）")
+	}
+	sa, ok := al.sess.(channel.StepAcceptor)
+	if !ok {
+		return channel.StepView{}, al.kind, errs.New(errs.Parse,
+			"渠道 "+string(al.kind)+" 不支持多步验证码授权，请在浏览器完成授权").
+			WithChannel(string(al.kind))
+	}
+	if err := sa.Submit(values); err != nil {
+		if ee, ok := err.(*errs.Error); ok {
+			return sa.Step(), al.kind, ee.WithChannel(string(al.kind))
+		}
+		return sa.Step(), al.kind, errs.New(errs.Parse, "这一步没能受理").WithCause(err).
+			WithChannel(string(al.kind))
+	}
+	view := sa.Step()
+	// 日志只记「哪一步、什么阶段」，**绝不记 values**（里面可能是密码或验证码）。
+	log.Printf("console: 渠道 %s 收到授权第 %q 步输入，当前阶段 %s", al.kind, view.Title, view.Stage)
+	return view, al.kind, nil
+}
+
 // ---------------------------------------------------------------------------
 // HTTP 处理
 // ---------------------------------------------------------------------------
@@ -334,7 +400,16 @@ func (s *Server) handleLoginStart(w http.ResponseWriter, r *http.Request) {
 	if pf, ok := s.login.PasswordProvider(); ok {
 		fields = pf
 	}
-	writeJSON(w, http.StatusOK, loginStartResp{Channel: req.Channel, AuthURL: url, Expires: until.Format(time.RFC3339), CallbackBase: base, PasteHint: pasteHint, LoginFields: fields})
+	// 多步 / 验证码流程的当前屏（实现 StepAcceptor 的渠道，如 DeepSeek 短信登录）。
+	// 有它时面板走「按步渲染」的新形态；没有则退回上面的静态表单/粘贴形态。
+	var step *channel.StepView
+	if sv, ok := s.login.StepProvider(); ok {
+		step = &sv
+	}
+	writeJSON(w, http.StatusOK, loginStartResp{
+		Channel: req.Channel, AuthURL: url, Expires: until.Format(time.RFC3339),
+		CallbackBase: base, PasteHint: pasteHint, LoginFields: fields, Step: step,
+	})
 }
 
 func (s *Server) handleLoginPoll(w http.ResponseWriter, r *http.Request) {
@@ -425,28 +500,9 @@ func (s *Server) handleLoginPassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, errs.New(errs.Parse, "缺少 values 字段"))
 		return
 	}
-	values := make(map[string]string, len(req.Values))
-	for k, v := range req.Values {
-		switch t := v.(type) {
-		case string:
-			values[k] = t
-		case bool:
-			// checkbox 勾选 → "on"（与 HTML 表单的语义一致，适配器按此判定）。
-			if t {
-				values[k] = "on"
-			} else {
-				values[k] = ""
-			}
-		case float64:
-			values[k] = strconv.FormatFloat(t, 'f', -1, 64)
-		case nil:
-			values[k] = ""
-		default:
-			// 其余类型（数组/对象）不是表单会产生的，明确报错而不是静默丢弃。
-			writeErr(w, http.StatusBadRequest,
-				errs.New(errs.Parse, "字段 "+k+" 的类型不被支持").WithCause(nil))
-			return
-		}
+	values := coerceFormValues(w, req.Values)
+	if values == nil {
+		return // coerceFormValues 已写好响应
 	}
 	kind, err := s.login.acceptPassword(values)
 	if err != nil {
@@ -454,4 +510,70 @@ func (s *Server) handleLoginPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "channel": string(kind)})
+}
+
+// coerceFormValues 把面板送来的表单值统一转成字符串。
+//
+// 为什么统一收 map[string]any 再转：面板的 checkbox（v-model）给的是布尔 true，
+// JSON 数字给的是 float64；若直接收 map[string]string，**整个请求体解析都会失败**，
+// 而报错只说「请求体无法解析」，完全看不出是哪个字段。实测踩过这个坑（0.7.0）。
+// 不在表单里出现的类型（数组/对象）明确报错，不静默丢弃。
+//
+// 返回 nil 表示已由本函数写好错误响应，调用方直接 return。
+func coerceFormValues(w http.ResponseWriter, raw map[string]any) map[string]string {
+	out := make(map[string]string, len(raw))
+	for k, v := range raw {
+		switch t := v.(type) {
+		case string:
+			out[k] = t
+		case bool:
+			// checkbox 勾选 → "on"（与 HTML 表单语义一致，适配器按此判定）。
+			if t {
+				out[k] = "on"
+			} else {
+				out[k] = ""
+			}
+		case float64:
+			out[k] = strconv.FormatFloat(t, 'f', -1, 64)
+		case nil:
+			out[k] = ""
+		default:
+			writeErr(w, http.StatusBadRequest, errs.New(errs.Parse, "字段 "+k+" 的类型不被支持"))
+			return nil
+		}
+	}
+	return out
+}
+
+// handleLoginStep 收「多步 / 验证码」授权流程里**当前这一步**的输入
+// （实现 channel.StepAcceptor 的渠道，如 DeepSeek 的手机号验证码登录）。
+//
+// 与 handleLoginPassword 的区别：那个只能表达「填一次表单就完事」，这个支持任意步数
+// —— 面板每交一步，服务端回**推进后的新屏**，面板照着重绘即可（不必自己记第几步）。
+// 图片验证码也走这里：面板在 image_challenge 屏提交用户填的字，字段名用 channel.FieldCaptcha。
+//
+// 安全要点：请求体解析后立即交给适配器，不回显、不写日志；响应里只有「下一步的屏」，
+// 绝不把用户填的密码/验证码原样返回（面板也就保证输入单向流向前端 → 服务端）。
+func (s *Server) handleLoginStep(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, errs.New(errs.Parse, "仅支持 POST"))
+		return
+	}
+	var req struct {
+		Values map[string]any `json:"values"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, errs.New(errs.Parse, "请求体无法解析").WithCause(err))
+		return
+	}
+	values := coerceFormValues(w, req.Values)
+	if values == nil {
+		return // coerceFormValues 已写好响应
+	}
+	view, kind, err := s.login.acceptStep(values)
+	if err != nil {
+		writeErrFromErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "channel": string(kind), "step": view})
 }
