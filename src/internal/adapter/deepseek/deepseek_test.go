@@ -465,13 +465,40 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+// TestLoginEnvelopeSummaryRedactsSecrets 日志摘要**绝不能**把 token / 手机号 / 验证码写出去。
+//
+// 这个助手是红线一的配套设施：真机上「上游为什么这么说」只有信封结构能回答，所以失败要落日志；
+// 但信封里同时躺着凭据。这条测试同时钉两件事：敏感值不出现、排查要看的 biz_code 出现。
+func TestLoginEnvelopeSummaryRedactsSecrets(t *testing.T) {
+	raw := []byte(`{"code":0,"msg":"","data":{"biz_code":1,"biz_msg":"LOGIN_TO_EXISTING_ACCOUNT",
+	  "biz_data":{"user":{"id":9,"mobile_number":"13900000000","token":"SECRET-TOKEN-VALUE"},
+	  "sms_verification_code":"654321","password":"SECRET-PW"}}}`)
+	got := loginEnvelopeSummary(raw, 400)
+	for _, leak := range []string{"SECRET-TOKEN-VALUE", "SECRET-PW", "654321", "13900000000"} {
+		if strings.Contains(got, leak) {
+			t.Fatalf("摘要里泄露了 %q：%s", leak, got)
+		}
+	}
+	for _, keep := range []string{"[已隐藏]", "LOGIN_TO_EXISTING_ACCOUNT", `"biz_code":1`} {
+		if !strings.Contains(got, keep) {
+			t.Fatalf("摘要里丢了排查要用的 %q：%s", keep, got)
+		}
+	}
+	// 非 JSON（WAF/HTML 页）也要能安全降级，不能把整页刷进日志。
+	plain := loginEnvelopeSummary([]byte("<html>"+strings.Repeat("x", 500)+"</html>"), 120)
+	if len(plain) > 200 || !strings.Contains(plain, "非 JSON") {
+		t.Fatalf("非 JSON 响应的摘要不合格：%q", plain)
+	}
+}
+
 // TestParseLoginToken 覆盖直登响应解析：成功取 token、失败把人话原因带出来。
 func TestParseLoginToken(t *testing.T) {
 	cases := []struct {
 		name, raw, wantTok string
 		wantMsgHas         string
 	}{
-		{"成功-user_token", `{"code":0,"data":{"biz_data":{"user_token":"tok-abc-12345678901234567890"}}}`, "tok-abc-12345678901234567890", ""},
+		{"成功-user.token（官方形状，token 在用户对象里）", `{"code":0,"data":{"biz_code":1,"biz_msg":"LOGIN_TO_EXISTING_ACCOUNT","biz_data":{"user":{"id":1,"token":"tok-in-user-12345678901234567890"}}}}`, "tok-in-user-12345678901234567890", ""},
+		{"成功-user_token（历史形状，保留兼容）", `{"code":0,"data":{"biz_data":{"user_token":"tok-abc-12345678901234567890"}}}`, "tok-abc-12345678901234567890", ""},
 		{"成功-token 别名", `{"code":0,"data":{"biz_data":{"token":"tok-xyz-12345678901234567890"}}}`, "tok-xyz-12345678901234567890", ""},
 		{"密码错", `{"code":0,"data":{"biz_code":2,"biz_msg":"PASSWORD_OR_USER_NAME_IS_WRONG"}}`, "", "账号或密码不对"},
 		{"风控", `{"code":0,"data":{"biz_code":7,"biz_msg":"RISK_DEVICE_DETECTED"}}`, "", "风控"},

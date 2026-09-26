@@ -43,8 +43,17 @@ func widgetResult(rid string) string {
 // sendOK 是发码成功的上游信封（官方给的重发窗口是 60 秒）。
 const sendOK = `{"code":0,"msg":"","data":{"biz_code":0,"biz_msg":"","biz_data":{"send_window_secs":60}}}`
 
-// loginOK 是短信登录成功的上游信封（token 在 data.biz_data.user_token，与密码路径同形）。
-const loginOK = `{"code":0,"msg":"","data":{"biz_code":0,"biz_msg":"","biz_data":{"user_token":"tok-from-sms-abcdefghijklmnop"}}}`
+// loginOK 是「新手机号注册并登入」成功的上游信封 —— **形状照真实响应**：
+// token 在 `data.biz_data.user.token`（用户对象内部），不是 `biz_data.user_token`。
+// 依据：官方前端把整个登录响应交给用户映射函数，该函数取 `e.token` 当 userToken 存起来
+// 供 `Authorization: Bearer` 使用。原先这里写的是 `{"user_token":...}` —— 那是**照密码
+// 路径猜的**（夹具注释还写着「与密码路径同形」），于是真机上永远取不到 token。
+const loginOK = `{"code":0,"msg":"","data":{"biz_code":0,"biz_msg":"","biz_data":{"user":{"id":1,"mobile_number":"13800138000","token":"tok-from-sms-abcdefghijklmnop","status":0}}}}`
+
+// loginExistingOK 是「手机号已有账号、直接登入」成功的上游信封 —— 就是用户真机撞到的那一次：
+// biz_code=1 / biz_msg=LOGIN_TO_EXISTING_ACCOUNT。这个码**不是失败**（官方前端在它下面记的
+// 日志是「验证码登录成功」，与 biz_code=0 的「验证码注册成功」并列），所以这条也必须拿到 token。
+const loginExistingOK = `{"code":0,"msg":"","data":{"biz_code":1,"biz_msg":"LOGIN_TO_EXISTING_ACCOUNT","biz_data":{"user":{"id":2,"mobile_number":"13800138000","token":"tok-existing-account-1234567890","status":0}}}}`
 
 // guestChallengeOK 是游客 PoW 挑战的桩响应（形状与真上游一致，数值随便取）。
 const guestChallengeOK = `{"code":0,"msg":"","data":{"biz_code":0,"biz_msg":"","biz_data":{"guest_challenge":{"algorithm":"DeepSeekHashV1","challenge":"3d7f80d6a5fe3a1aa05384d8599fb89df8438dcdf85c306e4ec2059888a0eb38","salt":"c19bfb47645d6f99e749","signature":"6529368e1b534e6a9679a513ae570a548ccdcb82f5b9be4eb25468ab9be2a149","difficulty":80000,"expire_at":1790426441746,"expire_after":300000,"target_path":"/v0/users/login_by_mobile_sms"}}}}`
@@ -448,6 +457,50 @@ func TestSMSFlowStepProgression(t *testing.T) {
 	}
 	if !equalPaths(*paths, want) {
 		t.Fatalf("调用序列 = %v, 想要 %v", *paths, want)
+	}
+}
+
+// TestSMSLoginExistingAccountGetsTokenFromUserObject 真机回归锁。
+//
+// 现场（2026-09-26，用户真机）：填完短信验证码点「登录」，面板显示
+// 「验证码登录失败：上游原话：LOGIN_TO_EXISTING_ACCOUNT」—— 看着像上游拒绝，
+// 其实上游当我们**成功**了（LOGIN_TO_EXISTING_ACCOUNT = 「这号已有账号，直接登入」），
+// 是旧解析只找了 biz_data.user_token 而漏掉了 user 对象里的 token。
+//
+// 这条测试把「已有账号」这条真实路径钉死：必须拿到 token、必须走到 done。
+func TestSMSLoginExistingAccountGetsTokenFromUserObject(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/users/create_guest_challenge":
+			io.WriteString(w, guestChallengeOK)
+		case "/users/create_sms_verification_code":
+			io.WriteString(w, sendOK)
+		case "/users/login_by_mobile_sms":
+			io.WriteString(w, loginExistingOK)
+		}
+	}))
+	defer srv.Close()
+
+	a := newTestAdapter(t, srv.URL)
+	f := a.startSMS()
+	if err := f.Submit(map[string]string{fieldMobile: "13800138000"}); err != nil {
+		t.Fatalf("提交手机号失败：%v", err)
+	}
+	if err := f.Submit(map[string]string{channel.FieldWidgetResult: widgetResult("RID-1")}); err != nil {
+		t.Fatalf("提交控件结果失败：%v", err)
+	}
+	if err := f.Submit(map[string]string{fieldSMSCode: "123456"}); err != nil {
+		t.Fatalf("已有账号这条路必须被当成成功（真机就是这么挂的）：%v", err)
+	}
+	if v := f.Step(); v.Stage != channel.StageDone {
+		t.Fatalf("stage = %q, 想要 %q（message=%s）", v.Stage, channel.StageDone, v.Message)
+	}
+	cred, err := f.credential()
+	if err != nil {
+		t.Fatalf("组装凭证失败：%v", err)
+	}
+	if cred.AccessToken != "tok-existing-account-1234567890" {
+		t.Fatalf("token 必须取 data.biz_data.user.token，实际：%q", cred.AccessToken)
 	}
 }
 

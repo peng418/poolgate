@@ -19,7 +19,12 @@ package deepseek
 //	        → data.biz_code      （用于「先验码后登录」的两段式上游；DeepSeek 走 ③ 一步到位）
 //	③ 登录  POST /api/v0/users/login_by_mobile_sms
 //	        { region, locale, mobile_number, area_code, sms_verification_code, device_id, os }
-//	        → data.biz_code / data.biz_data.user  （token 从同一条链路取，见 parseSMSLogin）
+//	        → data.biz_code + data.biz_data.user{…, token}   ← token 在 user 对象里！
+//	        biz_code 0 = 新号注册并登入、1 = 已有账号登入（**两者都是成功**，官方前端
+//	        把 0 记成「验证码注册成功」、1 记成「验证码登录成功」，都取同一个 user）。
+//	        踩过的坑：曾以为 token 在 data.biz_data.user_token（照密码路径猜的），
+//	        结果真机上「已有账号」这条路一直报「上游原话：LOGIN_TO_EXISTING_ACCOUNT」——
+//	        看着像被上游拒绝，其实是我们把 token 漏读了。详见 parseLoginToken。
 //
 // 关于人机校验（用户要求「如果有图片验证之类的，是必须有的，也可以拿过来」）：
 //
@@ -519,13 +524,20 @@ func (a *Adapter) loginByMobileSMS(ctx context.Context, s smsSnapshot) (string, 
 	if err != nil {
 		return "", err
 	}
-	// 复用密码路径的解析器：两边的成功信封形状一致（data.biz_data.user_token）。
+	// token 在 `data.biz_data.user.token`（用户对象内部，见 parseLoginToken 的说明）。
+	// 短信登录与密码登录共用这一个解析器：两边外层信封形状一致、token 位置也一致。
+	// 依据：官方前端把两者都交给同一个用户映射函数（`G` 与 `K` 都取 `biz_data.user`），
+	// 该函数里的 token 字段就是 `user.token`。
 	tok, msg := parseLoginToken(raw)
 	if tok == "" {
 		code, bmsg, _ := parseBiz(raw)
 		if isCaptchaChallenge(code, bmsg) {
 			a.noteCaptchaChallenge()
 		}
+		// 红线一：失败必须留证据。真机上「上游为什么这么说」只能靠信封结构来断，
+		// 而面板上只会看到一句话，所以这里必须把（脱敏后的）结构落到日志里。
+		dsLogf("短信登录没换到 token（biz_code=%d）：%s · 上游信封 %s", code,
+			firstNonEmpty(bmsg, msg), loginEnvelopeSummary(raw, 400))
 		return "", errs.New(errs.AuthFailed, "验证码登录失败："+smsMessage(code, firstNonEmpty(bmsg, msg))).
 			WithChannel(string(channel.DeepSeek))
 	}
@@ -786,6 +798,13 @@ func (a *Adapter) noteCaptchaChallenge() {
 func smsMessage(code int, msg string) string {
 	u := strings.ToUpper(msg)
 	switch {
+	case strings.Contains(u, "LOGIN_TO_EXISTING_ACCOUNT"):
+		// 这个码**不是失败**：官方前端把它和 code 0 一样当成功
+		// （0 = 「验证码注册成功」、1 = 「验证码登录成功」，两者都拿到 user 并登录）。
+		// 所以走到这里只有一种可能：上游当我们成功了，我们却没从响应里取到 token
+		// —— 那是我们解析的问题，不是用户填错了什么。如实说清，别让用户白试。
+		return "上游已接受这次登录（LOGIN_TO_EXISTING_ACCOUNT 表示这个手机号已有账号、直接登入），" +
+			"但我们没能从响应里取到 token —— 这是我们解析的问题，请把面板日志发我"
 	case strings.Contains(u, "SMS_EXPIRED"):
 		return "验证码已过期，请点「重新获取」再来一次"
 	case strings.Contains(u, "SMS_CODE_"), strings.Contains(u, "WRONG"):

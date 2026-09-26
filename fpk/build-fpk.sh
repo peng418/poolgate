@@ -82,7 +82,7 @@ M="$PKG/manifest"
   printf 'service_port          = %s\n'   "$PORT"
   printf 'desktop_uidir         = ui\n'
   printf 'desktop_applaunchname = %s.main\n' "$APPNAME"
-  printf 'changelog = 修 0.9.0 真机暴露的四个问题（DeepSeek 短信登录）：① 登录那一步报「上游原话：Missing Header」——根因是登录类接口（login_by_mobile_sms / create_sms_verification_code）在没登录时还必须带一个「游客 PoW」头 X-DS-Guest-PoW-Response，0.9.0 没带；现在按官方白名单为这几个接口逐个取挑战（POST /users/create_guest_challenge）并用内置 WASM 解出来再带上，发码那一步之前是「碰巧」过的（它的挑战难度只有 20，登录那一步是 80000，必挂）② 「点完图验要等很久才跳下一屏」——过校验后立刻把控件压暗并显示「校验已通过，正在发送验证码…」+ 转圈，不再让用户对着一个不动的题干瞪眼 ③ 验证码倒计时以前是写死在文案里的假数字；现在按上游给的重发窗口（send_window_secs）真每秒倒数，按钮上显示「N 秒后可重新获取」，归零才可点；点「重新获取」会退回人机校验那一屏重新签一个凭据（数美凭据是一次性的）④ 两屏样式重做（标题强调条 / 统一行距 / 按钮层级 / 纯 CSS 转圈 / 验证码字距）⑤ 修「换一题」按钮从来点不动（控件加载完成后状态一直停在 loading，按钮恒被禁用）⑥ 取不到或解不出 PoW 时，错误里直接说明真因（而不是把上游的 Missing Header 原样丢给用户）⑦ 上游说被拒的原因现在常驻在屏幕上，不再只在 toast 里闪一下 | FPK %s\n' "$VERSION"
+  printf 'changelog = 修 0.9.1 真机暴露的问题（DeepSeek 手机号+验证码登录）：① 填完验证码点「登录」报「上游原话：LOGIN_TO_EXISTING_ACCOUNT」—— 这不是上游拒绝，官方前端把这个码和 code 0 并列当**成功**（0=新号注册并登入、1=已有账号直接登入）；真正的原因是我们把 token 读错了位置：token 在 data.biz_data.user.token（用户对象内部，官方映射函数取 e.token 当 userToken 用），而旧代码只找了 data.biz_data.user_token—— 那是照密码路径猜的字段名。现在三处兼容读取，user.token 优先。换句话说：手机号已有 DeepSeek 账号的用户，之前根本登不进来。② 失败时把（脱敏后的）上游信封结构写进日志（token/手机号/验证码一律换成 [已隐藏]），以后再遇到「上游这么说」不用猜。③ 日志脱敏与解析各加了回归测试（含一条专门锁「已有账号」这条真实路径的测试）。 | FPK %s\n' "$VERSION"
 } >> "$M"
 chmod 0644 "$M"
 sed -n '1,20p' "$M" | sed 's/^/  /'

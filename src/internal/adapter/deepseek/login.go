@@ -289,6 +289,9 @@ func (a *Adapter) passwordLogin(ctx context.Context, account, password string) (
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	tok, msg := parseLoginToken(raw)
 	if tok == "" {
+		// 红线一：失败必须留证据。摘要是脱敏过的（token/密码/手机号换成 <已隐藏>）。
+		dsLogf("账号密码直登失败：%s · 上游信封 %s", firstNonEmpty(msg, "上游未返回 token"),
+			loginEnvelopeSummary(raw, 400))
 		return "", "", errs.New(errs.AuthFailed,
 			"账号密码直登失败："+firstNonEmpty(msg, "上游未返回 token")).
 			WithChannel(string(channel.DeepSeek))
@@ -296,10 +299,22 @@ func (a *Adapter) passwordLogin(ctx context.Context, account, password string) (
 	return tok, deviceID, nil
 }
 
-// parseLoginToken 从 /users/login 的响应里抽 user_token，并给出失败原因。
+// parseLoginToken 从登录类响应里抽 userToken，并给出失败原因。
 //
-// 上游把业务错误藏在 HTTP 200 的信封里（code / biz_code / biz_msg），所以
-// 不能只看 HTTP 状态码 —— 要把 biz_msg 带出来给用户（红线一）。
+// **token 的位置是实机 + 官方 bundle 一起定出来的**：官方前端把登录响应映射成
+// 用户对象的那个函数写着
+//
+//	{token: e.token, id: e.id, email: e.email, mobile: e.mobile || e.mobile_number || "", …}
+//
+// 也就是 **token 在 `data.biz_data.user.token`（用户对象内部）**，前端拿到后存起来
+// 当 `Authorization: Bearer` 用（`ww(user)` 里 `user.token && setPersistedCurrentUser(...)`）。
+//
+// 踩过的坑：早先这里只读 `biz_data.user_token`（**那是照密码路径猜的**，不是抓包来的），
+// 于是「手机号 + 短信验证码」登录在真机上永远失败 —— 上游其实把它当成功（见 sms.go
+// 里对 biz_code 0/1 的处理），报出来的却是上游原话 `LOGIN_TO_EXISTING_ACCOUNT`，
+// 看着像业务拒绝，实际是**我们把 token 漏掉了**。
+//
+// 三个位置按「官方确认过的在前」的顺序宽容解析，任一处给到即可。
 func parseLoginToken(raw []byte) (token, msg string) {
 	var out struct {
 		Code    int    `json:"code"`
@@ -311,13 +326,16 @@ func parseLoginToken(raw []byte) (token, msg string) {
 			BizData struct {
 				UserToken string `json:"user_token"`
 				Token     string `json:"token"`
+				User      struct {
+					Token string `json:"token"`
+				} `json:"user"`
 			} `json:"biz_data"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return "", "上游响应无法解析"
 	}
-	tok := firstNonEmpty(out.Data.BizData.UserToken, out.Data.BizData.Token)
+	tok := firstNonEmpty(out.Data.BizData.User.Token, out.Data.BizData.UserToken, out.Data.BizData.Token)
 	if tok != "" {
 		return tok, ""
 	}
@@ -329,6 +347,70 @@ func parseLoginToken(raw []byte) (token, msg string) {
 		return "", "被风控拦截（DeepSeek 原话：" + out.Data.BizMsg + "）；请改用「粘贴 userToken」方式"
 	}
 	return "", firstNonEmpty(out.Data.BizMsg, out.Msg, fmt.Sprintf("上游业务码 %d", out.Data.BizCode))
+}
+
+// loginEnvelopeSummary 把上游登录信封压成一行**可进日志的摘要**（红线一：失败要留证据）。
+//
+// 为什么要它：真机上「上游为什么这么说」常常要靠响应的**结构**才能断（这轮就是靠
+// `biz_data.user` 里有没有 token 才定案）。但信封里同时躺着 token / 手机号 /
+// 验证码 —— 这些一律不能进日志。
+//
+// 做法：按 key 名脱敏（含 token/password/手机号/验证码的敏感键保留键名、值换成
+// `[已隐藏]`），其余原样保留并限长，最后截断到 max 字节。宁可少记，不可泄露。
+//
+// 标记用方括号而不是尖括号：`json.Marshal` 会把 `<` `>` 转义成 `\u003c`/`\u003e`，
+// 尖括号标记在日志里根本看不见（这条是跑测试才发现的）。
+func loginEnvelopeSummary(raw []byte, max int) string {
+	var v any
+	if json.Unmarshal(raw, &v) != nil {
+		// 不是 JSON（HTML/WAF 页等）：只给长度和一个极短片段，避免把整页刷进日志。
+		return fmt.Sprintf("<非 JSON 响应 %d 字节> %s", len(raw), truncate(string(raw), 80))
+	}
+	redactKeys := []string{"token", "password", "passwd", "secret",
+		"sms_verification_code", "mobile", "phone", "authorization"}
+	var walk func(any) any
+	walk = func(x any) any {
+		switch t := x.(type) {
+		case map[string]any:
+			out := make(map[string]any, len(t))
+			for k, val := range t {
+				lk := strings.ToLower(k)
+				if sensitiveKey(lk, redactKeys) {
+					out[k] = "[已隐藏]"
+					continue
+				}
+				out[k] = walk(val)
+			}
+			return out
+		case []any:
+			for i := range t {
+				t[i] = walk(t[i])
+			}
+			return t
+		case string:
+			return truncate(t, 64)
+		default:
+			return x
+		}
+	}
+	b, err := json.Marshal(walk(v))
+	if err != nil {
+		return "<信封无法序列化>"
+	}
+	return truncate(string(b), max)
+}
+
+// sensitiveKey 判断一个已小写的 key 是否属于「值不可入日志」的类别。
+//
+// 注意 biz_code 这类**状态码**要留住（它正是排查要看的），所以不按 "code" 一概过滤，
+// 只有 sms_verification_code 这种一次性凭据才脱敏。
+func sensitiveKey(lk string, redactKeys []string) bool {
+	for _, r := range redactKeys {
+		if strings.Contains(lk, r) {
+			return true
+		}
+	}
+	return false
 }
 
 // Refresh 尝试续期。
