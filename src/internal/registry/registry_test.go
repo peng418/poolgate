@@ -105,3 +105,35 @@ func TestRegisterOverwrites(t *testing.T) {
 		t.Fatalf("重复注册应覆盖: %+v", spec)
 	}
 }
+
+func TestSetStatusPreservesImplementation(t *testing.T) {
+	// 暂停渠道时实现必须保留，否则面板签到/刷新走 credFor→Get 会报「渠道未实现」，
+	// 且设置页「渠道开关」的 implemented=false 会让「启用」按钮变成「未实现」无法恢复。
+	Reset()
+	impl := fakeChannel{spec: channel.Spec{Kind: channel.QoderCN, DisplayName: "QoderCN", Status: channel.Active}}
+	Register(impl, impl.Spec())
+
+	SetStatus(channel.QoderCN, channel.Paused)
+
+	got, ok := Get(channel.QoderCN)
+	if !ok {
+		t.Fatal("暂停后渠道实现不应丢失")
+	}
+	if got == nil {
+		t.Fatal("暂停后渠道实现不应为 nil")
+	}
+	spec, _ := GetSpec(channel.QoderCN)
+	if spec.Downstream() {
+		t.Fatal("暂停后不应下发模型")
+	}
+
+	// 恢复后应重新下发。
+	SetStatus(channel.QoderCN, channel.Active)
+	spec, _ = GetSpec(channel.QoderCN)
+	if !spec.Downstream() {
+		t.Fatal("恢复后应重新下发模型")
+	}
+	if _, ok := Get(channel.QoderCN); !ok {
+		t.Fatal("恢复后实现仍应在")
+	}
+}

@@ -330,17 +330,12 @@ func applyOverrides(settings *store.SettingsStore) {
 		return
 	}
 	for kind, ov := range settings.Get().ChannelOverrides {
-		spec, ok := registry.GetSpec(channel.Kind(kind))
-		if !ok {
-			continue
-		}
 		switch ov.Status {
 		case string(channel.Active):
-			spec.Status = channel.Active
+			registry.SetStatus(channel.Kind(kind), channel.Active)
 		case string(channel.Paused):
-			spec.Status = channel.Paused
+			registry.SetStatus(channel.Kind(kind), channel.Paused)
 		}
-		registry.RegisterSpec(spec)
 	}
 }
 

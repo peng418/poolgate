@@ -39,6 +39,23 @@ func Register(c channel.Channel, s channel.Spec) {
 // 面板能显示它并写明恢复条件，但它不参与路由（docs/03 §1 的裁定）。
 func RegisterSpec(s channel.Spec) { Register(nil, s) }
 
+// SetStatus 只改某渠道的运行状态，保留它已有的适配器实现与能力声明。
+//
+// 为什么不能用 RegisterSpec 来翻状态：RegisterSpec 会把 Channel 置成 nil，
+// 暂停后适配器实现就丢了 —— 面板的「签到/刷新余额」经 credFor → Get 拿不到实现，
+// 报「渠道未实现」，而且设置页「渠道开关」的「启用」按钮也因 implemented=false
+// 变成「未实现」无法恢复。翻状态必须原位只动 Status，实现原地保留。
+func SetStatus(k channel.Kind, s channel.Status) {
+	global.mu.Lock()
+	defer global.mu.Unlock()
+	e, ok := global.byKind[k]
+	if !ok {
+		return
+	}
+	e.Spec.Status = s
+	global.byKind[k] = e
+}
+
 // Get 取渠道实现；未注册或只有声明时返回 nil。
 func Get(k channel.Kind) (channel.Channel, bool) {
 	global.mu.RLock()
