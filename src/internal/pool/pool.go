@@ -127,9 +127,24 @@ func (p *Pool) SetDisabled(kind channel.Kind, uid string, d bool) {
 	}
 }
 
+// minRetryAtCooldown 是「沿用上游给的恢复时间点」时的下限。
+//
+// 上游要是回一个荒谬的（比如 1 秒后）解禁时间，照做等于把冷却变成空转、
+// 下一轮请求立刻又去撞枪口；1 分钟既不会误放行，也不会把号白关。
+const minRetryAtCooldown = time.Minute
+
 // NoteError 记录一次错误；按 kind 的 Policy 分档冷却。
 // 红线：UpstreamFault 不计账号错误（AccountBlamed 为 false），由调用方决定是否跳过。
 func (p *Pool) NoteError(kind channel.Kind, uid string, k errs.Kind) {
+	p.NoteErrorAt(kind, uid, k, time.Time{})
+}
+
+// NoteErrorAt 同 NoteError，但带上**上游给出的恢复时间点**（如禁言解禁时间）。
+//
+// 优先级：上游的时间点 > Policy 的固定冷却。上游才是「这个号什么时候能用」的权威，
+// 面板上「还要等多久」必须与上游一致 —— 拿固定冷却去猜，禁言 3 天却只冷 5 分钟，
+// 结果就是每个请求都去撞一次枪口（实测：被禁言的号反复被选中探测）。
+func (p *Pool) NoteErrorAt(kind channel.Kind, uid string, k errs.Kind, retryAt time.Time) {
 	if !k.AccountBlamed() {
 		return // 上游故障/内容拦截等不计入账号错误（D4 解耦）
 	}
@@ -143,8 +158,20 @@ func (p *Pool) NoteError(kind channel.Kind, uid string, k errs.Kind) {
 			e.state.Reason = string(k)
 			return
 		}
+		now := time.Now()
+		deadline := time.Time{}
 		if pol.Cooldown > 0 {
-			e.state.Until = time.Now().Add(pol.Cooldown)
+			deadline = now.Add(pol.Cooldown)
+		}
+		if retryAt.After(now) {
+			if d := retryAt.Sub(now); d < minRetryAtCooldown {
+				deadline = now.Add(minRetryAtCooldown)
+			} else {
+				deadline = retryAt
+			}
+		}
+		if !deadline.IsZero() {
+			e.state.Until = deadline
 			e.state.Reason = string(k)
 		}
 	}

@@ -567,3 +567,42 @@ func TestMaskAccount(t *testing.T) {
 		}
 	}
 }
+
+// 真机报文（2026-09-26）：HTTP 200 + biz_code=5 + biz_msg="user is muted" + biz_data.mute_until。
+// 这不是凭证失效 —— SessionDead 会禁用账号 + 让用户去重登，而重登解不开禁言；
+// 要归 Muted，并把上游给的解禁时间带出来。
+func TestMutedEnvelopeIsNotSessionDead(t *testing.T) {
+	raw := []byte(`{"code":0,"msg":"","data":{"biz_code":5,"biz_msg":"user is muted","biz_data":{"is_muted":1,"mute_until":1790689838.689}}}`)
+	err := bizError(raw, "发消息失败")
+	if k, _ := errs.KindOf(err); k != errs.Muted {
+		t.Fatalf("biz_code=5 + user is muted 应归 Muted，实际 %v（%v）", k, err)
+	}
+	until, ok := errs.RetryAtOf(err)
+	if !ok {
+		t.Fatal("应把上游给的 mute_until 带出来（面板要显示解禁时间）")
+	}
+	if got := until.Format("2006-01-02 15:04"); got != "2026-09-29 21:50" {
+		t.Fatalf("解禁时间应等于 mute_until 换算结果，got %s", got)
+	}
+	// 上游没给时间时也要能归 Muted（只是没有时间点，按固定冷却兜底）
+	err = bizError([]byte(`{"code":0,"data":{"biz_code":5,"biz_msg":"user is muted"}}`), "发消息失败")
+	if k, _ := errs.KindOf(err); k != errs.Muted {
+		t.Fatalf("没给 mute_until 也要归 Muted：%v", k)
+	}
+	if _, ok := errs.RetryAtOf(err); ok {
+		t.Fatal("上游没给时间时不该编一个解禁时间")
+	}
+	// 信封级 50006（官方包 a[a.MUTED=50006]）走同一条路
+	err = bizError([]byte(`{"code":50006,"msg":"muted","data":{"biz_data":{"mute_until":1790689838}}}`), "发消息失败")
+	if k, _ := errs.KindOf(err); k != errs.Muted {
+		t.Fatalf("信封级 50006 也应归 Muted：%v", k)
+	}
+}
+
+// 400 + "user is muted" 也要归 Muted（上游两条路都给过这个串）。
+func TestClassifyMuted(t *testing.T) {
+	a := New()
+	if got := a.Classify(400, []byte(`{"data":{"biz_msg":"user is muted"}}`)); got != errs.Muted {
+		t.Fatalf("400 + user is muted 应归 Muted，实际 %v", got)
+	}
+}

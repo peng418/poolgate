@@ -7,7 +7,10 @@
 //     （wild-work 的实测教训，见 docs/03-渠道能力矩阵.md §4）。
 package errs
 
-import "errors"
+import (
+	"errors"
+	"time"
+)
 
 // Kind 是有限的错误分类枚举。新增分类必须同时更新 DefaultPolicy 与前端文案。
 type Kind string
@@ -16,6 +19,7 @@ const (
 	HardCredit       Kind = "HardCredit"       // 余额/权益不足
 	SoftRate         Kind = "SoftRate"         // 限流（429）
 	SessionDead      Kind = "SessionDead"      // 会话/签名失效（401、Signature invalid）
+	Muted            Kind = "Muted"            // 账号被上游禁言（风控/违规处置，有解禁时间）
 	ContentBlocked   Kind = "ContentBlocked"   // 内容拦截
 	PromptTooLong    Kind = "PromptTooLong"    // 超出上下文窗口
 	ModelUnavailable Kind = "ModelUnavailable" // 该账号无此模型权限
@@ -32,6 +36,9 @@ func (k Kind) String() string { return string(k) }
 // AccountBlamed 报告该错误是否应计入账号错误。
 //
 // 这是 UpstreamFault 解耦的落点：上游故障时账号是好的，冷却账号等于误杀。
+//
+// Muted 反过来：禁言是**这个号**的状态（池里有别的号就该换号），所以算账号错误，
+// 并按上游给的解禁时间冷却它。
 func (k Kind) AccountBlamed() bool {
 	switch k {
 	case UpstreamFault, ContentBlocked, PromptTooLong, NoCandidate, AuthFailed:
@@ -47,6 +54,10 @@ func (k Kind) AccountBlamed() bool {
 // 但在**用凭证去打上游**的路径上（对话路由、健康探测），它同样意味着这个号的凭证不通 ——
 // 该续期、该换号，而不是把错误直接甩给客户端。
 //
+// Muted（上游禁言）**故意不算**凭证问题：禁言是上游对这个号的风控处置，重新登录解不开，
+// 续期只会白敲一次 token 端点。官方客户端收到 MUTED 时也只置 isMuted/muteUntil 标记，
+// 既不掉登录也不跳重登页（包里的 onMuted 与 onTokenInvalid/onIsBanned 是两条路）。
+//
 // 单点定义：router.Route 与 health.Runner 的换号纪律共用这一条判据，别各写一份。
 func CredentialKind(k Kind) bool { return k == SessionDead || k == AuthFailed }
 
@@ -59,6 +70,9 @@ type Error struct {
 	Channel  string // 渠道标识（可为空）
 	Account  string // 账号 uid（可为空）
 	Cause    error  // 原始错误（不对外暴露）
+	// RetryAt 是上游给出的恢复时间点（如禁言解禁时间）。零值表示上游没说，
+	// 此时按 Policy 的固定冷却处理；pool.NoteErrorAt 优先用它。
+	RetryAt time.Time
 }
 
 func (e *Error) Error() string {
@@ -96,6 +110,32 @@ func (e *Error) WithAccount(a string) *Error { e.Account = a; return e }
 
 // WithCause 保留原始错误。
 func (e *Error) WithCause(c error) *Error { e.Cause = c; return e }
+
+// WithRetryAt 附上上游给出的恢复时间点（如「禁言至」）。零值表示上游没说。
+func (e *Error) WithRetryAt(t time.Time) *Error { e.RetryAt = t; return e }
+
+// RetryAtOf 取出错误里上游给的恢复时间点；没有或为零值时 ok 为 false。
+//
+// 冷却时长必须以上游的话为准：拿固定冷却去猜禁言时长，要么白等、要么到点又去撞枪口。
+func RetryAtOf(err error) (time.Time, bool) {
+	var e *Error
+	if err != nil && errors.As(err, &e) && !e.RetryAt.IsZero() {
+		return e.RetryAt, true
+	}
+	return time.Time{}, false
+}
+
+// StructuredOf 取出适配器归一过的结构化错误；普通 error 返回 false。
+//
+// 与 KindOf 的区别：KindOf 对普通 error 会保守地给 Parse，而这里要的是
+// 「这个错误到底有没有被分类过」—— 判据/面板据此决定要不要沿用它的分类。
+func StructuredOf(err error) (*Error, bool) {
+	var e *Error
+	if err != nil && errors.As(err, &e) {
+		return e, true
+	}
+	return nil, false
+}
 
 // WithMessage 覆盖给人类看的结论（保留 Kind 与上游原话）。
 //

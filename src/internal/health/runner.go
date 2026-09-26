@@ -97,6 +97,9 @@ type AccountSource interface {
 	RefreshNow(ctx context.Context, kind channel.Kind, c channel.Credential) (*channel.Credential, error)
 	// NoteError 按 errs.Kind 分档冷却/禁用该账号（UpstreamFault 等不计账号错误）。
 	NoteError(kind channel.Kind, uid string, k errs.Kind)
+	// NoteErrorAt 同 NoteError，但可带上上游给的恢复时间点（如禁言解禁时间）。
+	// 探测与真实流量必须用同一套冷却纪律，所以探测侧也用这一条。
+	NoteErrorAt(kind channel.Kind, uid string, k errs.Kind, retryAt time.Time)
 	// NoteSuccess 清零该账号的错误计数。
 	NoteSuccess(kind channel.Kind, uid string)
 }
@@ -143,7 +146,8 @@ func (r *Runner) ProbeOne(ctx context.Context, t Target) Result {
 			return res
 		}
 		k := failureKind(res, err)
-		r.pool.NoteError(t.Kind, cred.UID, k)
+		until, _ := errs.RetryAtOf(err) // 上游给的恢复时间点（禁言解禁）优先于固定冷却
+		r.pool.NoteErrorAt(t.Kind, cred.UID, k, until)
 		if !k.AccountBlamed() && !errs.CredentialKind(k) {
 			// 不是这个号的锅：换号没意义，直接给出结论（渠道级故障）。
 			return res
@@ -159,7 +163,8 @@ func (r *Runner) ProbeOne(ctx context.Context, t Target) Result {
 					return res
 				}
 				k = failureKind(res, err)
-				r.pool.NoteError(t.Kind, nc.UID, k)
+				until, _ := errs.RetryAtOf(err)
+				r.pool.NoteErrorAt(t.Kind, nc.UID, k, until)
 				if !k.AccountBlamed() && !errs.CredentialKind(k) {
 					return res
 				}

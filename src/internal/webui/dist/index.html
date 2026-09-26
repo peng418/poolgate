@@ -768,7 +768,7 @@
                 <td><b>{{ a.nickname || a.uid }}</b><div class="hint mono">{{ shortUid(a.uid) }}</div></td>
                 <td>
                   <span class="pill" :class="accountPill(a)"><span class="i">{{ accountIcon(a) }}</span><span class="swatch"></span>{{ accountText(a) }}</span>
-                  <div class="hint" v-if="a.reason">{{ reasonText(a.reason) }}</div>
+                  <div class="hint" v-if="a.reason">{{ reasonText(a.reason, a.cooldown_until) }}</div>
                 </td>
                 <td class="num">{{ a.credits_known ? a.credits : '未知' }}</td>
                 <td>{{ a.expires_at ? fmtDate(a.expires_at) : '未知' }}</td>
@@ -1806,6 +1806,7 @@ createApp({
       const labels={UpstreamFault:'上游故障 UpstreamFault',Transport:'传输失败 Transport',
         ContentBlocked:'内容拦截 ContentBlocked',SoftRate:'限流 SoftRate',
         HardCredit:'额度不足 HardCredit',SessionDead:'会话失效 SessionDead',
+        Muted:'禁言 Muted',
         ModelUnavailable:'模型不可用 ModelUnavailable',Parse:'解析失败 Parse'};
       return Object.entries(stats).map(([name,count])=>({
         name,label:labels[name]||name,count,pct:Math.round(count/max*100),
@@ -2214,8 +2215,9 @@ createApp({
     //
     // 账号行直接把 pool 里的 reason（如 "SessionDead"）贴出来过 —— 用户看到的是
     // 一个英文枚举，不知道该干什么。禁用原因必须自带「接下来做什么」。
-    const reasonText=r=>{
+    const reasonText=(r,until)=>{
       const map={
+        Muted:'上游禁言 —— 账号被上游风控禁言（判定违反使用规范），到解禁时间自动恢复；不用重新登录，重新登录也解不开',
         SessionDead:'会话失效 —— 该账号的上游凭证已过期或被拒，点「重新登录」重新授权',
         AuthFailed:'认证失败 —— 该账号的上游凭证不被接受，点「重新登录」重新授权',
         HardCredit:'额度/权益不足 —— 充值或换号后点「启用」',
@@ -2225,7 +2227,8 @@ createApp({
         UpstreamFault:'上游故障 —— 不是账号的问题，换号或等上游恢复',
         '手动停用':'你手动停用了这个账号'
       };
-      return map[r]||r;
+      // 冷却会有到期时间（禁言尤其需要让人看到「等到什么时候」），直接缀在后面。
+      return (map[r]||r)+(until?'（冷却至 '+fmtTime(until)+'）':'');
     };
     const accountPill=a=>a.disabled?'crit':(a.cooling?'serious':'good');
     const accountIcon=a=>a.disabled?'×':(a.cooling?'≈':'✓');

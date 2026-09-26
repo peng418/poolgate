@@ -676,7 +676,8 @@ func (s *Server) aggregateChunks(w http.ResponseWriter, kind channel.Kind, cred 
 // noteFailure 按 errs.Kind 分档冷却；UpstreamFault 不计账号错误（pool 内部处理）。
 func (s *Server) noteFailure(kind channel.Kind, uid string, err error) {
 	if k, ok := errs.KindOf(err); ok {
-		s.pool.NoteError(kind, uid, k)
+		until, _ := errs.RetryAtOf(err)
+		s.pool.NoteErrorAt(kind, uid, k, until)
 	}
 }
 

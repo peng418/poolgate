@@ -112,3 +112,44 @@ func TestKindIsolation(t *testing.T) {
 		t.Fatal("QoderCN 应能选到 a，渠道互不干扰")
 	}
 }
+
+// 上游给了恢复时间点（禁言解禁）时，冷却必须**冷到那个点**，而不是拍一个固定时长；
+// 并且禁言**不**禁用账号（Disable 只留给 SessionDead 那种真死号）。
+func TestNoteErrorAtUsesUpstreamDeadline(t *testing.T) {
+	p := New()
+	add(p, channel.DeepSeek, "a", 100)
+	add(p, channel.DeepSeek, "b", 500)
+
+	p.NoteErrorAt(channel.DeepSeek, "b", errs.Muted, time.Now().Add(3*time.Hour))
+
+	st, ok := p.Get(channel.DeepSeek, "b")
+	if !ok {
+		t.Fatal("账号 b 应还在池子里")
+	}
+	if st.Disabled {
+		t.Fatal("禁言是临时的，不该被永久禁用")
+	}
+	if st.Reason != string(errs.Muted) {
+		t.Fatalf("原因应记为 Muted，got %q", st.Reason)
+	}
+	// b 被冷到 3 小时后 → 选号只能选 a
+	c, ok := p.Pick(context.Background(), channel.DeepSeek, nil)
+	if !ok || c.UID != "a" {
+		t.Fatalf("冷却中的 b 不该被选中，应选 a，got %v ok=%v", c.UID, ok)
+	}
+}
+
+// 上游给的解禁时间比 Policy 的固定冷却长得多 → 以**上游**为准
+// （禁言 3 天却只冷 30 分钟，等于每个请求都去撞一次枪口）。
+func TestNoteErrorAtPrefersUpstreamDeadline(t *testing.T) {
+	p := New()
+	add(p, channel.DeepSeek, "a", 100)
+	p.NoteErrorAt(channel.DeepSeek, "a", errs.Muted, time.Now().Add(72*time.Hour))
+	st, ok := p.Get(channel.DeepSeek, "a")
+	if !ok {
+		t.Fatal("账号 a 应还在池子里")
+	}
+	if !st.Until.After(time.Now().Add(71 * time.Hour)) {
+		t.Fatalf("冷却截止应在上游给的解禁时间（≈72h 后），got %s", st.Until)
+	}
+}

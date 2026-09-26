@@ -198,7 +198,8 @@ func (a *Adapter) Classify(status int, body []byte) errs.Kind {
 	case status == 400 || status == 422:
 		switch {
 		case strings.Contains(s, "user is muted"):
-			return errs.SessionDead
+			// 禁言是风控处置，不是凭证失效 —— 归 Muted，别让用户去「重新登录」白折腾。
+			return errs.Muted
 		case strings.Contains(s, "is_banned"):
 			return errs.SessionDead
 		case strings.Contains(s, "input_exceeds_limit"), strings.Contains(s, "too long"):
@@ -375,6 +376,38 @@ func clientHeaders(c *channel.Credential) map[string]string {
 	return h
 }
 
+// mutedError 构造「账号被上游禁言」的结构化错误。
+//
+// 实测报文（2026-09-26 真机）：HTTP 200 + SSE 帧里
+// {"code":0,"data":{"biz_code":5,"biz_msg":"user is muted","biz_data":{"is_muted":1,"mute_until":1790689838.689}}}。
+// 官方包对禁言的处置是**置一个标记**（onMuted → {isMuted, muteUntil}），既不掉登录也不跳重登页；
+// 所以这里也绝不归成「凭证失效」：不禁用账号、不去刷 token，只冷到解禁时间，并如实说明原因。
+func mutedError(raw []byte, muteUntil float64) error {
+	var until time.Time
+	if muteUntil > 0 {
+		until = time.Unix(int64(muteUntil), 0).In(time.Local)
+	}
+	msg := "账号被上游禁言（上游判定违反使用规范）"
+	if until.IsZero() {
+		msg += "，上游未给解禁时间"
+	} else {
+		msg += "，解禁时间 " + until.Format("2006-01-02 15:04")
+	}
+	msg += "；这不是凭证问题 —— 重新登录也解不开，换号或等到期"
+	return errs.New(errs.Muted, msg).WithChannel(string(channel.DeepSeek)).
+		WithUpstream(truncate(string(raw), 200)).WithRetryAt(until)
+}
+
+// firstPositive 取第一个大于 0 的值（上游不同路径给的字段名不一样）。
+func firstPositive(vs ...float64) float64 {
+	for _, v := range vs {
+		if v > 0 {
+			return v
+		}
+	}
+	return 0
+}
+
 // bizError 把业务信封里的错误变成可读错误（上游大量错误是 HTTP 200 + code/biz_code）。
 func bizError(raw []byte, what string) error {
 	var env struct {
@@ -383,6 +416,13 @@ func bizError(raw []byte, what string) error {
 		Data struct {
 			BizCode int    `json:"biz_code"`
 			BizMsg  string `json:"biz_msg"`
+			// 禁言信息（实测报文）：biz_data.is_muted / biz_data.mute_until（**秒**，带小数）。
+			// 官方包按 1e3*chat.mute_until 转毫秒；「分享」那条路用的是 end_at，一并认。
+			BizData struct {
+				IsMuted   int     `json:"is_muted"`
+				MuteUntil float64 `json:"mute_until"`
+				EndAt     float64 `json:"end_at"`
+			} `json:"biz_data"`
 		} `json:"data"`
 	}
 	_ = json.Unmarshal(raw, &env)
@@ -401,8 +441,10 @@ func bizError(raw []byte, what string) error {
 		kind = errs.UpstreamFault
 	case env.Data.BizCode == 10:
 		kind = errs.SessionDead // USER_IS_BANNED
-	case env.Data.BizCode == 5:
-		kind = errs.SessionDead // user is muted（临时禁言，重登也解不了）
+	case env.Code == 50006, env.Data.BizCode == 5:
+		// 禁言：帧内 biz_code=5（官方包枚举 I[I.MUTED=5]），信封级 code=50006
+		// （a[a.MUTED=50006]）。带解禁时间一起走，冷却时长以上游为准。
+		return mutedError(raw, firstPositive(env.Data.BizData.MuteUntil, env.Data.BizData.EndAt))
 	case env.Data.BizCode == 11:
 		kind = errs.AuthFailed // RISK_DEVICE_DETECTED（设备指纹不对）
 	}

@@ -717,6 +717,8 @@ func verdictFor(k errs.Kind, hasAccount bool) string {
 		return "上游限流（429）：稍后重试，或降低并发"
 	case errs.HardCredit:
 		return "账号额度不足：需要充值或换号"
+	case errs.Muted:
+		return "账号被上游禁言（上游风控处置，非本地配置问题、也非凭证失效）：到解禁时间自动恢复，或换个账号"
 	case errs.SessionDead:
 		return "凭证已失效：需要重新授权登录"
 	case errs.ContentBlocked:

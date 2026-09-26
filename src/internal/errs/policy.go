@@ -20,8 +20,13 @@ type Policy struct {
 //
 // 与 docs/02-项目设计方案.md §4 的表一一对应，改这里必须同步改文档。
 var DefaultPolicy = map[Kind]Policy{
-	HardCredit:       {Cooldown: 12 * time.Hour, Retry: true},
-	SoftRate:         {Cooldown: 60 * time.Second, Retry: true},
+	HardCredit: {Cooldown: 12 * time.Hour, Retry: true},
+	SoftRate:   {Cooldown: 60 * time.Second, Retry: true},
+	// 禁言：上游对账号的风控处置（「由于违反用户使用规范」），**有解禁时间**。
+	// 30m 只是上游没给时间时的兜底；真实冷却取上游给的 RetryAt（见 pool.NoteErrorAt）。
+	// Retry=true：池里还有别的号就该换号接着服务，而不是把整个渠道判死。
+	// 不禁用（Disable=false）：禁言是临时的，到点自己恢复；禁用等于逼用户重新登录，还解不开。
+	Muted:            {Cooldown: 30 * time.Minute, Retry: true, Passthrough: true},
 	SessionDead:      {Disable: true},
 	ContentBlocked:   {Passthrough: true},
 	PromptTooLong:    {Passthrough: true},

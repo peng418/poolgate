@@ -29,6 +29,7 @@ type fakePool struct {
 	pickCalls    int
 	refreshCalls []string
 	notes        []poolNote
+	retryAts     []time.Time
 	oks          []string
 }
 
@@ -62,10 +63,16 @@ func (f *fakePool) RefreshNow(_ context.Context, _ channel.Kind, c channel.Crede
 	return &nc, nil
 }
 
-func (f *fakePool) NoteError(_ channel.Kind, uid string, k errs.Kind) {
+func (f *fakePool) NoteError(kind channel.Kind, uid string, k errs.Kind) {
+	f.NoteErrorAt(kind, uid, k, time.Time{})
+}
+
+// NoteErrorAt 记录冷却回写；retryAt 用于断言「上游给的解禁时间被带到了池子」。
+func (f *fakePool) NoteErrorAt(_ channel.Kind, uid string, k errs.Kind, retryAt time.Time) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.notes = append(f.notes, poolNote{uid: uid, kind: k})
+	f.retryAts = append(f.retryAts, retryAt)
 }
 
 func (f *fakePool) NoteSuccess(_ channel.Kind, uid string) {

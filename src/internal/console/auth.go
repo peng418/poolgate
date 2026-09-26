@@ -161,6 +161,10 @@ func writeErrFromErr(w http.ResponseWriter, err error) {
 	if k == errs.SessionDead {
 		e = e.WithMessage(e.Error() + "（该渠道账号的凭证已失效：到「账号」页点它的「重新登录」重新授权）")
 	}
+	// 禁言不是凭证问题 —— 这里必须说清楚「重新登录解不开」，否则用户会去点「重新登录」。
+	if k == errs.Muted {
+		e = e.WithMessage(e.Error() + "（该渠道账号被上游风控禁言：不是凭证问题，重新登录解不开，到解禁时间自动恢复）")
+	}
 	writeErr(w, statusForKind(k), e)
 }
 
@@ -171,6 +175,10 @@ func statusForKind(k errs.Kind) int {
 		return http.StatusPaymentRequired
 	case errs.SoftRate:
 		return http.StatusTooManyRequests
+	case errs.Muted:
+		// 账号被上游禁言：网关自己这边没问题，是上游暂时不给这个号用 → 503。
+		// 用 401 会把用户带沟里（以为自己的 Key/会话坏了），用 429 又像「限流，立刻重试」。
+		return http.StatusServiceUnavailable
 	case errs.SessionDead, errs.AuthFailed:
 		// 上游凭证失效**不是**「管理员会话过期」。
 		//

@@ -101,3 +101,38 @@ func contains(s, sub string) bool {
 			return false
 		}())
 }
+
+// 禁言（Muted）是上游对**这个号**的风控处置，且带解禁时间：
+// 算账号错误（池里有别的号就该换号），但**不是**凭证问题（重登解不开、续期白敲），
+// 也**不**禁用（临时状态，到点自恢复）。这条锁的就是 0.9.5 修的误判。
+func TestMutedIsAccountBlamedNotCredentialNotDisabled(t *testing.T) {
+	if !Muted.AccountBlamed() {
+		t.Fatal("禁言是这个号的状态 → 应算账号错误（否则池子会反复选它去撞枪口）")
+	}
+	if CredentialKind(Muted) {
+		t.Fatal("禁言不是凭证问题：重新登录解不开，走续期只会白敲一次 token 端点")
+	}
+	pol := PolicyOf(Muted)
+	if pol.Disable {
+		t.Fatal("禁言是临时的（上游给了 mute_until）→ 不许永久禁用账号")
+	}
+	if !pol.Retry {
+		t.Fatal("池里还有别的号 → Policy.Retry 应为 true")
+	}
+	if !pol.Passthrough {
+		t.Fatal("上游的处置结果要原话透传给用户 → Passthrough 应为 true")
+	}
+}
+
+// 禁言必须带得出「解禁时间点」：面板与客户端都要看到它，不能只写一个固定冷却。
+func TestMutedCarriesRetryAt(t *testing.T) {
+	until := time.Date(2026, 9, 29, 21, 50, 38, 0, time.Local)
+	err := New(Muted, "账号被上游禁言").WithRetryAt(until)
+	got, ok := RetryAtOf(err)
+	if !ok || !got.Equal(until) {
+		t.Fatalf("RetryAt 应带出解禁时间：%v ok=%v", got, ok)
+	}
+	if _, ok := RetryAtOf(New(Muted, "上游没给时间")); ok {
+		t.Fatal("上游没给时间时 RetryAtOf 应返回 false（按固定冷却兜底），不许编一个")
+	}
+}

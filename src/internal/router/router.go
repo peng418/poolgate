@@ -158,7 +158,8 @@ func (r *Router) Route(ctx context.Context, ch channel.Channel, kind channel.Kin
 
 		// 失败：按 kind 冷却该号，换号重试。
 		if ok {
-			r.p.NoteError(kind, cred.UID, k)
+			until, _ := errs.RetryAtOf(err) // 上游给了恢复时间点（如禁言解禁）就以它为准
+			r.p.NoteErrorAt(kind, cred.UID, k, until)
 			if !k.AccountBlamed() && !errs.CredentialKind(k) {
 				// 上游故障/内容拦截/超长：非账号问题，直接返回错误，不换号白折腾。
 				return nil, err

@@ -152,6 +152,10 @@ func httpStatusFor(k errs.Kind) int {
 		return http.StatusPaymentRequired
 	case errs.SoftRate:
 		return http.StatusTooManyRequests
+	case errs.Muted:
+		// 池内账号被上游禁言：**不是**调用方的 Key 错了，也不是限流（重试立刻也是白试）。
+		// 与 NoCandidate 同一个语义档位：我是网关，我这边上游现在不给用。
+		return http.StatusServiceUnavailable
 	case errs.SessionDead, errs.AuthFailed:
 		// 池内账号的上游凭证失效 —— **不是**调用方的 API Key 错了。
 		//

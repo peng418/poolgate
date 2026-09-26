@@ -9,6 +9,8 @@ package health
 import (
 	"strings"
 	"time"
+
+	"poolgate/internal/errs"
 )
 
 // truncate 截断上游原话，避免把整段响应塞进面板与日志。
@@ -42,6 +44,15 @@ func Judge(text string, streamErr error, ttft time.Duration) Verdict {
 		v.Kind = "Transport"
 		v.Reason = "请求未能完成"
 		v.Upstream = truncate(streamErr.Error(), 400)
+		// 适配器已经归一过的错误不能被压平成 Transport：那会把「上游禁言」这类
+		// 上游对账号的明确处置显示成「传输失败」，用户以为网络坏了，去查错方向。
+		// 判据本身不变（仍然是不通过），只是分类与结论沿用适配器给的（红线二：看内容，不看状态码）。
+		if ee, ok := errs.StructuredOf(streamErr); ok {
+			v.Kind = string(ee.Kind)
+			if ee.Message != "" {
+				v.Reason = ee.Message
+			}
+		}
 		return v
 
 	case strings.TrimSpace(text) == "":
